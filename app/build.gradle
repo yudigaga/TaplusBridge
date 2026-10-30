@@ -1,0 +1,78 @@
+apply plugin: 'com.android.application'
+apply plugin: 'org.jetbrains.kotlin.plugin.compose'
+
+def taplusSigningFile = rootProject.file('keystore.properties')
+def taplusSigningProperties = new Properties()
+if (taplusSigningFile.exists()) {
+    taplusSigningFile.withInputStream { taplusSigningProperties.load(it) }
+}
+
+android {
+    namespace 'io.github.yudigaga.taplusbridge'
+    compileSdk 37
+    defaultConfig {
+        applicationId 'io.github.yudigaga.taplusbridge'
+        minSdk 28
+        targetSdk 35
+        versionCode 15
+        versionName '0.8.2'
+    }
+    signingConfigs {
+        taplusRelease {
+            if (taplusSigningFile.exists()) {
+                storeFile rootProject.file(taplusSigningProperties.getProperty('storeFile', ''))
+                storePassword taplusSigningProperties.getProperty('storePassword')
+                keyAlias taplusSigningProperties.getProperty('keyAlias')
+                keyPassword taplusSigningProperties.getProperty('keyPassword')
+            }
+        }
+    }
+    buildTypes {
+        debug { versionNameSuffix '-dev' }
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.taplusRelease
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    buildFeatures { buildConfig true; compose true; aidl true }
+    testOptions { unitTests.includeAndroidResources = true }
+}
+kotlin {
+    jvmToolchain(21)
+    compilerOptions { jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17 }
+}
+// AIDL writes a depfile using the Windows code page. Stage inputs in the existing ASCII
+// build directory so AGP can parse that file as UTF-8 without relocating the source tree.
+def stageAidl = tasks.register('stageAidlSources')
+android.sourceSets.configureEach { sourceSet ->
+    def stagedDirectory = layout.buildDirectory.dir("generated/aidl-src/${sourceSet.name}")
+    def sourceDirectory = layout.projectDirectory.dir("src/${sourceSet.name}/aidl")
+    def copyTask = tasks.register("stage${sourceSet.name.capitalize()}AidlSources", Sync) {
+        from sourceDirectory
+        into stagedDirectory
+    }
+    sourceSet.aidl.setSrcDirs([stagedDirectory])
+    stageAidl.configure { dependsOn(copyTask) }
+}
+tasks.configureEach {
+    if (name.startsWith('compile') && name.endsWith('Aidl')) dependsOn(stageAidl)
+}
+dependencies {
+    compileOnly 'io.github.libxposed:api:102.0.0'
+    implementation 'io.github.libxposed:service:102.0.0'
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation 'org.robolectric:robolectric:4.14.1'
+    implementation 'androidx.activity:activity-compose:1.13.0'
+    implementation 'top.yukonga.miuix.kmp:miuix-ui-android:0.9.4'
+    implementation 'top.yukonga.miuix.kmp:miuix-preference-android:0.9.4'
+    implementation 'com.google.code.gson:gson:2.10.1'
+    implementation 'dev.rikka.shizuku:api:13.1.5'
+    implementation 'dev.rikka.shizuku:provider:13.1.5'
+    testImplementation 'androidx.compose.ui:ui-test-junit4-android:1.12.0'
+    debugImplementation 'androidx.compose.ui:ui-test-manifest:1.12.0'
+}
+tasks.withType(Test).configureEach { maxHeapSize = '1g'; maxParallelForks = 1 }

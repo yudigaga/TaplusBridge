@@ -1,0 +1,15 @@
+.gradle/
+**/build/
+local.properties
+*.jks
+*.keystore
+/.routing-classes/
+/work/
+/analysis/
+/artifacts/
+/app/src/test/
+/tools/test_*.py
+/hs_err_pid*.log
+keystore.properties
+signing.properties
+**/__pycache__/

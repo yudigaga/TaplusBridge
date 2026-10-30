@@ -1,0 +1,18 @@
+buildscript {
+    repositories { google(); mavenCentral() }
+    dependencies {
+        classpath 'com.android.tools.build:gradle:9.1.1'
+        classpath 'org.jetbrains.kotlin:kotlin-gradle-plugin:2.4.20'
+        classpath 'org.jetbrains.kotlin:compose-compiler-gradle-plugin:2.4.20'
+    }
+}
+
+// Gradle's Windows test worker cannot load classes from some non-ASCII classpaths.
+// Keep source in the requested directory, with reproducible local build outputs in an ASCII path.
+if (System.getProperty('os.name').startsWith('Windows') && rootDir.path.any { it > 127 }) {
+    def asciiParent = rootDir.parentFile
+    while (asciiParent.path.any { it > 127 }) asciiParent = asciiParent.parentFile
+    def outputRoot = new File(asciiParent,
+            '.taplusbridge-build/' + Integer.toHexString(rootDir.path.hashCode()))
+    allprojects { layout.buildDirectory = new File(outputRoot, project.name) }
+}
