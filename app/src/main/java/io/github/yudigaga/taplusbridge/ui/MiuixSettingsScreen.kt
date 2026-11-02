@@ -67,6 +67,8 @@ object MiuixSettingsScreen {
     var page by rememberSaveable { mutableIntStateOf(0) }
     var revision by remember { mutableIntStateOf(0) }
     var snapshot by remember { mutableStateOf(controller.snapshot()) }
+    var sourceScope by remember { mutableStateOf(controller.sourceScope()) }
+    var sourceScopeError by remember { mutableStateOf(controller.sourceScopeError()) }
     var apps by remember { mutableStateOf<List<SettingsController.AppEntry>>(emptyList()) }
     var rootMessage by rememberSaveable { mutableStateOf("尚未检查 Root 授权") }
     var checkingRoot by remember { mutableStateOf(false) }
@@ -80,6 +82,8 @@ object MiuixSettingsScreen {
     val compact = LocalWindowInfo.current.containerDpSize.width < 360.dp || LocalDensity.current.fontScale > 1.2f
     val refresh: () -> Unit = {
         snapshot = controller.snapshot()
+        sourceScope = controller.sourceScope()
+        sourceScopeError = controller.sourceScopeError()
         independent = ConfigStore(activity).independentEnabled()
         runtimeStatus = RuntimePublisher.status()
         revision++
@@ -99,7 +103,9 @@ object MiuixSettingsScreen {
         }
     }
     BackHandler(page != 0) { page = 0 }
-    if (page == 1) {
+    if (page == 3) {
+        SourceScopeSettingsScreen(controller, apps, onDismiss = { page = 0 }, onSaved = { refresh(); page = 0 })
+    } else if (page == 1) {
         RuleSettingsScreen(controller, apps, revision, nav, onChanged = refresh)
     } else {
         Scaffold(
@@ -135,6 +141,15 @@ object MiuixSettingsScreen {
                     item { SectionLabel("识别与打开") }
                     item {
                         SettingsCard {
+                            SwitchPreference(snapshot.lensEnabled, { controller.setLensEnabled(it); refresh() },
+                                title = "Google Lens 识图", summary = "自动上传选中图片到 Google 并在传送门显示结果；需要可访问 Google 的网络",
+                                modifier = Modifier.testTag("toggle.lens"))
+                        }
+                    }
+                    item {
+                        SettingsCard {
+                            ArrowPreference(title = "生效应用", summary = sourceScopeError ?: sourceScopeSummary(sourceScope),
+                                onClick = { page = 3 }, modifier = Modifier.testTag("home.source_scope"))
                             SwitchPreference(snapshot.recognitionEnabled, { controller.setRecognitionEnabled(it); refresh() },
                                 title = "增强链接识别", summary = "补充文字与卡片中已有的链接", modifier = Modifier.testTag("toggle.recognition"))
                             SwitchPreference(snapshot.nativeEnabled, { controller.setNativeEnabled(it); refresh() },

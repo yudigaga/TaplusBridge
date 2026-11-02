@@ -14,8 +14,8 @@ android {
         applicationId 'io.github.yudigaga.taplusbridge'
         minSdk 28
         targetSdk 35
-        versionCode 15
-        versionName '0.8.2'
+        versionCode 26
+        versionName '0.14.1'
     }
     signingConfigs {
         taplusRelease {
@@ -30,7 +30,8 @@ android {
     buildTypes {
         debug { versionNameSuffix '-dev' }
         release {
-            minifyEnabled false
+            minifyEnabled true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
             signingConfig signingConfigs.taplusRelease
         }
     }

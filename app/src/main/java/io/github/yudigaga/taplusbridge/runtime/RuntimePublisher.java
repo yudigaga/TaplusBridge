@@ -58,8 +58,11 @@ public final class RuntimePublisher {
     private void confirm(long expected,RuntimeSnapshot snapshot,int attempt){
         android.os.Bundle status=RuntimeClient.call(app,"status",null);
         if(expected!=generation.get())return;
-        if(status!=null && snapshot.identity.equals(status.getString("identity")) && status.getBoolean("ready"))
-            message=snapshot.independent?"系统已确认配置，可冻结本体":"系统已确认关闭独立运行";
+        if(status!=null && snapshot.identity.equals(status.getString("identity")) && status.getBoolean("ready")
+                && (!snapshot.sourceScope.managed || status.getBoolean("scope_ready"))
+                && (!snapshot.scopeCapture || status.getBoolean("scope_capture_ready"))
+                && (!snapshot.scopeLinkProbe || status.getBoolean("scope_link_probe_ready")))
+            message=snapshot.independent?"系统已确认配置，可冻结本体":"系统已确认配置，独立流转已关闭";
         else if(attempt<5)main.postDelayed(()->worker.submit(()->confirm(expected,snapshot,attempt+1)),250L<<attempt);
         else message="配置已保存，系统尚未就绪；更新后请重启再同步";
     }

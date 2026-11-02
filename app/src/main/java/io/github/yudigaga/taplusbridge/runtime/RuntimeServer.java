@@ -38,6 +38,21 @@ public final class RuntimeServer {
     private volatile String snapshotRaw;
     private volatile RuntimeSnapshot snapshot;
     private Lease capture;
+    public interface SourceCapture {
+        Bundle take(int owner, Bundle request, RuntimeSnapshot config);
+        void nativeResult(Bundle request);
+        default boolean linkReady() { return false; }
+        default boolean ownsLinkPick(Bundle request) { return false; }
+    }
+    private volatile SourceCapture sourceCapture;
+    public void setSourceCapture(SourceCapture capture) { sourceCapture = capture; }
+    /** Local system use only; capture support does not require the independent routing toggle. */
+    public RuntimeSnapshot sourceCaptureConfiguration() {
+        RuntimeSnapshot config = current();
+        return config != null && config.build == BuildConfig.VERSION_CODE && config.enabled
+                && (config.scopeCapture || config.scopeLinkProbe) && config.sourceScope.managed
+                ? config : null;
+    }
     private record Ticket(LaunchPlanner.Plan plan,String identity,int owner,long until,String origin){}
     private record Lease(String nonce,String source,int sourceUid,int owner,long issued,boolean taken,String identity){}
     public RuntimeServer(Context context,Handler worker,Supplier<SharedPreferences> preferences,SystemPackageOps packages,
@@ -55,6 +70,23 @@ public final class RuntimeServer {
                 }catch(RuntimeException ignoredPayload){}
             }
         },new IntentFilter(RuntimeClient.BIND),null,worker,Context.RECEIVER_EXPORTED);
+        IntentFilter packageChanges = new IntentFilter(Intent.ACTION_PACKAGE_ADDED);
+        packageChanges.addAction(Intent.ACTION_PACKAGE_REMOVED); packageChanges.addDataScheme("package");
+        BroadcastReceiver scopePackages = new BroadcastReceiver() {
+            @Override public void onReceive(Context ignored, Intent intent) {
+                publishSourceScope(current());
+            }
+        };
+        try {
+            // The setting is device-wide, so changes in work profiles must also rebuild the complement.
+            var all = (android.os.UserHandle) android.os.UserHandle.class.getDeclaredField("ALL").get(null);
+            var register = Context.class.getDeclaredMethod("registerReceiverAsUser", BroadcastReceiver.class,
+                    android.os.UserHandle.class, IntentFilter.class, String.class, Handler.class);
+            register.setAccessible(true); register.invoke(context, scopePackages, all, packageChanges, null, worker);
+        } catch (ReflectiveOperationException | RuntimeException unavailable) {
+            event("Source app scope package observer unavailable: " + unavailable.getClass().getSimpleName());
+        }
+        worker.post(() -> publishSourceScope(current()));
         event("runtime channel ready; provider_required=false");
     }
     private final IRuntimeBridge.Stub binder=new IRuntimeBridge.Stub(){
@@ -114,13 +146,40 @@ public final class RuntimeServer {
         long identity=Binder.clearCallingIdentity();
         try {
             RuntimeSnapshot config=current();
+            if ("scope_link_probe_owns".equals(method)) {
+                Bundle result = new Bundle(); SourceCapture capture = sourceCapture;
+                result.putBoolean("owned", config != null && config.build == BuildConfig.VERSION_CODE
+                        && config.enabled && config.scopeLinkProbe && config.sourceScope.managed
+                        && capture != null && capture.ownsLinkPick(input));
+                if (result.getBoolean("owned")) result.putString("identity", config.identity);
+                return result;
+            }
+            if ("scope_capture_native".equals(method)) {
+                SourceCapture capture = sourceCapture; if (capture != null) capture.nativeResult(input); return Bundle.EMPTY;
+            }
+            if ("scope_capture_take".equals(method)) {
+                if (config == null || config.build != BuildConfig.VERSION_CODE || !config.enabled
+                        || (!config.scopeCapture && !config.scopeLinkProbe) || !config.sourceScope.managed) return Bundle.EMPTY;
+                SourceCapture capture = sourceCapture;
+                return capture == null ? Bundle.EMPTY : capture.take(uid, input, config);
+            }
             if("status".equals(method)) {
                 Bundle result=new Bundle();
+                result.putBoolean("scope_ready", publishSourceScope(config));
+                result.putBoolean("scope_capture_ready", sourceCapture != null);
+                result.putBoolean("scope_link_probe_ready", sourceCapture != null && sourceCapture.linkReady());
                 result.putBoolean("ready",config!=null && config.build==BuildConfig.VERSION_CODE && packages.ready());
                 if(config!=null) {
                     result.putString("identity",config.identity);
                 }
                 return result;
+            }
+            if ("source_scope".equals(method)) {
+                if (config == null || config.build != BuildConfig.VERSION_CODE) return declined("runtime_unavailable");
+                Bundle result = new Bundle(); result.putString("policy", config.sourceScope.encode());
+                result.putString("identity", config.identity);
+                result.putBoolean("scope_capture_enabled", config.enabled && config.scopeCapture);
+                result.putBoolean("scope_link_probe_enabled", config.enabled && config.scopeLinkProbe); return result;
             }
             if(config==null || !config.usable() || !packages.ready()) {
                 return declined("runtime_unavailable");
@@ -138,6 +197,19 @@ public final class RuntimeServer {
                 default -> declined("unsupported_request");
             };
         }catch(RuntimeException failed){return declined("exception");}finally{Binder.restoreCallingIdentity(identity);}
+    }
+    /** Only a validated framework snapshot can publish; no caller-supplied package list is used. */
+    private synchronized boolean publishSourceScope(RuntimeSnapshot config) {
+        if (config == null || config.build != BuildConfig.VERSION_CODE) return false;
+        if (!config.sourceScope.managed) return true;
+        try {
+            var host = context.getPackageManager().getPackageInfo(BridgeContract.HOST_PACKAGE, PackageManager.MATCH_DISABLED_COMPONENTS);
+            if (!HostPolicy.supportedVersion(host.versionName, host.getLongVersionCode())) return false;
+            SourceScopePublisher.publish(context, SourceScopePublisher.effectiveBlacklist(context, config.sourceScope));
+            event("Source app scope published"); return true;
+        } catch (PackageManager.NameNotFoundException | RuntimeException failed) {
+            event("Source app scope publication unavailable: " + failed.getClass().getSimpleName()); return false;
+        }
     }
     private Bundle route(int owner,String method,Bundle request,RuntimeSnapshot config){
         if(request.containsKey("explicit_target"))return declined("invalid_request");

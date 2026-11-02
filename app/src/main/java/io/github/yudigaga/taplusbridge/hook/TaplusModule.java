@@ -55,6 +55,7 @@ public final class TaplusModule extends XposedModule {
                 || !installAttempted.compareAndSet(false, true)) return;
         ClassLoader loader = param.getClassLoader();
         BridgeTransport.install();
+        HostSourceScopeHooks.install(this, loader);
         try {
             Method create=android.app.Application.class.getDeclaredMethod("onCreate");
             hook(create).setId("taplusbridge:runtime-connect").intercept(chain->{
@@ -65,6 +66,8 @@ public final class TaplusModule extends XposedModule {
         }catch(ReflectiveOperationException unavailable){log(5,TAG,"Runtime host connection unavailable");}
         installSourceTracking(loader);
         recognitionHooks = RecognitionHooks.install(this, loader, this::recommendationSource);
+        HostScopeCaptureHooks.install(this, loader);
+        PortalLensHooks.install(this, loader);
         try {
             Class<?> apps = loader.loadClass(HOST_ROOT + "utils.AppsUtils");
             Class<?> info = loader.loadClass(HOST_ROOT + "data.recognition.TextRecommendationInfo");
@@ -257,7 +260,8 @@ public final class TaplusModule extends XposedModule {
         boolean supported = HostPolicy.supportedVersion(info.versionName, info.getLongVersionCode());
         supportedHost = supported;
         if (versionReported.compareAndSet(false, true)) log(supported ? 4 : 5, TAG, supported
-                ? "Host 4.1.3/40013 contract active" : "Unsupported host version; original behavior preserved");
+                ? "Host " + info.versionName + "/" + info.getLongVersionCode() + " contract active"
+                : "Unsupported host version; original behavior preserved");
         return supported;
     }
 

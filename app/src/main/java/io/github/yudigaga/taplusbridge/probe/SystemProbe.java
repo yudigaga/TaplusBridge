@@ -59,10 +59,13 @@ public final class SystemProbe {
     private volatile Context system;
     private volatile InputAdapter input;
     private volatile io.github.yudigaga.taplusbridge.runtime.RuntimeServer runtime;
+    private SystemScopeCapture scopeCapture;
     private volatile Object atmsInstance;
+    private Class<?> activityTaskManagerType;
     private SourceWindowAccess windows;
     private Method optionsFromBundle, optionsAbort;
     private boolean armRegistered, tapRegistered, cancelRegistered;
+    private boolean linkLaunchReady;
 
     private record Snapshot(String activity, float x, float y, int left, int top, int right, int bottom,
                             int width, int height, int rotation, int display, long capturedAt) {
@@ -124,6 +127,10 @@ public final class SystemProbe {
                             int display = (Integer) getDisplay.invoke(motion);
                             physical.event(display, readDevice, motion.getDownTime(), motion.getEventTime(),
                                     motion.getActionMasked(), SystemClock.uptimeMillis());
+                            SystemScopeCapture scoped = scopeCapture;
+                            if (scoped != null && (motion.getSource() & InputDevice.SOURCE_TOUCHSCREEN) == InputDevice.SOURCE_TOUCHSCREEN
+                                    && !physical.isInjected(display, readDevice, motion.getDownTime(), SystemClock.uptimeMillis()))
+                                scoped.pointer(motion, display, physical.soleStream(display, readDevice, motion.getDownTime()));
                             Session waiting = session;
                             if(physical.unavailable()) {
                                 pointerUnknown(waiting);
@@ -146,7 +153,16 @@ public final class SystemProbe {
                     return chain.proceed();
                 });
         Class<?> atms = loader.loadClass("com.android.server.wm.ActivityTaskManagerService");
+        activityTaskManagerType = atms;
+        try {
+            scopeCapture = new SystemScopeCapture(module, worker, () -> system, () -> atmsInstance, () -> runtime, atms, physical);
+            module.log(4, TAG, "Scope capture system hooks installed");
+        } catch (ReflectiveOperationException | RuntimeException unavailable) {
+            module.log(5, TAG, "Scope capture system unavailable: " + unavailable.getClass().getSimpleName());
+        }
         windows = new SourceWindowAccess(atms);
+        linkLaunchReady = ScopeLinkLaunchHooks.install(module, atms,
+                () -> scopeCapture == null ? null : scopeCapture.linkProbe()) > 0;
         Method entry = null;
         for (Method method : atms.getDeclaredMethods()) {
             if (!AtmsSignature.matches(method) || Modifier.isSynchronized(method.getModifiers())) continue;
@@ -247,20 +263,39 @@ public final class SystemProbe {
                 && (extras == null || !extras.hasFileDescriptors());
     }
 
+    // Runs exclusively in system_server, outside application hidden-API enforcement.
+    @android.annotation.SuppressLint("BlockedPrivateApi")
     private void register(int attempt) {
         try {
             Context context = systemContext();
             if (context == null) throw new IllegalStateException("System context pending");
+            system = context; // Read-only capture does not depend on the synthetic input adapter.
+            if (atmsInstance == null && activityTaskManagerType != null) try {
+                Method service = Class.forName("android.app.ActivityTaskManager").getDeclaredMethod("getService");
+                service.setAccessible(true); Object candidate = service.invoke(null);
+                if (activityTaskManagerType.isInstance(candidate)) atmsInstance = candidate;
+            } catch (ReflectiveOperationException | RuntimeException ignored) { }
             if(runtime==null)try {
                 java.util.function.Consumer<String> runtimeLogger=message->module.log(4,TAG,message);
                 var candidate=new io.github.yudigaga.taplusbridge.runtime.RuntimeServer(context,worker,
                         ()->module.getRemotePreferences(io.github.yudigaga.taplusbridge.runtime.RuntimeSnapshot.GROUP),
                         new io.github.yudigaga.taplusbridge.runtime.SystemPackageOps(context,runtimeLogger),runtimeLogger);
+                candidate.setSourceCapture(scopeCapture);
                 candidate.register();runtime=candidate;
             }catch(ReflectiveOperationException|RuntimeException unavailable){
                 module.log(5,TAG,"Frozen runtime unavailable: "+unavailable.getClass().getSimpleName());
             }
             InputAdapter adapter = new InputAdapter(context, physical);
+            if (scopeCapture != null && linkLaunchReady && scopeCapture.linkProbe() == null) {
+                scopeCapture.setLinkProbe(new ScopeLinkProbe(worker, physical,
+                        () -> runtime == null ? null : runtime.sourceCaptureConfiguration(),
+                        target -> {
+                            scopeCapture.validateLinkTarget(target);
+                            windows.requireTarget(atmsInstance, target.source, target.activity, target.uid, target.user,
+                                    target.display, target.x, target.y);
+                        }, (target, action, downAt) -> adapter.injectTarget(target.uid, target.display, target.x, target.y, action, downAt),
+                        message -> module.log(4, TAG, message)));
+            }
             if (!armRegistered) {
                 registerAll(context, new BroadcastReceiver() {
                     @Override public void onReceive(Context ignored, Intent command) { arm(command); }
@@ -534,24 +569,27 @@ public final class SystemProbe {
             inject.setAccessible(true); setDisplay.setAccessible(true);
         }
         boolean inject(Session session, int action, long downAt) throws ReflectiveOperationException {
+            Snapshot point = session.snapshot();
+            return injectTarget(session.ticket().uid(), point.display(), point.x(), point.y(), action, downAt);
+        }
+        boolean injectTarget(int uid, int display, float x, float y, int action, long downAt) throws ReflectiveOperationException {
             if (action == MotionEvent.ACTION_DOWN) {
                 if (!physical.released()) throw new Rejected("touch_active");
-                physical.injected(session.snapshot().display(), 0, downAt, SystemClock.uptimeMillis());
+                physical.injected(display, 0, downAt, SystemClock.uptimeMillis());
                 // InputDispatcher rewrites injected unfiltered events to VIRTUAL_KEYBOARD_ID.
                 // Keep both aliases until delivery completes, which may follow this Binder return.
-                physical.injected(session.snapshot().display(), KeyCharacterMap.VIRTUAL_KEYBOARD,
+                physical.injected(display, KeyCharacterMap.VIRTUAL_KEYBOARD,
                         downAt, SystemClock.uptimeMillis());
             }
-            Snapshot point = session.snapshot();
-            MotionEvent event = MotionEvent.obtain(downAt, SystemClock.uptimeMillis(), action, point.x(), point.y(), 0);
+            MotionEvent event = MotionEvent.obtain(downAt, SystemClock.uptimeMillis(), action, x, y, 0);
             try {
-                event.setSource(InputDevice.SOURCE_TOUCHSCREEN); setDisplay.invoke(event, point.display());
+                event.setSource(InputDevice.SOURCE_TOUCHSCREEN); setDisplay.invoke(event, display);
                 // WAIT_FOR_FINISHED=2: the popup must process outside DOWN/CANCEL before WMS is
                 // checked again. The public launch hook consumes synchronously without waiting for
                 // this worker, so a source input handler's Binder call does not form a worker cycle.
                 // A different UID receives nothing; no unscoped fallback exists.
                 long identity = Binder.clearCallingIdentity();
-                try { return Boolean.TRUE.equals(inject.invoke(manager, event, 2, session.ticket().uid())); }
+                try { return Boolean.TRUE.equals(inject.invoke(manager, event, 2, uid)); }
                 finally { Binder.restoreCallingIdentity(identity); }
             } finally { event.recycle(); }
         }

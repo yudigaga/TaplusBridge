@@ -1,16 +1,22 @@
 package io.github.yudigaga.taplusbridge.config;
 
 import android.content.Context;
+import android.content.Intent;
 import android.content.SharedPreferences;
+import io.github.yudigaga.taplusbridge.hook.HostPolicy;
 import io.github.yudigaga.taplusbridge.rules.LinkRuleEntry;
 import io.github.yudigaga.taplusbridge.rules.RuleRepository;
 import io.github.yudigaga.taplusbridge.routing.RouteRule;
 import io.github.yudigaga.taplusbridge.thaw.ThawEngine;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
 
 /** Feature preferences retain their keys; all routing data now lives in the Ice rule repository. */
 public final class ConfigStore {
+    public static final String SOURCE_SCOPE_CHANGED = "io.github.yudigaga.taplusbridge.SOURCE_SCOPE_CHANGED";
+    public static final String SCOPE_CAPTURE_KEY = "scope_capture_fallback";
+    public static final String SCOPE_LINK_PROBE_KEY = "scope_link_probe";
     private final SharedPreferences prefs;
     private final Context context;
     public ConfigStore(Context context) {
@@ -29,10 +35,51 @@ public final class ConfigStore {
     public void setNativeEnabled(boolean value) { prefs.edit().putBoolean("native", value).commit(); }
     public boolean recognitionEnabled() { return prefs.getBoolean("recognition", true); }
     public void setRecognitionEnabled(boolean value) { prefs.edit().putBoolean("recognition", value).commit(); }
+    public boolean lensEnabled() { return prefs.getBoolean("google_lens", true); }
+    public void setLensEnabled(boolean value) { prefs.edit().putBoolean("google_lens", value).commit(); }
     public boolean captureEnabled() { return prefs.getBoolean("capture", true); }
     public void setCaptureEnabled(boolean value) { prefs.edit().putBoolean("capture", value).commit(); }
     public boolean independentEnabled(){return prefs.getBoolean("independent_runtime",true);}
     public void setIndependentEnabled(boolean value){prefs.edit().putBoolean("independent_runtime",value).commit();}
+    public boolean scopeCaptureEnabled() {
+        try { return prefs.getBoolean(SCOPE_CAPTURE_KEY, false); }
+        catch (RuntimeException malformed) { return false; }
+    }
+    public boolean scopeLinkProbeEnabled() {
+        try { return prefs.getBoolean(SCOPE_LINK_PROBE_KEY, false); }
+        catch (RuntimeException malformed) { return false; }
+    }
+    public SourceScopePolicy sourceScope() {
+        if (!prefs.contains(SourceScopePolicy.KEY)) return SourceScopePolicy.unmanaged();
+        try { return SourceScopePolicy.parse(prefs.getString(SourceScopePolicy.KEY, null)); }
+        catch (RuntimeException invalid) { throw new IllegalArgumentException("source_scope_invalid"); }
+    }
+    /** One committed JSON value keeps mode and both selections in the same disk transaction. */
+    public boolean saveSourceScope(SourceScopePolicy.Mode mode, Collection<String> blacklist,
+                                   Collection<String> whitelist) {
+        return saveSourceScopeSelection(mode, blacklist, whitelist, null, null);
+    }
+    public boolean saveSourceScope(SourceScopePolicy.Mode mode, Collection<String> blacklist,
+                                   Collection<String> whitelist, boolean fallback) {
+        return saveSourceScopeSelection(mode, blacklist, whitelist, fallback, null);
+    }
+    public boolean saveSourceScope(SourceScopePolicy.Mode mode, Collection<String> blacklist,
+                                   Collection<String> whitelist, boolean fallback, boolean linkProbe) {
+        return saveSourceScopeSelection(mode, blacklist, whitelist, fallback, linkProbe);
+    }
+    private boolean saveSourceScopeSelection(SourceScopePolicy.Mode mode, Collection<String> blacklist,
+                                            Collection<String> whitelist, Boolean fallback, Boolean linkProbe) {
+        if (android.os.Process.myUid() / 100000 != 0)
+            throw new IllegalStateException("请在主用户中设置传送门的生效应用");
+        String raw = SourceScopePolicy.of(mode, blacklist, whitelist).encode();
+        SharedPreferences.Editor editor = prefs.edit().putString(SourceScopePolicy.KEY, raw);
+        // The legacy overload deliberately leaves the existing key untouched.
+        if (fallback != null) editor.putBoolean(SCOPE_CAPTURE_KEY, fallback);
+        if (linkProbe != null) editor.putBoolean(SCOPE_LINK_PROBE_KEY, linkProbe);
+        if (!editor.commit()) return false;
+        context.sendBroadcast(new Intent(SOURCE_SCOPE_CHANGED).setPackage(HostPolicy.HOST_PACKAGE));
+        return true;
+    }
     public ThawEngine.Mode mode() {
         String value;
         try { value = prefs.getString("engine", "ROOT"); }

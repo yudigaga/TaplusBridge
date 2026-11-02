@@ -43,6 +43,14 @@ public final class PhysicalTouchState {
     }
     public synchronized boolean released() { return observedUp && !overflow && active.isEmpty() && uncertain.isEmpty(); }
     public synchronized boolean unavailable() { return overflow; }
+    public synchronized boolean isInjected(int display, int device, long downAt, long now) {
+        prune(now); return injected.containsKey(new Stream(display, device, downAt));
+    }
+    public synchronized boolean soleStream(int display, int device, long downAt) {
+        Long activeDown = active.get(device);
+        return display == 0 && !overflow && uncertain.isEmpty() && active.size() == 1
+                && activeDown != null && activeDown == downAt;
+    }
     public synchronized long releasedAt() { return released()?releasedAt:-1; }
     public synchronized void unknown() { observedUp=false; overflow=true; }
     /** A readable device with one malformed event cannot disable unrelated future gestures globally. */

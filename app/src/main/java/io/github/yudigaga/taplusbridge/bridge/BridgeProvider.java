@@ -19,6 +19,7 @@ import java.util.Arrays;
 import io.github.yudigaga.taplusbridge.config.ConfigStore;
 import io.github.yudigaga.taplusbridge.capture.CaptureBroker;
 import io.github.yudigaga.taplusbridge.capture.CaptureLease;
+import io.github.yudigaga.taplusbridge.hook.HostPolicy;
 
 public final class BridgeProvider extends ContentProvider {
     @Override public boolean onCreate() {
@@ -27,6 +28,9 @@ public final class BridgeProvider extends ContentProvider {
     }
     @Override public Bundle call(String method, String arg, Bundle extras) {
         Context context = getContext();
+        if (context != null && "lens_config".equals(method) && Binder.getCallingUid() == Process.myUid()) {
+            Bundle result = new Bundle(); result.putBoolean("enabled", new ConfigStore(context).lensEnabled()); return result;
+        }
         if (context != null && ("capture_take".equals(method) || "capture_report".equals(method)
                 || ("probe_status".equals(method) && Binder.getCallingUid() == 1000))) {
             if (Binder.getCallingUid() != 1000) return Bundle.EMPTY;
@@ -42,7 +46,8 @@ public final class BridgeProvider extends ContentProvider {
         }
         if (context == null || (!BridgeContract.PREPARE.equals(method) && !"resolve".equals(method)
                 && !"recognition_status".equals(method) && !"capture_available".equals(method)
-                && !"capture_arm".equals(method) && !"probe_arm".equals(method) && !"probe_status".equals(method) && !"capture_cancel".equals(method))) return Bundle.EMPTY;
+                && !"capture_arm".equals(method) && !"probe_arm".equals(method) && !"probe_status".equals(method) && !"capture_cancel".equals(method)
+                && !"source_scope".equals(method) && !"lens_config".equals(method))) return Bundle.EMPTY;
         int uid = Binder.getCallingUid();
         if (uid / 100000 != Process.myUid() / 100000) return Bundle.EMPTY;
         String[] callers = context.getPackageManager().getPackagesForUid(uid);
@@ -50,7 +55,13 @@ public final class BridgeProvider extends ContentProvider {
         long identity = Binder.clearCallingIdentity();
         try {
             PackageInfo host = context.getPackageManager().getPackageInfo(BridgeContract.HOST_PACKAGE, 0);
-            if (host.getLongVersionCode() != 40013 || !"4.1.3".equals(host.versionName)) return declined("unsupported_host");
+            if (!HostPolicy.supportedVersion(host.versionName, host.getLongVersionCode())) return declined("unsupported_host");
+            if ("lens_config".equals(method)) {
+                Bundle result = new Bundle(); result.putBoolean("enabled", new ConfigStore(context).lensEnabled()); return result;
+            }
+            if ("source_scope".equals(method)) {
+                Bundle result = new Bundle(); result.putString("policy", new ConfigStore(context).sourceScope().encode()); return result;
+            }
             if ("probe_status".equals(method)) {
                 Bundle result = new Bundle(); result.putBoolean("saved", CaptureBroker.recordProbeStatus(context, extras)); return result;
             }

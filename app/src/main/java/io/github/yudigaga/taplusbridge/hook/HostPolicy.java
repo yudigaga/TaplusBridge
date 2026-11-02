@@ -7,15 +7,16 @@ import java.util.regex.Pattern;
 public final class HostPolicy {
     public static final String HOST_PACKAGE = "com.miui.contentextension";
     public static final String MODULE_PACKAGE = "io.github.yudigaga.taplusbridge";
-    public static final String HOST_VERSION = "4.1.3";
-    public static final long HOST_VERSION_CODE = 40013;
+    public static final String HOST_VERSION = "5.1.5";
+    public static final long HOST_VERSION_CODE = 50015;
     private static final Pattern PACKAGE = Pattern.compile(
             "[A-Za-z][A-Za-z0-9_]*(?:\\.[A-Za-z][A-Za-z0-9_]*)+");
 
     private HostPolicy() {}
 
     public static boolean supportedVersion(String name, long code) {
-        return HOST_VERSION.equals(name) && code == HOST_VERSION_CODE;
+        return (HOST_VERSION.equals(name) && code == HOST_VERSION_CODE)
+                || ("4.1.3".equals(name) && code == 40013);
     }
 
     public static boolean validTarget(String value) {

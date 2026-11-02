@@ -14,11 +14,14 @@ TIMESTAMP = re.compile(r"\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?")
 MODULE_EVENTS = (
     "API 102 module loaded", "ContentCatcher session source tracking installed",
     "Host-only local recognition and destination card hooks installed", "Recommendation builder hook installed",
-    "Clipboard URL builder hook installed", "Host 4.1.3/40013 contract active",
+    "Clipboard URL builder hook installed", "Host 4.1.3/40013 contract active", "Host 5.1.5/50015 contract active",
     "System framework callback reached", "System one-shot observation hook installed",
     "System observation command channel ready", "System observation requires Android 13 or newer",
     "Invisible probe public Binder hook installed", "Invisible probe command channel ready",
     "runtime channel ready", "runtime launch claimed", "runtime launch submitted",
+    "Source app scope hooks installed", "Source app scope published", "Source app scope capture configuration requested",
+    "Scope capture system hooks installed", "Scope capture host delivery installed",
+    "Scope link launch hooks installed",
 )
 FAILURE_EVENTS = (
     "System observer unavailable", "System command channel unavailable", "Capture arm unavailable",
@@ -29,6 +32,10 @@ FAILURE_EVENTS = (
     "Probe preparation rejected", "Probe input rejected", "Probe identity skipped",
     "Probe options cancellation limited", "Probe metadata unavailable",
     "Frozen runtime unavailable", "runtime launch failed",
+    "Source app scope unavailable", "Source app scope publication unavailable", "Source app scope preserved published state",
+    "Source app scope package observer unavailable",
+    "Scope capture system unavailable", "Scope capture host unavailable",
+    "Scope link options cancellation limited",
     "Recognition hooks unavailable", "Recognition enhancement preserved host flow",
 )
 EXCEPTIONS = frozenset((
@@ -37,7 +44,7 @@ EXCEPTIONS = frozenset((
     "ClassNotFoundException", "IllegalAccessException", "InvocationTargetException", "NullPointerException",
     "NameNotFoundException", "RemoteException", "DeadObjectException", "UnsupportedOperationException",
     "Rejected", "Unavailable",
-    "ReflectiveOperationException", "Throwable",
+    "ReflectiveOperationException", "Throwable", "IOException",
 ))
 RECOGNITION_STAGES = frozenset((
     "capture_text", "capture_catcher", "capture_image", "capture_clipboard", "capture_ocr",
@@ -102,10 +109,50 @@ HOST_LOGCAT_PREFIX = (
 HOST_ACK = re.compile(HOST_LOGCAT_PREFIX + r"capture stage=host_ack outcome=(accepted|failed)(?:\s|$)")
 HOST_PROBE_RESULT = re.compile(HOST_LOGCAT_PREFIX + r"probe stage=host_result outcome=(captured)(?:\s|$)")
 HOST_PROBE = re.compile(HOST_LOGCAT_PREFIX + r"probe stage=")
+MODULE_SOURCE_SCOPE = re.compile(re.escape(MODULE_TAG)
+    + r"[^\]\r\n]+\]\s+source scope stage=(host_gate|host_presentation) outcome=([a-z_]+)(?=\s|$)")
+SOURCE_SCOPE_OUTCOMES = {
+    "host_gate": frozenset(("allowed", "denied", "unmanaged", "unavailable")),
+    "host_presentation": frozenset(("passed", "property_blocked", "scope_blocked")),
+}
+SOURCE_SCOPE_PACKAGES = {
+    "org.lsposed.manager": "lsposed_manager",
+    "com.resukisu.resukisu": "root_manager",
+    "com.android.chrome": "chrome",
+}
+SOURCE_SCOPE_KINDS = frozenset((*SOURCE_SCOPE_PACKAGES.values(), "other", "unknown"))
+SCOPE_CAPTURE_STAGES = frozenset(("gesture", "submitted", "rejected", "failed", "host_received", "host_submitted"))
+SCOPE_CAPTURE_HOST_ERRORS = frozenset(("request", "read", "deliver", "native"))
+SCOPE_CAPTURE_REASONS = EXCEPTIONS | frozenset((
+    "none", "capture_focus", "capture_identity", "capture_main_window", "capture_secure", "capture_ime",
+    "capture_bounds", "capture_window_changed", "capture_snapshot", "capture_window_unavailable",
+    "capture_surface", "capture_buffer", "capture_secure_buffer", "capture_unavailable", "capture_attributes",
+    "capture_display", "capture_popup_limit", "capture_hidden", "scope_image_large", "scope_image_encode",
+    "scope_image_missing", "scope_host_unavailable",
+))
+SCOPE_CAPTURE_MESSAGE = re.compile(r"^[sS]cope capture stage=([a-z_]+)(?=\s|$)")
+MODULE_SCOPE_CAPTURE = re.compile(re.escape(MODULE_TAG) + r"[^\]\r\n]+\]\s+([sS]cope capture stage=.*)$")
+HOST_SCOPE_CAPTURE = re.compile(HOST_LOGCAT_PREFIX + r"([sS]cope capture stage=.*)$")
+HOST_PRIVACY_THREAD_GUARD = re.compile(HOST_LOGCAT_PREFIX.replace("TaplusBridge", "Privacy_PrivacyManager")
+    + r"can not request privacy update in main thread!(?=\s|$)")
+SCOPE_LINK_STAGES = frozenset(("rejected", "armed", "blocked", "tapped", "finished", "captured"))
+SCOPE_LINK_REASONS = frozenset((
+    "none", "candidate_invalid", "new_touch", "touch_changed", "short_press", "configuration_changed",
+    "window_changed", "unsupported_launch", "http", "candidate_changed", "input_or_window_changed",
+    "cancelled", "native_won", "native_pick", "same_gesture_tail", "timeout", "captured", "window_or_configuration_changed",
+))
+SCOPE_LINK_MESSAGE = re.compile(r"^scope link stage=([a-z_]+)(?=\s|$)")
+MODULE_SCOPE_LINK = re.compile(re.escape(MODULE_TAG) + r"[^\]\r\n]+\]\s+(scope link stage=.*)$")
+HOST_SCOPE_LINK = re.compile(HOST_LOGCAT_PREFIX + r"(scope link stage=.*)$")
+NATIVE_SOURCE_SCOPE = re.compile(HOST_LOGCAT_PREFIX.replace("TaplusBridge", "ContentCatcher_TaplusBlackListHelper")
+    + r"blackList size:\s*([0-9]{1,6})\s+(?:package is\s*(.*?)\s+)?isInTaplusWhiteList:\s*(true|false)(?=\s|$)")
+HOST_OBSERVE_CONTROL = re.compile(HOST_LOGCAT_PREFIX.replace("TaplusBridge", "Taplus\\.TextContentExtensionService")
+    + r"contains observe_control_event return(?=\s|$)")
 SYSTEM_RUNTIME_START = re.compile(HOST_LOGCAT_PREFIX.replace("TaplusBridge", "ActivityTaskManager")
     + r"START\s+u([0-9]{1,4})\s+.*?\bact=io\.github\.yudigaga\.taplusbridge\.RUNTIME_OPEN_V1(?=[\s;}])")
 SYSTEM_STARTUP_EVENTS = frozenset(("System framework callback reached", "System one-shot observation hook installed",
-    "System observation command channel ready", "Invisible probe public Binder hook installed", "Invisible probe command channel ready"))
+    "System observation command channel ready", "Invisible probe public Binder hook installed", "Invisible probe command channel ready",
+    "Scope capture system hooks installed"))
 
 
 def valid_date(value):
@@ -145,6 +192,45 @@ def exception_field(line):
     return simple if simple in EXCEPTIONS else "OTHER"
 
 
+def source_scope_kind(package_name):
+    if package_name in SOURCE_SCOPE_PACKAGES:
+        return SOURCE_SCOPE_PACKAGES[package_name]
+    if package_name and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+", package_name):
+        return "other"
+    return "unknown"
+
+
+def scope_capture_metadata(message):
+    match = SCOPE_CAPTURE_MESSAGE.match(message)
+    if not match:
+        return None
+    stage = match.group(1)
+    if stage in SCOPE_CAPTURE_HOST_ERRORS:
+        stage = "host_" + stage
+    elif stage not in SCOPE_CAPTURE_STAGES:
+        return None
+    reason = re.search(r"(?:^|\s)(?:reason|failure)=([^\s]+)(?=\s|$)", message)
+    reason = reason.group(1) if reason and reason.group(1) in SCOPE_CAPTURE_REASONS else "unknown"
+    source = re.search(r"(?:^|\s)source(?:_kind)?=([^\s]+)(?=\s|$)", message)
+    fields = {"stage": stage, "reason": reason,
+              "source_kind": source.group(1) if source and source.group(1) in SOURCE_SCOPE_KINDS else "unknown"}
+    cause = re.search(r"(?:^|\s)cause=([^\s]+)(?=\s|$)", message)
+    if cause:
+        fields["root_cause"] = cause.group(1) if cause.group(1) in EXCEPTIONS else "unknown"
+    return fields
+
+
+def scope_link_metadata(message):
+    match = SCOPE_LINK_MESSAGE.match(message)
+    if not match or match.group(1) not in SCOPE_LINK_STAGES:
+        return None
+    reason = re.search(r"(?:^|\s)reason=([^\s]+)(?=\s|$)", message)
+    source = re.search(r"(?:^|\s)source(?:_kind)?=([^\s]+)(?=\s|$)", message)
+    return {"stage": match.group(1),
+            "reason": reason.group(1) if reason and reason.group(1) in SCOPE_LINK_REASONS else "unknown",
+            "source_kind": source.group(1) if source and source.group(1) in SOURCE_SCOPE_KINDS else "unknown"}
+
+
 def probe_metadata(line, stage):
     fields = {"stage": stage}
     if stage in ("ready", "waiting_release"):
@@ -174,6 +260,9 @@ def analyze(path, after=None, date=None):
         selected_date, date_source = (valid_date(date), "explicit") if date else infer_date(path, records)
         module_events, diagnostic_events, capture_events, failure_events, probe_events, perf_events = [], [], [], [], [], []
         runtime_launch_events = []
+        source_scope_events = []
+        scope_capture_events = []
+        scope_link_events = []
         earlier_system = {}
         for name, number, line, at in records:
             if selected_date and (not at or at[:10] != selected_date):
@@ -185,10 +274,23 @@ def analyze(path, after=None, date=None):
             if after and (not at or at.split("T", 1)[1][:8] < after):
                 continue
             provenance = {"source": name, "line": number, "at": at}
+            scope_link = MODULE_SCOPE_LINK.search(line)
+            link_metadata = scope_link_metadata(scope_link.group(1)) if scope_link else None
+            if link_metadata:
+                scope_link_events.append({**provenance, **link_metadata})
+            scope_capture = MODULE_SCOPE_CAPTURE.search(line)
+            capture_metadata = scope_capture_metadata(scope_capture.group(1)) if scope_capture else None
+            if capture_metadata:
+                scope_capture_events.append({**provenance, **capture_metadata})
+            source_scope = MODULE_SOURCE_SCOPE.search(line)
+            if source_scope and source_scope.group(2) in SOURCE_SCOPE_OUTCOMES[source_scope.group(1)]:
+                source_scope_events.append({**provenance, "stage": source_scope.group(1), "outcome": source_scope.group(2),
+                    "mode": enum_field(line[source_scope.start():], "mode", {"BLACKLIST", "WHITELIST"}) or "UNKNOWN",
+                    "source_kind": enum_field(line[source_scope.start():], "source", SOURCE_SCOPE_KINDS) or "unknown"})
             known = next((event for event in MODULE_EVENTS if event in line), None)
             if known:
                 event = {**provenance, "event": known}
-                build = re.search(r"\bbuild=([0-9]+\.[0-9]+\.[0-9]+-dev/[0-9]+)\b", line)
+                build = re.search(r"\bbuild=([0-9]+\.[0-9]+\.[0-9]+(?:-dev)?/[0-9]+)\b", line)
                 if build:
                     event["build"] = build.group(1)
                 system = re.search(r"\bsystem_server=(true|false)\b", line)
@@ -263,6 +365,26 @@ def analyze(path, after=None, date=None):
                 r"/(?:product|system|system_ext)/[A-Za-z0-9_./-]{0,220}/ContentCatcher[A-Za-z0-9_.-]*\.apk\b", line))
             stamped = re.match(r"\d\d-\d\d \d\d:\d\d:\d\d(?:\.\d+)?", line)
             in_window = stamped and (not selected_date or line[:5] == selected_date[5:]) and (not after or line[6:14] >= after)
+            scope_link = HOST_SCOPE_LINK.match(line) if in_window else None
+            link_metadata = scope_link_metadata(scope_link.group(1)) if scope_link else None
+            if link_metadata:
+                scope_link_events.append({"source": "full.log", "line": number, "at": stamped.group(), **link_metadata})
+            scope_capture = HOST_SCOPE_CAPTURE.match(line) if in_window else None
+            capture_metadata = scope_capture_metadata(scope_capture.group(1)) if scope_capture else None
+            if capture_metadata:
+                scope_capture_events.append({"source": "full.log", "line": number, "at": stamped.group(), **capture_metadata})
+            if in_window and HOST_PRIVACY_THREAD_GUARD.match(line):
+                scope_capture_events.append({"source": "full.log", "line": number, "at": stamped.group(),
+                    "stage": "host_thread_guard", "reason": "main_thread", "source_kind": "unknown"})
+            native_scope = NATIVE_SOURCE_SCOPE.match(line) if in_window else None
+            if native_scope and int(native_scope.group(1)) <= 65536:
+                source_scope_events.append({"source": "full.log", "line": number, "at": stamped.group(),
+                    "stage": "native_gate", "native_blacklist_size": int(native_scope.group(1)),
+                    "allowed": native_scope.group(3) == "true",
+                    "source_kind": source_scope_kind(native_scope.group(2))})
+            if in_window and HOST_OBSERVE_CONTROL.match(line):
+                source_scope_events.append({"source": "full.log", "line": number, "at": stamped.group(),
+                    "stage": "observe_control", "event": "observation_control_return"})
             runtime_start = SYSTEM_RUNTIME_START.match(line) if in_window else None
             if runtime_start:
                 event = {"source": "full.log", "line": number, "at": stamped.group(),
@@ -300,6 +422,10 @@ def analyze(path, after=None, date=None):
         if current:
             relevant_records.append(current)
         for number, line in relevant_records:
+            if HOST_OBSERVE_CONTROL.match(line):
+                # An observation-control callback is not a text/image capture, even if later text
+                # in the same record happens to quote one of the ordinary capture markers.
+                continue
             marker = "onPickText sContent:"
             if marker in line:
                 value = line.split(marker, 1)[1]
@@ -316,9 +442,14 @@ def analyze(path, after=None, date=None):
             "probe_events": probe_events,
             "perf_events": perf_events,
             "runtime_launch_events": runtime_launch_events,
+            "source_scope_events": source_scope_events,
+            "scope_capture_events": scope_capture_events,
+            "scope_link_events": scope_link_events,
             "observed_stages": sorted({event["stage"] for event in diagnostic_events}),
             "observed_capture_stages": sorted({event["stage"] for event in capture_events}),
             "observed_probe_stages": sorted({event["stage"] for event in probe_events}),
+            "observed_scope_capture_stages": sorted({event["stage"] for event in scope_capture_events}),
+            "observed_scope_link_stages": sorted({event["stage"] for event in scope_link_events}),
             "system_capture_apks": sorted(component_paths), "text_events": text_events, "image_events": image_events,
             "raw_content_persisted": False, "url_hosts_persisted": False,
             "limits": "Only fixed log events and bounded metadata are retained. An armed event does not prove host acknowledgement. Earlier startup events are context, not proof that their process remained alive. Missing events do not prove missing URL fields or reconstruct a destination."}

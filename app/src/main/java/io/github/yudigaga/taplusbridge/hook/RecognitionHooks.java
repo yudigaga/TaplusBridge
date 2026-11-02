@@ -46,6 +46,10 @@ public final class RecognitionHooks {
     private final AutoProbeReadiness autoProbe;
     private final RecognitionEpochs origins=new RecognitionEpochs();
     private Field recommendationTask,segmentTask,segmenting,ocrDisposable;
+    private Method requestRecommendation, requestSegments, recognizeImage, imageBitmap, recommendationUrl, publishSegments;
+    private String scopeLinkUrl, scopeText;
+    private boolean mixedImage, mixedPrepared;
+    private final ProbeRecommendations scopeRecommendations = new ProbeRecommendations();
     private volatile Object pickService;
     private volatile long lastPickAt;
     private volatile boolean probeGeometry;
@@ -81,6 +85,13 @@ public final class RecognitionHooks {
         hookBoundary(method(service, "onStartPick", false), "pick");
         hookBoundary(method(service, "cancelTask", false), "cancel");
         hookBoundary(method(service, "onDestroy", false), "destroy");
+        Method otherMode = method(service, "isOtherMode", true);
+        requireResult(otherMode, boolean.class);
+        module.hook(otherMode).setId("taplusbridge:recognition-mixed-entries")
+                .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).intercept(chain -> {
+                    synchronized (sessionLock) { if (active && mixedImage) return true; }
+                    return chain.proceed();
+                });
         Method start = method(service, "onStartCommand", false, Intent.class, int.class, int.class);
         requireResult(start, int.class);
         module.hook(start).setId("taplusbridge:recognition-service")
@@ -106,6 +117,7 @@ public final class RecognitionHooks {
                         try {
                             if (contextSupported(chain.getThisObject())) {
                                 pickService = chain.getThisObject();
+                                captureScopeContent(chain.getArg(0), "onPickImage".equals(name));
                                 rememberProbePick(chain.getArg(0), "onPickImage".equals(name));
                                 enhancer.capture(chain.getArg(0));
                                 enhancer.diagnostic("onPickImage".equals(name) ? "capture_image" : "capture_catcher",
@@ -127,6 +139,7 @@ public final class RecognitionHooks {
                         Object result = supported && Looper.myLooper()==Looper.getMainLooper()
                                 ?origins.scoped(origin,chain::proceed):chain.proceed();
                         if (supported) {
+                            if ("startPickImageTask".equals(name)) prepareMixedImage(origin);
                             recordStatus(hostContext());
                             schedulePublish();
                         }
@@ -134,6 +147,12 @@ public final class RecognitionHooks {
                     });
         }
         Class<?> recommendations = loader.loadClass(ROOT + "data.recognition.TextRecommendationUtils");
+        requestRecommendation = method(recommendations, "tryToGetRecommendation", true, Context.class, String.class, String.class);
+        requestSegments = method(recommendations, "getTextSegmentResponse", true, Context.class, String.class, boolean.class);
+        recognizeImage = method(loader.loadClass(ROOT + "data.recognition.ImageRecognition"), "doImageRecognize", true, Bitmap.class);
+        imageBitmap = method(service, "getBitmap", true);
+        recommendationUrl = method(loader.loadClass(ROOT + "data.http.HostConfig"), "getUrl", true, int.class);
+        publishSegments = method(loader.loadClass(ROOT + "text.RecommendationMonitor"), "onSegmentReady", true, ArrayList.class, boolean.class);
         recommendationTask=recommendations.getDeclaredField("sLastRecommendationTask");
         if(!Modifier.isStatic(recommendationTask.getModifiers())
                 || !AsyncTask.class.isAssignableFrom(recommendationTask.getType()))
@@ -163,8 +182,9 @@ public final class RecognitionHooks {
                         Context context = hostContext();
                         if (supported(context) && input != null && isActive() && (synthetic.get() || currentOrigin())) {
                             if (!synthetic.get()) synchronized (sessionLock) {
-                                lastServer = new ArrayList<>(input);
                                 enhancer.captureRecommendationLinks(input);
+                                input = scopeLinkUrl == null ? input : scopeRecommendations.merge(input, enhancer::isProbeRecommendation);
+                                lastServer = new ArrayList<>(input);
                             }
                             replacement = enhancer.merge(context, input, safeSource());
                             enhancer.diagnostic(synthetic.get() ? "publish_local" : "publish_server", "published",
@@ -283,7 +303,21 @@ public final class RecognitionHooks {
                             ocrText=text;
                         }
                     } catch (ReflectiveOperationException|RuntimeException failure) { report(failure); }
-                    Object result=capturedEpoch>=0?origins.scoped(capturedEpoch,chain::proceed):chain.proceed();
+                    Object[] arguments = null;
+                    if (capturedEpoch >= 0 && "tryToGetRecommendation".equals(capture.getName())) {
+                        String link;
+                        synchronized (sessionLock) { link = scopeLinkUrl; }
+                        String original = chain.getArg(textIndex) instanceof String value ? value : null;
+                        String merged = recommendationText(original, link);
+                        if (!java.util.Objects.equals(original, merged)) {
+                            arguments = new Object[capture.getParameterCount()];
+                            for (int i = 0; i < arguments.length; i++) arguments[i] = chain.getArg(i);
+                            arguments[textIndex] = merged;
+                        }
+                    }
+                    Object[] replacement = arguments;
+                    Object result=capturedEpoch>=0?origins.scoped(capturedEpoch,
+                            () -> replacement == null ? chain.proceed() : chain.proceed(replacement)):chain.proceed();
                     if(taskField!=null && capturedEpoch>=0)try {
                         Object after=taskField.get(null);
                         if(after!=null && after!=previousTask)origins.bind(after,capturedEpoch);
@@ -363,6 +397,8 @@ public final class RecognitionHooks {
             scheduledEpoch = -1;
             lastServer = new ArrayList<>();
             enhancer.clear();
+            scopeLinkUrl = scopeText = null; mixedImage = mixedPrepared = false;
+            scopeRecommendations.clear();
             probeGeometry = false; lastPickAt = 0;
             autoProbe.reset(epoch); pickService = null;
         }
@@ -373,12 +409,98 @@ public final class RecognitionHooks {
 
     private boolean isActive() { synchronized (sessionLock) { return active; } }
 
+    private void captureScopeContent(Object result, boolean image) {
+        try {
+            Object raw = result.getClass().getMethod("getPropertyMap").invoke(result);
+            if (!(raw instanceof Map<?, ?> map)) return;
+            String url = map.get("taplus_scope_link_url") instanceof String value
+                    && ScopeCapturePayload.validTextUrl(value) ? value : null;
+            String text = map.get("taplus_scope_text") instanceof String value ? value : null;
+            if (text != null && text.length() > 131072) text = text.substring(0, 131072);
+            synchronized (sessionLock) {
+                scopeLinkUrl = url; scopeText = text;
+                mixedImage = image && Boolean.TRUE.equals(map.get("taplus_scope_mixed"));
+                mixedPrepared = false;
+            }
+            if (url != null) enhancer.captureProbeUrl(url);
+        } catch (ReflectiveOperationException | RuntimeException failure) { report(failure); }
+    }
+
+    /** The native image, text segmentation, OCR and URL cards share one task and one pair of views. */
+    private void prepareMixedImage(long origin) {
+        if (Looper.myLooper() != Looper.getMainLooper()) { main.post(() -> prepareMixedImage(origin)); return; }
+        String url, text;
+        synchronized (sessionLock) {
+            if (!active || epoch != origin || !mixedImage || mixedPrepared) return;
+            mixedPrepared = true; url = scopeLinkUrl; text = scopeText;
+        }
+        Context context = hostContext();
+        if (!supported(context)) return;
+        try {
+            origins.scoped(origin, () -> {
+                // Splash waits for a segment event even for URL-only images; real OCR replaces this empty state later.
+                publishSegments.invoke(null, new ArrayList<>(), true);
+                String endpoint = (String) recommendationUrl.invoke(null, 1);
+                if (text != null && !text.isEmpty()) {
+                    requestRecommendation.invoke(null, context, endpoint, text);
+                    requestSegments.invoke(null, context, text, false);
+                } else {
+                    if (url != null) requestRecommendation.invoke(null, context, endpoint, url);
+                    Object bitmap = imageBitmap.invoke(null);
+                    if (bitmap instanceof Bitmap image && !image.isRecycled()) recognizeImage.invoke(null, image);
+                }
+                return null;
+            });
+        } catch (Throwable failure) { report(failure); }
+    }
+
+    static String recommendationText(String original, String url) {
+        if (!ScopeCapturePayload.validTextUrl(url) || url.equals(original)
+                || io.github.yudigaga.taplusbridge.recognition.LinkExtractor.extract(original).contains(url)) return original;
+        return original == null || original.isEmpty() ? url : original + "\n" + url;
+    }
+
+    /** Only actual cards for this probe URL survive a later OCR response in the same pick. */
+    static final class ProbeRecommendations {
+        private final java.util.LinkedHashMap<String, Object> saved = new java.util.LinkedHashMap<>();
+        void clear() { saved.clear(); }
+        ArrayList<?> merge(ArrayList<?> incoming, java.util.function.Predicate<Object> probeCard) {
+            ArrayList<Object> result = new ArrayList<>();
+            java.util.HashSet<String> existing = new java.util.HashSet<>();
+            for (Object value : incoming) {
+                String key = key(value);
+                boolean probe = probeCard.test(value), first = existing.add(key);
+                if (!probe || first) result.add(value);
+                if (probe && saved.size() < 32) saved.put(key, value);
+            }
+            for (var entry : saved.entrySet()) if (existing.add(entry.getKey())) result.add(entry.getValue());
+            return result;
+        }
+        private String key(Object value) {
+            if (value == null) return "null";
+            try {
+                StringBuilder result = new StringBuilder(value.getClass().getName());
+                for (String name : new String[]{"getDetailUrl", "getPackageName", "getIntent", "getCategory"}) {
+                    Object field = value.getClass().getMethod(name).invoke(value);
+                    String text = String.valueOf(field);
+                    result.append('|').append(text.length()).append(':').append(text);
+                }
+                return result.toString();
+            } catch (ReflectiveOperationException | RuntimeException unsupported) {
+                return value.getClass().getName() + '@' + System.identityHashCode(value);
+            }
+        }
+    }
+
     private void rememberProbePick(Object result, boolean image) {
         probeGeometry = false; lastPickAt = 0;
+        synchronized (sessionLock) { if (mixedImage || scopeLinkUrl != null) return; }
         try {
             Object params = result.getClass().getMethod("getParams", String.class)
                     .invoke(result, image ? "image_pick" : "text_pick");
             Object payload = params instanceof Map<?, ?> map ? map.get(image ? "image_pick_mode" : "pick_mode") : null;
+            // A window screenshot is not proof of a card rectangle; never synthesize a source click from it.
+            if (payload instanceof Bundle captured && captured.getBoolean("taplus_scope_capture")) return;
             if (payload instanceof Bundle bundle && bundle.getParcelable("view_rect") instanceof Rect rect && !rect.isEmpty()) {
                 probeGeometry = true; lastPickAt = SystemClock.elapsedRealtime();
             }
@@ -399,7 +521,7 @@ public final class RecognitionHooks {
     private void scheduleAutoProbe() {
         final long pickedEpoch;
         synchronized (sessionLock) {
-            if (!active || pickService == null || !autoProbe.ready(epoch)
+            if (!active || !probeGeometry || pickService == null || !autoProbe.ready(epoch)
                     || !HostCaptureAction.eligible(safeSource())) return;
             pickedEpoch = epoch;
         }

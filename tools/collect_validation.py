@@ -36,8 +36,11 @@ def native_alignment(archive):
     return libraries
 
 
-def collect(build, artifacts, version, code, warnings):
-    apk = artifacts / ("TaplusBridge-" + version + "-dev.apk")
+def collect(build, artifacts, version, code, warnings, variant="debug", certificate_sha256=None):
+    release = variant == "release"
+    suffix = "-release" if release else "-dev"
+    version_name = version if release else version + "-dev"
+    apk = artifacts / ("TaplusBridge-" + version + suffix + ".apk")
     suites = []
     results = build / "test-results/testDebugUnitTest"
     for file in sorted(results.glob("TEST-*.xml")):
@@ -47,13 +50,21 @@ def collect(build, artifacts, version, code, warnings):
     assert suites, "No test results"
     totals = {name: sum(row[name] for row in suites) for name in ("tests", "failures", "errors", "skipped")}
     assert totals["failures"] == totals["errors"] == totals["skipped"] == 0, totals
-    lint = (build / "reports/lint-results-debug.txt").read_text(encoding="utf-8")
+    lint_path = build / ("reports/lint-results-" + variant + ".txt")
+    lint = lint_path.read_text(encoding="utf-8")
     assert f"0 errors, {warnings} warnings" in lint, "Review changed lint result"
     shutil.copytree(results, artifacts / ("junit-" + version), dirs_exist_ok=True)
-    shutil.copy2(build / "reports/lint-results-debug.txt", artifacts / ("lint-" + version + ".txt"))
+    shutil.copy2(lint_path, artifacts / ("lint-" + version + ".txt"))
     certificate = (artifacts / ("apksigner-" + version + ".txt")).read_text(encoding="utf-8-sig")
-    assert "v2): true" in certificate and "CN=Android Debug" in certificate
-    assert "4e06d06e242802a8b8e77f696079ddd78e3d615d0cf73b781f3a187abb51f980" in certificate
+    assert "v2): true" in certificate
+    if release:
+        assert certificate_sha256 and re.fullmatch(r"[0-9a-fA-F]{64}", certificate_sha256), "Expected release certificate required"
+        assert "CN=Android Debug" not in certificate, "Release must use the long-term key"
+    else:
+        certificate_sha256 = "4e06d06e242802a8b8e77f696079ddd78e3d615d0cf73b781f3a187abb51f980"
+        assert "CN=Android Debug" in certificate
+    actual_certificate = re.search(r"Signer #1 certificate SHA-256 digest: ([0-9a-fA-F]{64})", certificate)
+    assert actual_certificate and actual_certificate.group(1).lower() == certificate_sha256.lower(), "Signing certificate changed"
     assert "Verification successful" in (artifacts / ("zipalign-" + version + ".txt")).read_text(encoding="utf-8-sig")
     with zipfile.ZipFile(apk) as archive:
         entry = archive.read("META-INF/xposed/java_init.list").decode().strip()
@@ -80,7 +91,7 @@ def collect(build, artifacts, version, code, warnings):
     ns = "{http://schemas.android.com/apk/res/android}"
     manifest = ET.parse(artifacts / ("module-manifest-" + version + ".xml")).getroot()
     assert manifest.attrib["package"] == "io.github.yudigaga.taplusbridge"
-    assert manifest.attrib[ns + "versionName"] == version + "-dev"
+    assert manifest.attrib[ns + "versionName"] == version_name
     assert manifest.attrib[ns + "versionCode"] == str(code)
     transit = manifest.find("application/activity[@" + ns + "name='io.github.yudigaga.taplusbridge.ui.TransitActivity']")
     assert transit is not None and ns + "theme" in transit.attrib, "No window theme on transit entry"
@@ -93,9 +104,10 @@ def collect(build, artifacts, version, code, warnings):
         "checked_at": datetime.now().astimezone().isoformat(),
         "apk": apk.name, "size": apk.stat().st_size,
         "sha256": hashlib.sha256(apk.read_bytes()).hexdigest().upper(),
-        "versionName": version + "-dev", "versionCode": code,
-        "signing": {"type": "Android Debug", "v2": True, "v3": False,
-                    "certificate_sha256": "4e06d06e242802a8b8e77f696079ddd78e3d615d0cf73b781f3a187abb51f980"},
+        "versionName": version_name, "versionCode": code,
+        "signing": {"type": "long-term release" if release else "Android Debug", "v2": True,
+                    "v3": "v3): true" in certificate,
+                    "certificate_sha256": actual_certificate.group(1).lower()},
         "zip_alignment_4_bytes": True,
         "zip_alignment_native_16k": True,
         "native_16k_alignment": "ELF PT_LOAD verified" if native_libraries else "no native libraries in module",
@@ -118,7 +130,7 @@ def collect(build, artifacts, version, code, warnings):
         "host_contract": json.loads((artifacts / ("host-contract-" + version + ".json")).read_text(encoding="utf-8")),
         "device_connected": False, "installed_on_device": False, "runtime_hook_verified": False,
         "root_shizuku_thaw_verified_on_device": False, "target_deep_links_verified_on_device": False,
-        "release_signed_with_long_term_key": False, "remote_published": False,
+        "release_signed_with_long_term_key": release, "remote_published": False,
         "wechat_or_source_app_hooked": False,
         "real_screenshot_card_payload_verified": False,
         "system_capture_mode": "automatic per-pick invisible probe after monitored physical UP; targeted source input; public Binder launch consumed before original body",
@@ -150,5 +162,8 @@ if __name__ == "__main__":
     parser.add_argument("--version", default="0.8.1")
     parser.add_argument("--code", type=int, default=14)
     parser.add_argument("--lint-warnings", type=int, required=True)
+    parser.add_argument("--variant", choices=("debug", "release"), default="debug")
+    parser.add_argument("--certificate-sha256", help="Required for release; compare with the prior signed APK")
     args = parser.parse_args()
-    collect(args.build, args.artifacts, args.version, args.code, args.lint_warnings)
+    collect(args.build, args.artifacts, args.version, args.code, args.lint_warnings,
+            args.variant, args.certificate_sha256)

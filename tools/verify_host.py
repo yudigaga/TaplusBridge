@@ -89,17 +89,38 @@ def verify(apk):
         root + "clipboard/utils/ClipboardUtils;": {
             "generateNerIntent(" + context + "Ljava/lang/String;Ljava/lang/String;)" + intent: True,
         },
+        root + "utils/TaplusSettingUtils;": {
+            "isTaplusEnable(" + context + ")Z": True,
+        },
+        root + "utils/ContentCatcherUtil;": {
+            "switchCatcherConfig(" + context + "Z)V": True,
+        },
         root + "services/TextContentExtensionService;": {
             "getInjectorPackage()Ljava/lang/String;": True,
+            "getBitmap()Landroid/graphics/Bitmap;": True,
             "parseInjectorToken(" + catcher + ")V": False,
             "onStartPick()V": False,
             "onStartCommand(" + intent + "II)I": False,
             "cancelTask()V": False, "onDestroy()V": False,
             "sIsClipboardViewShowing:Z": True,
+            "mCallback:Lmiui/contentcatcher/sdk/listener/IContentListenerCallback;": False,
         },
         info: {name + "()Ljava/lang/String;": False for name in
                ("getDetailUrl", "getIntent", "getPackageName", "getCategory")},
-        root + "App;": {"getInstance()" + root + "App;": True},
+        root + "App;": {"getInstance()" + root + "App;": True, "onCreate()V": False},
+        root + "data/common/ContentExtensionConfig;": {
+            "getInstance(" + context + ")" + root + "data/common/ContentExtensionConfig;": True,
+            "updateBlacklistAndProvider()V": False,
+            "updateBlacklistConfig(Ljava/util/List;)V": False,
+            "getConfigWithUser(" + context + "Ljava/lang/String;Ljava/lang/String;Landroid/graphics/Point;)Ljava/lang/String;": False,
+            "getConfig(" + context + "Ljava/lang/String;Ljava/lang/String;Landroid/graphics/Point;)Ljava/lang/String;": False,
+            "mIsForbiddenByUser:Z": False,
+        },
+        root + "setting/whitelist/utils/BlacklistUtils;": {
+            "getBlacklistByAllBlacklistAndLocalInstalled(" + context + ")Ljava/util/List;": True,
+            "saveBlacklistToSettingProviderIfNeed(" + context + "Ljava/util/List;)V": True,
+            "saveBlacklistToSettingProvider(" + context + "Ljava/util/List;)V": True,
+        },
         root + "text/RecommendationMonitor;": {
             "onDetailReady(Ljava/util/ArrayList;)V": True,
             "onSegmentReady(Ljava/util/ArrayList;Z)V": True,
@@ -115,6 +136,9 @@ def verify(apk):
             "processOcrResult(" + context + "Ljava/lang/String;)V": True,
             "doImageRecognize(Landroid/graphics/Bitmap;)V": True,
             "mOcrDisposable:Lio/reactivex/disposables/Disposable;": True,
+        },
+        root + "data/http/HostConfig;": {
+            "getUrl(I)Ljava/lang/String;": True,
         },
         root + "data/recognition/TextRecommendationUtils$1;": {
             "onPostExecute(Ljava/util/ArrayList;)V": False,
@@ -135,11 +159,17 @@ def verify(apk):
             "mRecommendIcon:" + root + "view/SourceIcon;": False,
         },
         root + "view/SourceIcon;": {"setIcon(Landroid/graphics/drawable/Drawable;)V": False},
+        root + "data/recognition/Entity;": {
+            "getEntityClass()Ljava/lang/String;": False,
+            "getEntityStr()Ljava/lang/String;": False,
+        },
     }
     required[root + "services/TextContentExtensionService;"].update({
         "onPickText(" + catcher + ")V": False,
         "onPickImage(" + catcher + ")V": False,
+        "initPresentationType(" + catcher + ")Z": False,
         "startPickTextTask()V": False, "startPickImageTask()V": False,
+        "isOtherMode()Z": True,
     })
     required[info].update({name + ":Ljava/lang/String;": False for name in
                            ("title", "cat", "detailUrl", "packageName", "intent", "sourceIcon")})

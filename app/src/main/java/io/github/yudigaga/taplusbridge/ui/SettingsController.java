@@ -16,6 +16,7 @@ import io.github.yudigaga.taplusbridge.bridge.LaunchPlanner;
 import io.github.yudigaga.taplusbridge.capture.CaptureBroker;
 import io.github.yudigaga.taplusbridge.capture.IntentObservation;
 import io.github.yudigaga.taplusbridge.config.ConfigStore;
+import io.github.yudigaga.taplusbridge.config.SourceScopePolicy;
 import io.github.yudigaga.taplusbridge.hook.HostPolicy;
 import io.github.yudigaga.taplusbridge.routing.RouteRule;
 import io.github.yudigaga.taplusbridge.rules.LinkRuleEntry;
@@ -26,6 +27,7 @@ import io.github.yudigaga.taplusbridge.thaw.ShizukuAccess;
 import java.lang.ref.WeakReference;
 import java.text.Collator;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
 import java.util.Set;
 import java.util.Objects;
@@ -104,7 +106,7 @@ public final class SettingsController implements AutoCloseable {
 
     /** Immutable display state; hostSupported means inspected version, not LSPosed activation. */
     public static final class Snapshot {
-        public final boolean enabled, nativeEnabled, recognitionEnabled, captureEnabled;
+        public final boolean enabled, nativeEnabled, recognitionEnabled, captureEnabled, lensEnabled;
         public final ThawEngine.Mode mode;
         public final boolean hostInstalled, hostSupported, shizukuGranted;
         public final String hostVersionName, hostVersion, shizukuStatus, versionName;
@@ -114,6 +116,7 @@ public final class SettingsController implements AutoCloseable {
                          String hostVersionName, long hostVersionCode, boolean shizukuGranted, String shizukuStatus) {
             enabled = config.enabled(); nativeEnabled = config.nativeEnabled();
             recognitionEnabled = config.recognitionEnabled(); captureEnabled = config.captureEnabled();
+            lensEnabled = config.lensEnabled();
             mode = config.mode(); this.hostInstalled = hostInstalled; this.hostSupported = hostSupported;
             this.hostVersionName = hostVersionName; this.hostVersionCode = hostVersionCode;
             hostVersion = hostInstalled ? hostVersionName + " / " + hostVersionCode : "未安装传送门";
@@ -200,10 +203,46 @@ public final class SettingsController implements AutoCloseable {
     }
     public void restoreDefaults() { requireOpen(); ruleRepository.restoreDefaults(); }
 
+    public SourceScopePolicy sourceScope() {
+        try { return config.sourceScope(); }
+        catch (IllegalArgumentException malformed) {
+            // Only a UI draft: the invalid saved value remains rejected by host/runtime readers.
+            return SourceScopePolicy.of(SourceScopePolicy.Mode.WHITELIST, List.of(), List.of());
+        }
+    }
+    public String sourceScopeError() {
+        try { config.sourceScope(); return null; }
+        catch (IllegalArgumentException malformed) { return "应用范围配置损坏，请重新选择名单并保存"; }
+    }
+    public boolean scopeCaptureEnabled() { return config.scopeCaptureEnabled(); }
+    public boolean scopeLinkProbeEnabled() { return config.scopeLinkProbeEnabled(); }
+    public void saveSourceScope(SourceScopePolicy.Mode mode, Collection<String> blacklist,
+                                Collection<String> whitelist) {
+        requireOpen();
+        if (!config.saveSourceScope(Objects.requireNonNull(mode, "mode"), blacklist, whitelist))
+            throw new IllegalStateException("应用范围保存失败，请重试");
+        CaptureBroker.cancelCurrent(context);
+    }
+    public void saveSourceScope(SourceScopePolicy.Mode mode, Collection<String> blacklist,
+                                Collection<String> whitelist, boolean fallback) {
+        requireOpen();
+        if (!config.saveSourceScope(Objects.requireNonNull(mode, "mode"), blacklist, whitelist, fallback))
+            throw new IllegalStateException("应用范围保存失败，请重试");
+        CaptureBroker.cancelCurrent(context);
+    }
+    public void saveSourceScope(SourceScopePolicy.Mode mode, Collection<String> blacklist,
+                                Collection<String> whitelist, boolean fallback, boolean linkProbe) {
+        requireOpen();
+        if (!config.saveSourceScope(Objects.requireNonNull(mode, "mode"), blacklist, whitelist, fallback, linkProbe))
+            throw new IllegalStateException("应用范围保存失败，请重试");
+        CaptureBroker.cancelCurrent(context);
+    }
+
     public void setEnabled(boolean enabled) {
         requireOpen(); config.setEnabled(enabled); if (!enabled) CaptureBroker.cancelCurrent(context);
     }
     public void setNativeEnabled(boolean enabled) { requireOpen(); config.setNativeEnabled(enabled); }
+    public void setLensEnabled(boolean enabled) { requireOpen(); config.setLensEnabled(enabled); }
     public void setRecognitionEnabled(boolean enabled) {
         requireOpen(); config.setRecognitionEnabled(enabled); if (!enabled) CaptureBroker.cancelCurrent(context);
     }
