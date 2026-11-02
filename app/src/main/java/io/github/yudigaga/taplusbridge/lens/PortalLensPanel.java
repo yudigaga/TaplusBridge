@@ -24,6 +24,7 @@ import android.os.SystemClock;
 import android.util.Base64;
 import android.view.Gravity;
 import android.view.View;
+import android.view.SurfaceControlViewHost;
 import android.webkit.SslErrorHandler;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceError;
@@ -100,6 +101,8 @@ public final class PortalLensPanel implements View.OnAttachStateChangeListener {
     private final ArrayList<TextView> modeButtons = new ArrayList<>();
     private String searchMode = "all", queryBaseUrl;
     private boolean browsingQuery;
+    private LensEmbeddedBrowser embeddedBrowser;
+    private String embeddedViewId;
 
     public PortalLensPanel(View host, TextView action, RelativeLayout group, Supplier<Bitmap> selectedImage,
                            Supplier<String> sourcePackage) {
@@ -232,6 +235,8 @@ public final class PortalLensPanel implements View.OnAttachStateChangeListener {
 
     private void update(Job next, Bundle update) {
         if (!current(next) || !matches(update, next.id, panelId, next.key)) return;
+        @SuppressWarnings("deprecation") PendingIntent viewer = update.getParcelable("session_viewer");
+        if (viewer != null) next.sessionViewerIntent = viewer;
         int generation = update.getInt("page_generation", -1);
         if (generation < 0 || generation < next.pageGeneration) return;
         next.pageGeneration = generation;
@@ -243,6 +248,8 @@ public final class PortalLensPanel implements View.OnAttachStateChangeListener {
             updateOriginalPageButton();
         }
         String status = update.getString("status", "parse_error");
+        String mode = update.getString("search_mode");
+        if (mode != null && java.util.Set.of("all", "visual", "ai", "exact").contains(mode)) searchMode = mode;
         switch (status) {
             case "loading" -> { armTimeout(next, 120_000); showMessage("Google Lens 正在识图…", false); }
             case "needs_interaction" -> {
@@ -253,16 +260,39 @@ public final class PortalLensPanel implements View.OnAttachStateChangeListener {
                 showInteraction(next, message.length() <= 300 ? message : message.substring(0, 300), interaction);
             }
             case "interaction_opened" -> interactionOpened(next);
+            case "session_viewer_opened" -> { if (next.sessionViewerVisible) interactionOpened(next); }
+            case "interaction_closed" -> interactionClosed(next);
+            case "page_ready" -> {
+                MAIN.removeCallbacks(next.watchdog); next.searchReady = true; next.livePageReady = true;
+                updateOriginalPageButton(); updateSearchControls();
+                if (!next.sessionViewerVisible && !next.awaitingInteractionOpen) showLivePage(next);
+            }
             case "results_ready" -> {
+                next.livePageReady = false;
                 @SuppressWarnings("deprecation") ArrayList<Bundle> items = update.getParcelableArrayList("items");
                 if (items == null || items.isEmpty()) { fail(next, "返回的结果无法识别，请重试"); return; }
                 if (!showResults(next, items)) { fail(next, "结果链接无法打开，请重试"); return; }
-                release(next, false);
+                MAIN.removeCallbacks(next.watchdog); next.searchReady = true; updateOriginalPageButton(); updateSearchControls();
             }
-            case "empty" -> { showMessage("Google Lens 未找到匹配图片", true); release(next, false); }
+            case "empty" -> {
+                next.livePageReady = false;
+                showMessage("Google Lens 未找到匹配内容，可切换匹配方式或修改搜索词", false);
+                MAIN.removeCallbacks(next.watchdog); next.searchReady = true; updateOriginalPageButton(); updateSearchControls();
+            }
             case "network_error" -> fail(next, "Google Lens 连接失败，请检查手机网络后重试");
             case "timeout" -> fail(next, "识图超时，请重试");
             case "cancelled" -> { showMessage("本次识图已取消", true); release(next, false); }
+            case "query_error" -> {
+                showMessage(update.getString("message", "当前图片的搜索会话暂不可用"), false);
+                MAIN.removeCallbacks(next.watchdog); next.searchReady = true;
+                updateOriginalPageButton(); updateSearchControls();
+            }
+            case "parse_error" -> {
+                if (next.searchReady) {
+                    showMessage(update.getString("message", "Google 未返回可显示内容，可调整搜索词或筛选方式"), false);
+                    updateSearchControls();
+                } else fail(next, "Google 页面已返回，但暂时无法提取结果，请重试或更新模块");
+            }
             default -> fail(next, "Google 页面已返回，但暂时无法提取结果，请重试或更新模块");
         }
     }
@@ -283,7 +313,7 @@ public final class PortalLensPanel implements View.OnAttachStateChangeListener {
     private void launchInteraction(Job next) {
         if (!current(next) || next.awaitingInteractionOpen || next.interactionIntent == null) return;
         if (!beginInteraction(next)) { fail(next, "无法确认当前应用身份，请重新长按图片后重试"); return; }
-        next.awaitingInteractionOpen = true;
+        next.openingSessionViewer = false; next.awaitingInteractionOpen = true;
         showMessage("正在打开 Google 验证…", false);
         MAIN.postDelayed(next.launchWatchdog, LensInteractionLease.LAUNCH_TIMEOUT_MILLIS);
         try {
@@ -310,6 +340,13 @@ public final class PortalLensPanel implements View.OnAttachStateChangeListener {
         if (resultSheet != null) resultSheet.setInteractionHidden(true);
     }
 
+    private void interactionClosed(Job next) {
+        if (!current(next) || !next.sessionViewerReturnPending) return;
+        next.sessionViewerReturnPending = false; MAIN.removeCallbacks(next.launchWatchdog); next.awaitingInteractionOpen = false;
+        endInteraction(next); updateSearchControls();
+        if (next.livePageReady) showLivePage(next);
+    }
+
     private void interactionLaunchFailed(Job next, String message) {
         if (!current(next) || !next.awaitingInteractionOpen) return;
         endInteraction(next);
@@ -318,6 +355,7 @@ public final class PortalLensPanel implements View.OnAttachStateChangeListener {
 
     private void release(Job next, boolean cancel) {
         MAIN.removeCallbacks(next.watchdog);
+        if (job == next) closeEmbeddedBrowser();
         endInteraction(next);
         next.cancelled = true; next.closeImage();
         ILensService service = next.service;
@@ -348,6 +386,7 @@ public final class PortalLensPanel implements View.OnAttachStateChangeListener {
 
     private void endInteraction(Job next) {
         MAIN.removeCallbacks(next.launchWatchdog); next.awaitingInteractionOpen = false;
+        next.openingSessionViewer = false; next.sessionViewerVisible = false; next.sessionViewerReturnPending = false;
         Interaction held = interactionLease;
         if (held != null && held.owner.get() == this && held.id.equals(next.id)) held.lease.end(SystemClock.elapsedRealtime());
         if (resultSheet != null) resultSheet.setInteractionHidden(false);
@@ -357,12 +396,30 @@ public final class PortalLensPanel implements View.OnAttachStateChangeListener {
         if (job != next || next.cancelled || epoch.get() != next.epochValue
                 || !matches(update, next.id, panelId, next.key)) return;
         int generation = update.getInt("page_generation", -1);
-        if (generation < 0 || generation < next.pageGeneration) return;
-        String status = update.getString("status", "");
-        if (!java.util.Set.of("results_ready", "empty", "network_error", "parse_error", "timeout", "cancelled").contains(status)) return;
-        Interaction held = interactionLease;
-        if (held != null && held.owner.get() == this && held.id.equals(next.id) && held.valid())
+        synchronized (next) {
+            if (generation < 0 || generation < next.pageGeneration || generation < next.callbackGeneration) return;
+            next.callbackGeneration = generation;
+            String status = update.getString("status", "");
+            Interaction held = interactionLease;
+            if (held == null || held.owner.get() != this || !held.id.equals(next.id) || !held.valid()) return;
+            // Binder must publish the viewer lifetime before queued UI work or another page result arrives.
+            if ("session_viewer_opened".equals(status)) {
+                if (next.openingSessionViewer && next.awaitingInteractionOpen && held.lease.active())
+                    next.sessionViewerVisible = true;
+                return;
+            }
+            if ("interaction_closed".equals(status)) {
+                if (next.sessionViewerVisible) {
+                    next.sessionViewerVisible = false; next.sessionViewerReturnPending = true;
+                    held.lease.end(SystemClock.elapsedRealtime());
+                }
+                return;
+            }
+            if (next.sessionViewerVisible && java.util.Set.of("results_ready", "page_ready", "empty", "query_error", "parse_error").contains(status)) return;
+            if (!java.util.Set.of("results_ready", "page_ready", "empty", "network_error", "parse_error", "timeout", "cancelled").contains(status)) return;
+            next.sessionViewerVisible = false; next.openingSessionViewer = false;
             held.lease.end(SystemClock.elapsedRealtime());
+        }
     }
 
     /** Called from the host's Binder observer; this never modifies a View from that thread. */
@@ -378,23 +435,29 @@ public final class PortalLensPanel implements View.OnAttachStateChangeListener {
         PortalLensPanel panel = visibleSheet.get();
         return panel != null && panel.resultSheet != null && panel.resultSheet.isShowing()
                 && panel.sheetImageValid() && ((panel.searchInput != null && panel.searchInput.hasFocus())
-                || (panel.sourceWebView != null && panel.sourceWebView.hasFocus()));
+                || (panel.sourceWebView != null && panel.sourceWebView.hasFocus())
+                || (panel.embeddedBrowser != null && panel.embeddedBrowser.hasFocus()));
     }
 
     private static final class Interaction {
         final WeakReference<PortalLensPanel> owner;
         final String id;
         final int epoch;
+        final WeakReference<Bitmap> image;
+        final int imageGeneration;
         final LensInteractionLease lease;
         Interaction(PortalLensPanel owner, PortalLensPanel.Job job, LensInteractionLease lease) {
             this.owner = new WeakReference<>(owner); this.id = job.id; this.epoch = job.epochValue; this.lease = lease;
+            this.image = new WeakReference<>(job.image); this.imageGeneration = job.generation;
         }
         boolean valid() {
-            if (!lease.active()) return true;
             PortalLensPanel panel = owner.get();
-            PortalLensPanel.Job current = panel == null ? null : panel.job;
-            return panel != null && panel.epoch.get() == epoch && current != null
-                    && current.id.equals(id) && !current.cancelled;
+            Bitmap selected = image.get();
+            if (panel == null || selected == null || panel.epoch.get() != epoch || panel.selectedImage.get() != selected
+                    || selected.isRecycled() || selected.getGenerationId() != imageGeneration) return false;
+            if (!lease.active()) return true;
+            PortalLensPanel.Job current = panel.job;
+            return current != null && current.id.equals(id) && !current.cancelled;
         }
     }
 
@@ -477,9 +540,18 @@ public final class PortalLensPanel implements View.OnAttachStateChangeListener {
     }
 
     private void updateSearchControls() {
-        boolean available = queryBaseUrl != null && hasOriginalPage() && job == null;
+        boolean available = queryBaseUrl != null && hasOriginalPage() && job != null && job.searchReady;
         if (searchButton != null) searchButton.setEnabled(available);
-        if (searchInput != null) searchInput.setEnabled(available);
+        if (searchInput != null) {
+            searchInput.setEnabled(available);
+            searchInput.setHint(switch (searchMode) {
+                case "ai" -> "询问 AI 关于这张图片的问题";
+                case "exact" -> "输入要查找的精确内容";
+                case "visual" -> "描述图片的外观特征";
+                default -> "搜索此图片相关内容";
+            });
+        }
+        if (searchButton != null) searchButton.setText("ai".equals(searchMode) ? "提问" : "搜索");
         for (TextView tab : modeButtons) {
             tab.setEnabled(available); boolean selected = searchMode.equals(tab.getTag());
             tab.setSelected(selected); tab.setTypeface(null, selected ? Typeface.BOLD : Typeface.NORMAL);
@@ -489,11 +561,12 @@ public final class PortalLensPanel implements View.OnAttachStateChangeListener {
     }
 
     private void submitQuery() {
-        if (queryBaseUrl == null || job != null) return;
+        Job current = job;
+        if (queryBaseUrl == null || current == null || !current.searchReady || current.service == null) return;
         String query = searchInput == null ? "" : searchInput.getText().toString();
         hideOwnedKeyboard(searchInput);
         if ("all".equals(searchMode) && query.trim().isEmpty()) {
-            returnToResults(); return;
+            closeSourcePage(); browsingQuery = true; query = "";
         }
         String target = LensSearchUrl.build(queryBaseUrl, query, searchMode);
         if (target == null) {
@@ -501,7 +574,16 @@ public final class PortalLensPanel implements View.OnAttachStateChangeListener {
         }
         if (resultSheet != null) resultSheet.expand();
         displayedResultUrl = target; updateOriginalPageButton();
-        browsingQuery = true; openEmbeddedPage(target); updateSearchControls();
+        showMessage("正在同一图片会话中搜索…", false); browsingQuery = true;
+        current.searchReady = false; armTimeout(current, 120_000); updateSearchControls();
+        String submitted = query, mode = searchMode;
+        ILensService service = current.service;
+        SIGNALS.execute(() -> {
+            try { service.refine(current.id, submitted, mode); }
+            catch (RemoteException | RuntimeException disconnected) {
+                MAIN.post(() -> fail(current, "Google Lens 图片会话已断开，请重新识图"));
+            }
+        });
     }
 
     private boolean sheetImageValid() {
@@ -510,9 +592,7 @@ public final class PortalLensPanel implements View.OnAttachStateChangeListener {
     }
 
     private void returnToResults() {
-        closeSourcePage(); browsingQuery = false; searchMode = "all";
-        if (searchInput != null) searchInput.setText("");
-        if (queryBaseUrl != null) displayedResultUrl = queryBaseUrl;
+        closeSourcePage(); browsingQuery = false;
         updateOriginalPageButton(); updateSearchControls();
     }
 
@@ -524,6 +604,7 @@ public final class PortalLensPanel implements View.OnAttachStateChangeListener {
     }
 
     private void closeResultSheet() {
+        closeEmbeddedBrowser();
         hideOwnedKeyboard(searchInput);
         LensResultSheet previous = resultSheet; resultSheet = null;
         if (visibleSheet.get() == this) visibleSheet = new WeakReference<>(null);
@@ -535,6 +616,7 @@ public final class PortalLensPanel implements View.OnAttachStateChangeListener {
 
     private void base() {
         if (!ensureResultSheet()) return;
+        closeEmbeddedBrowser();
         closeSourcePage();
         if (overlay == null) {
             overlay = new ScrollView(host.getContext()); overlay.setFillViewport(true); overlay.setClipToPadding(false);
@@ -561,43 +643,35 @@ public final class PortalLensPanel implements View.OnAttachStateChangeListener {
     }
 
     private void updateOriginalPageButton() {
-        boolean available = hasOriginalPage();
+        Job current = job;
+        boolean available = hasOriginalPage() && current != null && current.searchReady && current.sessionViewerIntent != null;
         if (resultSheet != null) resultSheet.setOriginalPage(available, this::openOriginalPage);
     }
 
     private void openOriginalPage() {
-        if (!hasOriginalPage()) {
+        Job current = job;
+        if (!hasOriginalPage() || current == null || !current.searchReady || current.sessionViewerIntent == null) {
             updateOriginalPageButton();
-            android.widget.Toast.makeText(host.getContext(), "本次识图尚未返回可打开的结果网页", android.widget.Toast.LENGTH_SHORT).show();
+            android.widget.Toast.makeText(host.getContext(), "当前图片会话暂不可用，请重新识图", android.widget.Toast.LENGTH_SHORT).show();
             return;
         }
+        if (!beginInteraction(current)) {
+            android.widget.Toast.makeText(host.getContext(), "无法打开当前图片会话，请重新识图", android.widget.Toast.LENGTH_SHORT).show();
+            return;
+        }
+        closeEmbeddedBrowser();
+        current.openingSessionViewer = true; current.awaitingInteractionOpen = true;
+        MAIN.postDelayed(current.launchWatchdog, LensInteractionLease.LAUNCH_TIMEOUT_MILLIS);
         try {
-            Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(displayedResultUrl))
-                    .addCategory(Intent.CATEGORY_BROWSABLE).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-            Intent generic = new Intent(Intent.ACTION_VIEW, Uri.parse("https://example.com"))
-                    .addCategory(Intent.CATEGORY_BROWSABLE);
-            java.util.LinkedHashSet<String> browsers = new java.util.LinkedHashSet<>();
-            for (android.content.pm.ResolveInfo browser : context.getPackageManager().queryIntentActivities(
-                    new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_APP_BROWSER), 0)) {
-                if (browser.activityInfo != null && browser.activityInfo.enabled
-                        && browser.activityInfo.packageName != null && !"android".equals(browser.activityInfo.packageName))
-                    browsers.add(browser.activityInfo.packageName);
-            }
-            android.content.pm.ResolveInfo browser = context.getPackageManager().resolveActivity(generic,
-                    android.content.pm.PackageManager.MATCH_DEFAULT_ONLY);
-            if (browser != null && browser.activityInfo != null && browsers.contains(browser.activityInfo.packageName)) {
-                intent.setPackage(browser.activityInfo.packageName);
-            } else {
-                if (browsers.isEmpty()) throw new android.content.ActivityNotFoundException();
-                ArrayList<Intent> choices = new ArrayList<>();
-                for (String name : browsers) choices.add(new Intent(intent).setPackage(name));
-                intent = choices.remove(0);
-                if (!choices.isEmpty()) intent = Intent.createChooser(intent, "打开原网页")
-                        .putExtra(Intent.EXTRA_INITIAL_INTENTS, choices.toArray(new Intent[0])).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-            }
-            context.startActivity(intent);
+            current.sessionViewerIntent.send(context, 0, null, null, null, null, interactionLaunchOptions());
         } catch (RuntimeException unavailable) {
-            android.widget.Toast.makeText(host.getContext(), "没有可打开原网页的浏览器", android.widget.Toast.LENGTH_SHORT).show();
+            current.awaitingInteractionOpen = false; endInteraction(current);
+            if (current.livePageReady) showLivePage(current);
+            android.widget.Toast.makeText(host.getContext(), "无法打开 Google Lens 原网页", android.widget.Toast.LENGTH_SHORT).show();
+        } catch (PendingIntent.CanceledException unavailable) {
+            current.awaitingInteractionOpen = false; endInteraction(current);
+            if (current.livePageReady) showLivePage(current);
+            android.widget.Toast.makeText(host.getContext(), "Google Lens 图片会话已结束，请重新识图", android.widget.Toast.LENGTH_SHORT).show();
         }
     }
 
@@ -611,6 +685,91 @@ public final class PortalLensPanel implements View.OnAttachStateChangeListener {
         return LensResultGrid.append(host.getContext(), contents, items,
                 url -> { if (displayedImage(next)) openSourcePage(url); },
                 (view, address) -> loadThumbnail(view, address, next)) > 0;
+    }
+
+    private void showLivePage(Job next) {
+        if (!current(next) || !next.livePageReady || next.sessionViewerVisible || next.awaitingInteractionOpen) return;
+        if (embeddedBrowser != null && embeddedBrowser.isShowing()) return;
+        showMessage(Build.VERSION.SDK_INT >= 30 ? "正在显示 Google 当前图片搜索页…"
+                : "当前系统不支持内嵌此模式，可点击右上角原网页继续查看同一图片", false);
+        if (Build.VERSION.SDK_INT < 30 || resultArea == null || next.service == null) return;
+        // Wait for the dialog traversal rather than creating a second WebView or uploading again.
+        FrameLayout area = resultArea;
+        area.post(() -> mountLivePage(next, area));
+    }
+
+    private void mountLivePage(Job next, FrameLayout area) {
+        if (Build.VERSION.SDK_INT < 30 || !current(next) || !next.livePageReady || resultArea != area
+                || next.sessionViewerVisible || next.awaitingInteractionOpen || embeddedBrowser != null) return;
+        String viewId = UUID.randomUUID().toString();
+        ILensService service = next.service;
+        if (service == null) return;
+        LensEmbeddedBrowser browser = new LensEmbeddedBrowser(host, new LensEmbeddedBrowser.Listener() {
+            @Override public void onSurfaceReady(IBinder token, int display, int width, int height) {
+                SIGNALS.execute(() -> {
+                    try {
+                        service.attachBrowser(next.id, viewId, token, display, width, height, new ILensSurfaceCallback.Stub() {
+                            @Override public void onSurface(Bundle result) {
+                                MAIN.post(() -> receiveBrowser(next, viewId, result));
+                            }
+                        });
+                    } catch (RemoteException | RuntimeException unavailable) {
+                        MAIN.post(() -> browserUnavailable(next, viewId));
+                    }
+                });
+            }
+            @Override public void onResize(int width, int height) {
+                SIGNALS.execute(() -> {
+                    try { service.resizeBrowser(next.id, viewId, width, height); }
+                    catch (RemoteException | RuntimeException unavailable) { MAIN.post(() -> browserUnavailable(next, viewId)); }
+                });
+            }
+            @Override public void onClosed() {
+                boolean unexpected = viewId.equals(embeddedViewId);
+                if (unexpected) { embeddedBrowser = null; embeddedViewId = null; }
+                SIGNALS.execute(() -> {
+                    try { service.detachBrowser(next.id, viewId); } catch (RemoteException | RuntimeException ignored) { }
+                });
+                if (unexpected) MAIN.post(() -> {
+                    if (current(next) && embeddedBrowser == null && next.livePageReady
+                            && !next.sessionViewerVisible && !next.awaitingInteractionOpen)
+                        showMessage("当前页面显示已暂停，可切换模式或点击右上角原网页继续查看", false);
+                });
+            }
+        });
+        embeddedBrowser = browser; embeddedViewId = viewId;
+        if (!browser.mount(area)) browserUnavailable(next, viewId);
+    }
+
+    private void receiveBrowser(Job next, String viewId, Bundle result) {
+        if (Build.VERSION.SDK_INT < 30) return;
+        @SuppressWarnings("deprecation") SurfaceControlViewHost.SurfacePackage surface = result == null ? null
+                : result.getParcelable("surface_package");
+        boolean matches = result != null && next.id.equals(result.getString("request_id"))
+                && viewId.equals(result.getString("view_id"));
+        if (!current(next) || !viewId.equals(embeddedViewId) || embeddedBrowser == null
+                || next.sessionViewerVisible || next.awaitingInteractionOpen || !matches) {
+            if (surface != null) surface.release();
+            return;
+        }
+        if (surface == null) { browserUnavailable(next, viewId); return; }
+        if (!embeddedBrowser.attachSurface(surface)) {
+            closeEmbeddedBrowser();
+            showMessage("当前页面暂无法嵌入，可点击右上角原网页查看同一图片的结果", false); return;
+        }
+        if (overlay != null) overlay.setVisibility(View.GONE);
+    }
+
+    private void browserUnavailable(Job next, String viewId) {
+        if (!current(next) || !viewId.equals(embeddedViewId)) return;
+        closeEmbeddedBrowser();
+        showMessage("当前页面暂无法嵌入，可点击右上角原网页查看同一图片的结果", false);
+    }
+
+    private void closeEmbeddedBrowser() {
+        LensEmbeddedBrowser previous = embeddedBrowser;
+        embeddedBrowser = null; embeddedViewId = null;
+        if (previous != null) previous.destroy();
     }
 
     @android.annotation.SuppressLint("SetJavaScriptEnabled")
@@ -835,10 +994,17 @@ public final class PortalLensPanel implements View.OnAttachStateChangeListener {
         volatile String key;
         boolean bound;
         volatile int pageGeneration = -1;
+        volatile int callbackGeneration = -1;
         volatile ILensService service;
+        volatile boolean searchReady;
+        boolean livePageReady;
+        volatile PendingIntent sessionViewerIntent;
         String resultUrl;
         PendingIntent interactionIntent;
-        boolean awaitingInteractionOpen;
+        volatile boolean awaitingInteractionOpen;
+        volatile boolean openingSessionViewer;
+        volatile boolean sessionViewerVisible;
+        volatile boolean sessionViewerReturnPending;
         private ParcelFileDescriptor descriptor;
         final Runnable launchWatchdog = () -> interactionLaunchFailed(this,
                 "Google 验证窗口尚未打开，请重试；当前图片无需重新上传");

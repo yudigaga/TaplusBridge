@@ -131,7 +131,10 @@ public final class LensPageParser {
                     || !("google.com".equalsIgnoreCase(host) || "www.google.com".equalsIgnoreCase(host)
                     || "lens.google.com".equalsIgnoreCase(host)) || !"/search".equals(uri.getPath())) return false;
             return "lens.google.com".equalsIgnoreCase(host) || "26".equals(uri.getQueryParameter("udm"))
-                    || uri.getQueryParameterNames().contains("lns_mode") || uri.getQueryParameterNames().contains("vsrid");
+                    || uri.getQueryParameterNames().contains("lns_mode") || uri.getQueryParameterNames().contains("vsrid")
+                    || (("44".equals(uri.getQueryParameter("udm")) || "48".equals(uri.getQueryParameter("udm"))
+                        || "50".equals(uri.getQueryParameter("udm")))
+                        && uri.getQueryParameter("p") != null && !uri.getQueryParameter("p").isEmpty());
         } catch (RuntimeException malformed) { return false; }
     }
 

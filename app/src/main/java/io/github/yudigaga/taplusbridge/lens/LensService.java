@@ -40,6 +40,46 @@ public final class LensService extends Service {
             if (requestId != null && requestId.length() <= 128)
                 main.post(() -> LensSession.cancel(requestId));
         }
+        @Override public void refine(String requestId, String query, String mode) {
+            enforceCaller();
+            String[] checked = LensContract.validatedRefinement(requestId, query, mode);
+            main.post(() -> LensSession.refine(checked[0], checked[1], checked[2]));
+        }
+        @Override public void attachBrowser(String requestId, String viewId, IBinder hostToken,
+                                           int displayId, int width, int height, ILensSurfaceCallback callback) {
+            enforceCaller();
+            LensContract.validateBrowser(requestId, viewId, width, height);
+            if (hostToken == null || displayId < 0 || callback == null) throw new IllegalArgumentException("missing_lens_surface");
+            int expectedBinding = bindingGeneration;
+            main.post(() -> {
+                LensSession session = bound && expectedBinding == bindingGeneration ? LensSession.current(requestId) : null;
+                Bundle result = new Bundle(); result.putString("request_id", requestId); result.putString("view_id", viewId);
+                if (session != null) session.attachBrowser(result, viewId, hostToken, displayId, width, height);
+                try { callback.onSurface(result); }
+                catch (android.os.RemoteException | RuntimeException disconnected) {
+                    if (session != null) session.detachBrowser(viewId);
+                } finally {
+                    if (android.os.Build.VERSION.SDK_INT >= 30) {
+                        android.view.SurfaceControlViewHost.SurfacePackage surface = result.getParcelable("surface_package");
+                        if (surface != null) surface.release();
+                    }
+                }
+            });
+        }
+        @Override public void resizeBrowser(String requestId, String viewId, int width, int height) {
+            enforceCaller(); LensContract.validateBrowser(requestId, viewId, width, height);
+            main.post(() -> {
+                LensSession session = LensSession.current(requestId);
+                if (session != null) session.resizeBrowser(viewId, width, height);
+            });
+        }
+        @Override public void detachBrowser(String requestId, String viewId) {
+            enforceCaller(); LensContract.validateBrowser(requestId, viewId, 1, 1);
+            main.post(() -> {
+                LensSession session = LensSession.current(requestId);
+                if (session != null) session.detachBrowser(viewId);
+            });
+        }
     };
 
     private void enforceCaller() {

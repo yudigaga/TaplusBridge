@@ -35,6 +35,8 @@ const fixture = name => fs.readFileSync(path.join(root, 'app/src/test/resources/
     assert.equal(data.items.length, 0);
     assert.equal((await check('https://www.google.com/search?udm=26', '<html><script type="application/ld+json">{"@type":"ItemList","numberOfItems":0,"itemListElement":[]}</script></html>')).status, 'parse_error');
     assert.equal((await check('https://www.google.com/search?udm=26', '<html><script type="application/ld+json">{"@type":"SearchResultsPage","mainEntity":{"@type":"ItemList","numberOfItems":0,"itemListElement":[]}}</script></html>')).status, 'parse_error');
+    assert.equal((await check('https://www.google.com/search?udm=48&vsrid=session', '<html><body>没有与您的搜索相匹配的内容</body></html>')).status, 'empty');
+    assert.equal((await check('https://www.google.com/search?udm=50&vsrid=session', '<html><body>似乎无法针对该搜索生成回答。试试问点别的吧。</body></html>')).status, 'empty');
     assert.equal((await check('https://lens.google.com/', '<html data-taplus-lens-upload="1"></html>')).status, 'loading');
     assert.equal((await check('https://example.org/search?udm=26', fixture('schema-itemlist-synthetic.html'))).status, 'parse_error');
     const observed = await check('https://www.google.com/search?udm=26', fixture('google-visual-card-observed-20261102.html'));
@@ -73,6 +75,6 @@ const fixture = name => fs.readFileSync(path.join(root, 'app/src/test/resources/
     assert.equal(boundedMany.items.length, 40);
     assert.ok(JSON.stringify(boundedMany.items).length < 394000);
     assert.ok(boundedMany.items.some(row => row.thumbnail_url === null));
-    console.log('14 offline browser parser scenarios passed, including observed visual-card DOM, safe marker counts and explicit JSON string serialization. Phone WebView/end-to-end remains unverified.');
+    console.log('16 offline browser parser scenarios passed, including observed visual-card DOM, explicit no-match states, safe marker counts and JSON serialization. Phone WebView/end-to-end remains unverified.');
   } finally { await browser.close(); }
 })().catch(error => { console.error(error); process.exitCode = 1; });

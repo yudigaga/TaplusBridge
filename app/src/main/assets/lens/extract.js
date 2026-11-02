@@ -88,6 +88,11 @@
       match_type: 'visual', link_type: googleRedirect ? 'google_redirect' : 'direct'});
   });
   if (items.length) return result('results_ready', '已提取页面中的图片结果', items);
+  const visibleText = (document.body && document.body.innerText || '').slice(0, 12000);
+  if (query.get('udm') === '50' && /似乎无法针对.{0,20}搜索生成回答|unable to generate an? (?:AI )?(?:overview|answer)/i.test(visibleText))
+    return result('empty', 'Google 当前无法为这张图片生成 AI 回答');
+  if (/没有与.{0,30}搜索.{0,20}匹配.{0,20}内容|did not match any documents|no results found/i.test(visibleText))
+    return result('empty', 'Google Lens 没有找到与当前图片匹配的内容');
   // Unknown future layouts must fail explicitly rather than becoming empty results.
   return result('parse_error', '当前 Lens 页面结构尚未适配，请打开网页检查或稍后重试');
 })

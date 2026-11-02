@@ -1,6 +1,7 @@
 package io.github.yudigaga.taplusbridge.lens;
 
 import android.os.Bundle;
+import java.util.Set;
 import java.util.regex.Pattern;
 
 /** Only metadata crosses Binder; the image is transferred through an owned descriptor. */
@@ -38,6 +39,23 @@ public final class LensContract {
         result.putString("status", status);
         result.putString("message", message);
         return result;
+    }
+
+    static String[] validatedRefinement(String requestId, String query, String mode) {
+        if (requestId == null || requestId.isEmpty() || requestId.length() > 128
+                || query == null || query.length() > 512 || mode == null
+                || !Set.of("all", "ai", "exact", "visual").contains(mode))
+            throw new IllegalArgumentException("invalid_lens_refinement");
+        for (int i = 0; i < query.length(); i++)
+            if (Character.isISOControl(query.charAt(i))) throw new IllegalArgumentException("invalid_lens_query");
+        return new String[]{requestId, query, mode};
+    }
+
+    static void validateBrowser(String requestId, String viewId, int width, int height) {
+        if (requestId == null || requestId.isEmpty() || requestId.length() > 128
+                || viewId == null || viewId.isEmpty() || viewId.length() > 128
+                || width < 1 || height < 1 || width > 8192 || height > 16384 || (long) width * height > 33554432L)
+            throw new IllegalArgumentException("invalid_lens_browser");
     }
 
     static boolean matchesPage(Bundle request, int generation, Bundle parsed) {

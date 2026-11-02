@@ -89,7 +89,7 @@ public final class LensResultSheet implements View.OnAttachStateChangeListener {
         originalPage.setTextColor(new android.content.res.ColorStateList(new int[][]{
                 new int[]{-android.R.attr.state_enabled}, new int[]{}},
                 new int[]{dark ? 0xff777777 : 0xffaaaaaa, dark ? 0xff8ab4f8 : 0xff1967d2}));
-        originalPage.setContentDescription("原网页暂不可用，结果网址尚未返回");
+        originalPage.setContentDescription("当前图片会话的原网页暂不可用");
         originalPage.setOnClickListener(view -> { if (originalPage.isEnabled() && openOriginalPage != null) openOriginalPage.run(); });
         header.addView(originalPage, new LinearLayout.LayoutParams(-2, -2));
         chrome.addView(header, new LinearLayout.LayoutParams(-1, -2));
@@ -124,8 +124,8 @@ public final class LensResultSheet implements View.OnAttachStateChangeListener {
     public void setOriginalPage(boolean enabled, Runnable open) {
         openOriginalPage = open;
         originalPage.setEnabled(enabled && open != null);
-        originalPage.setContentDescription(originalPage.isEnabled() ? "在浏览器中打开本次识图原网页"
-                : "原网页暂不可用，结果网址尚未返回");
+        originalPage.setContentDescription(originalPage.isEnabled() ? "在传送门内打开当前图片会话原网页"
+                : "当前图片会话的原网页暂不可用");
     }
 
     /** Return true when a nested source-page viewer has already handled this back action. */
@@ -216,7 +216,7 @@ public final class LensResultSheet implements View.OnAttachStateChangeListener {
 
     private boolean touchesWebView(View view, float x, float y) {
         if (view.getVisibility() != View.VISIBLE || x < 0 || y < 0 || x >= view.getWidth() || y >= view.getHeight()) return false;
-        if (view instanceof WebView) return true;
+        if (view instanceof WebView || view instanceof android.view.SurfaceView) return true;
         if (view instanceof ViewGroup group) for (int i = group.getChildCount() - 1; i >= 0; i--) {
             View child = group.getChildAt(i);
             if (touchesWebView(child, x + group.getScrollX() - child.getLeft() - child.getTranslationX(),
