@@ -1,7 +1,6 @@
 package io.github.yudigaga.taplusbridge.ui
 
 import android.widget.Toast
-import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -25,7 +24,6 @@ import top.yukonga.miuix.kmp.preference.SwitchPreference
 @Composable internal fun SourceScopeSettingsScreen(
     controller: SettingsController,
     apps: List<SettingsController.AppEntry>,
-    onDismiss: () -> Unit,
     onSaved: () -> Unit,
 ) {
     val initial = remember(controller) { controller.sourceScope() }
@@ -41,9 +39,10 @@ import top.yukonga.miuix.kmp.preference.SwitchPreference
     val mode = SourceScopePolicy.Mode.valueOf(modeName)
     val selected = if (mode == SourceScopePolicy.Mode.BLACKLIST) blacklist else whitelist
     val appMap = remember(apps) { apps.associateBy { it.packageName } }
-    val found = remember(apps, query) {
+    val found = remember(apps, query, selected) {
         val filter = query.trim()
-        apps.filter { it.label.contains(filter, true) || it.packageName.contains(filter, true) }
+        val matches = apps.filter { it.label.contains(filter, true) || it.packageName.contains(filter, true) }
+        matches.filter { it.packageName in selected } + matches.filter { it.packageName !in selected }
     }
     val missing = remember(selected, appMap, query) {
         selected.filter { it !in appMap && it.contains(query.trim(), true) }.sorted()
@@ -55,23 +54,33 @@ import top.yukonga.miuix.kmp.preference.SwitchPreference
         else whitelist = ArrayList(next.sorted())
         saveError = ""
     }
-    BackHandler(onBack = onDismiss)
+    fun discardDraft() {
+        val persisted = controller.sourceScope()
+        modeName = persisted.mode.name
+        blacklist = ArrayList(persisted.blacklist.sorted())
+        whitelist = ArrayList(persisted.whitelist.sorted())
+        captureFallback = controller.scopeCaptureEnabled()
+        linkProbe = controller.scopeLinkProbeEnabled()
+        query = ""
+        saveError = ""
+    }
     Scaffold(
         modifier = Modifier.testTag("page.source_scope"),
         topBar = {
-            TopAppBar(title = "生效应用", subtitle = "选择传送门可使用的来源应用",
-                navigationIcon = {
-                    IconButton(onDismiss, Modifier.testTag("source_scope.back")) { Icon(SettingsIcons.Back, "返回") }
-                }, actions = {
-                    TextButton("保存", {
-                        try {
-                            controller.saveSourceScope(mode, blacklist, whitelist, captureFallback, linkProbe)
-                            Toast.makeText(context, "已保存；来源应用可能需要退出后重新进入", Toast.LENGTH_LONG).show()
-                            onSaved()
-                        } catch (error: RuntimeException) {
-                            saveError = error.message ?: "保存失败，请重试"
-                        }
-                    }, Modifier.testTag("source_scope.save"))
+            SettingsPageHeader(
+                title = "生效应用",
+                subtitle = "选择传送门可使用的来源应用",
+                discardTag = "source_scope.back",
+                saveTag = "source_scope.save",
+                onDiscard = ::discardDraft,
+                onSave = {
+                    try {
+                        controller.saveSourceScope(mode, blacklist, whitelist, captureFallback, linkProbe)
+                        Toast.makeText(context, "已保存；来源应用可能需要退出后重新进入", Toast.LENGTH_LONG).show()
+                        onSaved()
+                    } catch (error: RuntimeException) {
+                        saveError = error.message ?: "保存失败，请重试"
+                    }
                 })
         },
     ) { padding ->

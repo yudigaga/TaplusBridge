@@ -11,6 +11,7 @@ import android.os.ResultReceiver;
 import io.github.yudigaga.taplusbridge.bridge.BridgeContract;
 import io.github.yudigaga.taplusbridge.capture.CaptureBroker;
 import io.github.yudigaga.taplusbridge.capture.IntentObservation;
+import io.github.yudigaga.taplusbridge.hook.HostDragHooks;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
@@ -20,11 +21,15 @@ public final class HostProbeAction {
     private static final Uri PROVIDER=Uri.parse("content://"+BridgeContract.AUTHORITY);
     private static final AtomicReference<Run> ACTIVE=new AtomicReference<>();
     private HostProbeAction() { }
-    public static void start(Context context,Object service,String source,long pickedAt,
+    public static void start(Context context,Object service,String source,long pickedAt,long recognitionAt,
                              BooleanSupplier current,Consumer<String> captured) {
+        start(context,service,source,pickedAt,recognitionAt,current,() -> true,captured);
+    }
+    public static void start(Context context,Object service,String source,long pickedAt,long recognitionAt,
+                             BooleanSupplier current,BooleanSupplier prepareForTap,Consumer<String> captured) {
         Handler main=new Handler(Looper.getMainLooper());
         main.post(() -> {
-            Run run=new Run(context,service,source,pickedAt,current,captured,main);
+            Run run=new Run(context,service,source,pickedAt,recognitionAt,current,prepareForTap,captured,main);
             Run previous=ACTIVE.getAndSet(run);
             if(previous!=null) previous.finish(null,"replaced");
             run.begin();
@@ -35,17 +40,19 @@ public final class HostProbeAction {
         if(run!=null) run.main.post(() -> run.finish(null,"cancelled"));
     }
     private static final class Run {
-        final Context context; final Object service; final String source; final long pickedAt;
-        final BooleanSupplier current; final Consumer<String> captured; final Handler main;
+        final Context context; final Object service; final String source; final long pickedAt, recognitionAt;
+        final BooleanSupplier current,prepareForTap; final Consumer<String> captured; final Handler main;
         HostProbeWindow window; String nonce; int user=-1; boolean ready,finished,tapSent;
         final Runnable timeout=() -> finish(null,tapSent?"capture_timeout":"ready_timeout");
-        Run(Context context,Object service,String source,long pickedAt,BooleanSupplier current,
-            Consumer<String> captured,Handler main) {
+        Run(Context context,Object service,String source,long pickedAt,long recognitionAt,BooleanSupplier current,
+            BooleanSupplier prepareForTap,Consumer<String> captured,Handler main) {
             this.context=context;this.service=service;this.source=source;this.pickedAt=pickedAt;
-            this.current=current;this.captured=captured;this.main=main;
+            this.recognitionAt=recognitionAt;
+            this.current=current;this.prepareForTap=prepareForTap;this.captured=captured;this.main=main;
         }
         void begin() {
             try {
+                if(recognitionAt<=0) { finish(null,"stale_session");return; }
                 if(!current.getAsBoolean()) { finish(null,"stale_session");return; }
                 Bundle request=new Bundle();request.putString("source",source);
                 Bundle ticket=io.github.yudigaga.taplusbridge.runtime.BridgeTransport.call(context,"probe_arm",request);
@@ -59,6 +66,7 @@ public final class HostProbeAction {
                     @Override protected void onReceiveResult(int code,Bundle data) { receive(code,data); }
                 };
                 Bundle payload=window.snapshot();payload.putAll(envelope());
+                if(recognitionAt>0)payload.putLong("recognition_at",recognitionAt);
                 payload.putParcelable("ack",frameworkReceiver(callback));
                 main.postDelayed(timeout,ProbeContract.TIMEOUT_MILLIS);
                 context.sendBroadcast(new Intent(ProbeContract.ARM).setPackage("android").putExtras(payload));
@@ -86,6 +94,14 @@ public final class HostProbeAction {
                     if(ready)return;
                     if(!data.getBoolean("block_ready") || !data.getBoolean("release_confirmed")) { finish(null,"protocol");return; }
                     ready=true;
+                    try { window.passthrough(); }
+                    catch (ReflectiveOperationException | RuntimeException failure) {
+                        finish(null,"source_changed"); return;
+                    }
+                    boolean tapReady;
+                    try { tapReady=prepareForTap.getAsBoolean(); }
+                    catch (RuntimeException unavailable) { tapReady=false; }
+                    if(!tapReady) { finish(null,"window_occluded"); return; }
                     // This only lets the host window update settle; physical release is proven above
                     // and is checked again by system_server, never inferred from this delay.
                     main.postDelayed(() -> {

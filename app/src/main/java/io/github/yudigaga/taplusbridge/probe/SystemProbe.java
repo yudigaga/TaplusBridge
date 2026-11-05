@@ -27,10 +27,12 @@ import android.view.MotionEvent;
 import io.github.libxposed.api.XposedInterface;
 import io.github.libxposed.api.XposedModule;
 import io.github.yudigaga.taplusbridge.bridge.BridgeContract;
+import io.github.yudigaga.taplusbridge.hook.HostPolicy;
 import io.github.yudigaga.taplusbridge.capture.AtmsSignature;
 import io.github.yudigaga.taplusbridge.capture.CaptureBroker;
 import io.github.yudigaga.taplusbridge.capture.CaptureLease;
 import io.github.yudigaga.taplusbridge.capture.IntentObservation;
+import io.github.yudigaga.taplusbridge.drag.DragGestureGate;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.util.List;
@@ -41,13 +43,12 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /**
  * Automatic, physical-UP-gated synthetic-card probe. Consumes a public Binder request before its body creates
  * any ActivityStarter/SafeActivityOptions; it does not fake success inside ActivityStarter.execute.
- * Other launch APIs and navigation inside an existing Activity are outside this hook's coverage.
+ * Public launch overloads share the same gate; navigation inside an existing Activity remains outside coverage.
  */
 public final class SystemProbe {
     private static final String TAG = "TaplusBridge";
     private static final Uri PROVIDER = Uri.parse("content://" + BridgeContract.AUTHORITY);
-    private static final int GRANTS = Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
-            | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION | Intent.FLAG_GRANT_PREFIX_URI_PERMISSION;
+    private static final long MAX_RECOGNITION_LEAD_MILLIS = 20_000;
     private final XposedModule module;
     private final Handler worker;
     private final Object lock = new Object();
@@ -58,11 +59,14 @@ public final class SystemProbe {
     private volatile Session session;
     private volatile Context system;
     private volatile InputAdapter input;
+    private volatile io.github.yudigaga.taplusbridge.drag.SystemLongPressDrag longPressDrag;
     private volatile io.github.yudigaga.taplusbridge.runtime.RuntimeServer runtime;
     private SystemScopeCapture scopeCapture;
     private volatile Object atmsInstance;
     private Class<?> activityTaskManagerType;
     private SourceWindowAccess windows;
+    private SourceWindowAccess.CardPlan cardPlan;
+    private int hostUid = -1;
     private Method optionsFromBundle, optionsAbort;
     private boolean armRegistered, tapRegistered, cancelRegistered;
     private boolean linkLaunchReady;
@@ -84,8 +88,10 @@ public final class SystemProbe {
                     && capturedAt >= 0 && now >= capturedAt && now - capturedAt < 30000;
         }
     }
-    private record Session(ProbeGate.Ticket ticket, Snapshot snapshot, ResultReceiver callback,boolean autonomous) { }
-    private record Captured(String url, String reason, IntentObservation.Observation metadata, long observedAt, boolean forResult) { }
+    private record Session(ProbeGate.Ticket ticket, Snapshot snapshot, ResultReceiver callback,
+                           boolean autonomous, long recognitionAt) { }
+    record Captured(String url, String reason, IntentObservation.Observation metadata, long observedAt, boolean forResult) { }
+    record LaunchClaim(ProbeGate.Decision decision, long generation, Captured captured) { }
     private static final class Rejected extends IllegalStateException {
         final String reason;
         Rejected(String reason) { super(reason); this.reason = reason; }
@@ -125,17 +131,46 @@ public final class SystemProbe {
                                 && PhysicalTouchState.isTouchPointer(motion.getSource(), motion.getActionMasked())) {
                             readDevice = motion.getDeviceId();
                             int display = (Integer) getDisplay.invoke(motion);
+                            boolean realMainInput = display == 0 && !physical.isInjected(display, readDevice,
+                                    motion.getDownTime(), SystemClock.uptimeMillis());
+                            if (realMainInput && motion.getActionMasked() == MotionEvent.ACTION_DOWN)
+                                DragGestureGate.physicalDown(display, readDevice, motion.getDownTime());
+                            if (realMainInput && motion.getActionMasked() == MotionEvent.ACTION_UP)
+                                DragGestureGate.physicalUp(display, readDevice, motion.getDownTime());
+                            var directional = longPressDrag;
+                            boolean transferredStream = directional != null && directional.transferredPointer(display, readDevice,
+                                    motion.getDownTime(), motion.getActionMasked());
+                            if (transferredStream) {
+                                recordTransferredTouch(physical, display, readDevice, motion.getDownTime(),
+                                        motion.getEventTime(), motion.getActionMasked(), SystemClock.uptimeMillis(),
+                                        SystemClock.elapsedRealtime());
+                                return chain.proceed();
+                            }
+                            boolean soleBefore = physical.soleStream(display, readDevice, motion.getDownTime());
                             physical.event(display, readDevice, motion.getDownTime(), motion.getEventTime(),
                                     motion.getActionMasked(), SystemClock.uptimeMillis());
+                            if (motion.getActionMasked() == MotionEvent.ACTION_UP && physical.released())
+                                physical.markReleasedElapsed(SystemClock.elapsedRealtime());
+                            boolean dragging = DragGestureGate.suppressLongPress();
                             SystemScopeCapture scoped = scopeCapture;
+                            if (directional != null && (motion.getSource() & InputDevice.SOURCE_TOUCHSCREEN) == InputDevice.SOURCE_TOUCHSCREEN
+                                    && !physical.isInjected(display, readDevice, motion.getDownTime(), SystemClock.uptimeMillis()))
+                                directional.pointer(motion, display, motion.getActionMasked() == MotionEvent.ACTION_UP
+                                        ? soleBefore && physical.released()
+                                        : physical.soleStream(display, readDevice, motion.getDownTime()));
                             if (scoped != null && (motion.getSource() & InputDevice.SOURCE_TOUCHSCREEN) == InputDevice.SOURCE_TOUCHSCREEN
                                     && !physical.isInjected(display, readDevice, motion.getDownTime(), SystemClock.uptimeMillis()))
                                 scoped.pointer(motion, display, physical.soleStream(display, readDevice, motion.getDownTime()));
                             Session waiting = session;
-                            if(physical.unavailable()) {
+                            if (dragging && waiting != null) {
+                                worker.post(() -> fail(waiting, "dragging"));
+                            } else if(physical.unavailable()) {
                                 pointerUnknown(waiting);
                             } else if (motion.getActionMasked() == MotionEvent.ACTION_UP && waiting != null
                                     && gate.awaitingRelease(waiting.ticket())) worker.post(() -> release(waiting));
+                            if (realMainInput && motion.getActionMasked() == MotionEvent.ACTION_UP
+                                    && (directional == null || !directional.transferred()))
+                                DragGestureGate.physicalInputUp();
                         }
                     } catch (Throwable unreadable) {
                         if (readDevice == null) physical.unknown();
@@ -155,6 +190,17 @@ public final class SystemProbe {
         Class<?> atms = loader.loadClass("com.android.server.wm.ActivityTaskManagerService");
         activityTaskManagerType = atms;
         try {
+            longPressDrag = new io.github.yudigaga.taplusbridge.drag.SystemLongPressDrag(module, worker,
+                    () -> system, () -> atmsInstance, () -> runtime, atms);
+            longPressDrag.setOnDirectedRelease(() -> {
+                if (android.os.Looper.myLooper() == worker.getLooper()) releaseWaitingProbe();
+                else worker.postAtFrontOfQueue(this::releaseWaitingProbe);
+            });
+            module.log(4, TAG, "drag gesture stage=installed");
+        } catch (ReflectiveOperationException | RuntimeException unavailable) {
+            module.log(5, TAG, "drag gesture stage=unavailable exception=" + unavailable.getClass().getSimpleName());
+        }
+        try {
             scopeCapture = new SystemScopeCapture(module, worker, () -> system, () -> atmsInstance, () -> runtime, atms, physical);
             module.log(4, TAG, "Scope capture system hooks installed");
         } catch (ReflectiveOperationException | RuntimeException unavailable) {
@@ -162,7 +208,7 @@ public final class SystemProbe {
         }
         windows = new SourceWindowAccess(atms);
         linkLaunchReady = ScopeLinkLaunchHooks.install(module, atms,
-                () -> scopeCapture == null ? null : scopeCapture.linkProbe()) > 0;
+                () -> scopeCapture == null ? null : scopeCapture.linkProbe(), this::interceptHostLaunch) > 0;
         Method entry = null;
         for (Method method : atms.getDeclaredMethods()) {
             if (!AtmsSignature.matches(method) || Modifier.isSynchronized(method.getModifiers())) continue;
@@ -185,48 +231,15 @@ public final class SystemProbe {
                         }catch(ReflectiveOperationException|RuntimeException unavailable){module.log(5,TAG,"Runtime options cancellation limited");}
                         return 0;
                     }
-                    ProbeGate.Decision decision = ProbeGate.Decision.PASS;
-                    Session owner = null;
-                    Intent intent = null;
-                    boolean unsupportedUser = false;
-                    String candidateUrl = null;
+                    int callerUid = Binder.getCallingUid();
+                    long identity = Binder.clearCallingIdentity();
+                    boolean consumed;
                     try {
-                        String source = (String) chain.getArg(1);
-                        int uid = Binder.getCallingUid(), user = (Integer) chain.getArg(11);
-                        intent = (Intent) chain.getArg(3);
-                        ComponentName component = intent == null ? null : intent.getComponent();
-                        boolean known = component != null && CaptureLease.expectedDestination(source,
-                                component.getPackageName(), component.getClassName());
-                        if (known && gate.activeFor(source, uid)) candidateUrl = ProbePayload.uniqueHttpUrl(intent);
-                        synchronized (lock) {
-                            ProbeGate.RequestedUser requested = gate.requestedUser(source, uid, user);
-                            unsupportedUser = !requested.supported(); user = requested.boundUser();
-                            decision = gate.claim(source, uid, user, known, fingerprint(candidateUrl), SystemClock.elapsedRealtime());
-                            if (decision == ProbeGate.Decision.CAPTURE && session != null
-                                    && gate.current().generation() == session.ticket().generation()) owner = session;
-                        }
-                    } catch (RuntimeException failure) {
-                        module.log(5, TAG, "Probe identity skipped: " + failure.getClass().getSimpleName());
-                    }
-                    // Never catch/replay proceed(). A consumed request never enters the original body.
-                    if (decision == ProbeGate.Decision.PASS) return chain.proceed();
-                    try {
-                    Captured captured = null;
-                    if (decision == ProbeGate.Decision.CAPTURE && owner != null) {
-                        IntentObservation.Observation metadata = null;
-                        String url = null, reason = "unsupported_request";
-                        boolean forResult = false;
-                        try {
-                            metadata = IntentObservation.inspect(intent);
-                            forResult = chain.getArg(5) != null && (Integer) chain.getArg(7) >= 0;
-                            if (!unsupportedUser && (Integer) chain.getArg(7) == -1 && chain.getArg(9) == null && plain(intent)) {
-                                url = candidateUrl;
-                                reason = url == null ? "no_unique_url" : "captured";
-                            }
-                        } catch (RuntimeException failure) { reason = "unreadable"; }
-                        captured = new Captured(url, reason, metadata, SystemClock.elapsedRealtime(), forResult);
-                    }
-                    // Options were not materialized by ATMS; explicitly notify their cancellation.
+                        consumed = interceptHostLaunch(callerUid, (String) chain.getArg(1),
+                                (Integer) chain.getArg(11), (Intent) chain.getArg(3),
+                                chain.getArg(5) != null && (Integer) chain.getArg(7) >= 0);
+                    } finally { Binder.restoreCallingIdentity(identity); }
+                    if (!consumed) return chain.proceed();
                     try {
                         Bundle options = (Bundle) chain.getArg(10);
                         if (options != null) {
@@ -236,33 +249,57 @@ public final class SystemProbe {
                     } catch (ReflectiveOperationException | RuntimeException failure) {
                         module.log(5, TAG, "Probe options cancellation limited: " + failure.getClass().getSimpleName());
                     }
-                    if (owner != null && captured != null) {
-                        Session ticket = owner; Captured result = captured;
-                        worker.post(() -> {
-                            try { complete(ticket, result); }
-                            catch (Throwable failure) { try { fail(ticket, "capture_unavailable"); } catch (Throwable ignored) { } }
-                        });
-                    } else module.log(4, TAG, "probe stage=late_blocked");
-                    } catch (Throwable consumedFailure) {
-                        // Protective hook modes must not replay an owned source launch on module errors.
-                        Session ticket = owner;
-                        if (ticket != null) try {
-                            worker.post(() -> { try { fail(ticket, "capture_unavailable"); } catch (Throwable ignored) { } });
-                        } catch (Throwable ignored) { }
-                    }
                     // Caller-visible success is valid here: no ActivityStarter or ActivityRecord exists.
                     return 0;
                 });
         worker.post(() -> register(0));
         module.log(4, TAG, "Invisible probe public Binder hook installed; source launch consumed");
     }
-    private static boolean plain(Intent intent) {
-        if (!IntentObservation.isSupportedComponent(intent == null ? null : intent.getComponent())) return false;
-        Bundle extras = intent.getExtras();
-        return intent.getClipData() == null && intent.getSelector() == null && (intent.getFlags() & GRANTS) == 0
-                && (extras == null || !extras.hasFileDescriptors());
+
+    static LaunchClaim claimLaunch(ProbeGate gate, int uid, String source, int user, Intent intent, boolean forResult) {
+        synchronized (gate) {
+            ComponentName component = intent == null ? null : intent.getComponent();
+            boolean known = component != null && CaptureLease.expectedDestination(source,
+                    component.getPackageName(), component.getClassName());
+            String candidate = gate.activeFor(source, uid) ? ScopeLinkProbe.strictHttp(intent, source) : null;
+            ProbeGate.RequestedUser requested = gate.requestedUser(source, uid, user);
+            long now = SystemClock.elapsedRealtime();
+            ProbeGate.Decision decision = gate.claim(source, uid, requested.boundUser(), known, fingerprint(candidate), now);
+            if (decision != ProbeGate.Decision.CAPTURE) return new LaunchClaim(decision, -1, null);
+            String url = null, reason = "unsupported_request";
+            IntentObservation.Observation metadata = null;
+            try {
+                metadata = IntentObservation.inspect(intent);
+                if (requested.supported()) {
+                    url = candidate; reason = url == null ? "no_unique_url" : "captured";
+                }
+            } catch (RuntimeException unreadable) { reason = "unreadable"; }
+            return new LaunchClaim(decision, gate.current().generation(), new Captured(url, reason, metadata, now, forResult));
+        }
     }
 
+    private boolean interceptHostLaunch(int uid, String source, int user, Intent intent, boolean forResult) {
+        LaunchClaim claim;
+        Session owner;
+        synchronized (lock) {
+            claim = claimLaunch(gate, uid, source, user, intent, forResult);
+            owner = session != null && session.ticket().generation() == claim.generation() ? session : null;
+        }
+        if (claim.decision() == ProbeGate.Decision.PASS) return false;
+        // Once claimed, never replay the launch if delivery fails.
+        try {
+            if (owner != null && claim.captured() != null) worker.post(() -> {
+                try { complete(owner, claim.captured()); }
+                catch (Throwable failure) { try { fail(owner, "capture_unavailable"); } catch (Throwable ignored) { } }
+            });
+            else module.log(4, TAG, "probe stage=late_blocked");
+        } catch (Throwable consumedFailure) {
+            if (owner != null) try {
+                worker.post(() -> { try { fail(owner, "capture_unavailable"); } catch (Throwable ignored) { } });
+            } catch (Throwable ignored) { }
+        }
+        return true;
+    }
     // Runs exclusively in system_server, outside application hidden-API enforcement.
     @android.annotation.SuppressLint("BlockedPrivateApi")
     private void register(int attempt) {
@@ -281,6 +318,7 @@ public final class SystemProbe {
                         ()->module.getRemotePreferences(io.github.yudigaga.taplusbridge.runtime.RuntimeSnapshot.GROUP),
                         new io.github.yudigaga.taplusbridge.runtime.SystemPackageOps(context,runtimeLogger),runtimeLogger);
                 candidate.setSourceCapture(scopeCapture);
+                candidate.setDragGestures(longPressDrag);
                 candidate.register();runtime=candidate;
             }catch(ReflectiveOperationException|RuntimeException unavailable){
                 module.log(5,TAG,"Frozen runtime unavailable: "+unavailable.getClass().getSimpleName());
@@ -290,11 +328,38 @@ public final class SystemProbe {
                 scopeCapture.setLinkProbe(new ScopeLinkProbe(worker, physical,
                         () -> runtime == null ? null : runtime.sourceCaptureConfiguration(),
                         target -> {
-                            scopeCapture.validateLinkTarget(target);
-                            windows.requireTarget(atmsInstance, target.source, target.activity, target.uid, target.user,
-                                    target.display, target.x, target.y);
-                        }, (target, action, downAt) -> adapter.injectTarget(target.uid, target.display, target.x, target.y, action, downAt),
+                            int uid = hostUid();
+                            cardPlan = windows.planCardTap(atmsInstance, target.source, target.activity, target.uid,
+                                    target.user, target.display, target.x, target.y, uid);
+                            if (!cardPlan.dismiss()) scopeCapture.validateLinkTargetBehind(target, uid);
+                        }, (target, action, downAt) -> {
+                            if (action == MotionEvent.ACTION_DOWN) {
+                                SourceWindowAccess.CardPlan planned = cardPlan;
+                                cardPlan = null;
+                                if (planned != null && planned.dismiss()) {
+                                    long dismissAt = SystemClock.uptimeMillis();
+                                    boolean sent = false;
+                                    try {
+                                        sent = adapter.injectTarget(target.uid, target.display, planned.dismissX(),
+                                                planned.dismissY(), MotionEvent.ACTION_DOWN, dismissAt);
+                                        if (!sent) throw new IllegalStateException("input_failed");
+                                    } finally {
+                                        if (sent) try {
+                                            adapter.injectTarget(target.uid, target.display, planned.dismissX(),
+                                                    planned.dismissY(), MotionEvent.ACTION_CANCEL, dismissAt);
+                                        } catch (ReflectiveOperationException | RuntimeException ignored) { }
+                                    }
+                                    if (windows.inspect(atmsInstance, target.source, target.activity, target.uid,
+                                            target.user, target.display, target.x, target.y) != ProbeClickPlan.Window.MAIN)
+                                        throw new IllegalStateException("popup_not_dismissed");
+                                    scopeCapture.validateLinkTargetBehind(target, hostUid());
+                                }
+                            }
+                            return adapter.injectTarget(target.uid, target.display, target.x, target.y, action, downAt);
+                        },
                         message -> module.log(4, TAG, message)));
+                if (longPressDrag != null) longPressDrag.setCardLinks((target, config, url) ->
+                        scopeCapture.linkProbe().confirm(target, config, url));
             }
             if (!armRegistered) {
                 registerAll(context, new BroadcastReceiver() {
@@ -345,6 +410,11 @@ public final class SystemProbe {
                     || command.getIntExtra("protocol", -1) != ProbeContract.VERSION
                     || !ProbeContract.MODE.equals(command.getStringExtra("mode")) || input == null || system == null)
                 throw new Rejected("protocol");
+            long recognitionAt = command.getLongExtra("recognition_at", 0), now = SystemClock.elapsedRealtime();
+            if (recognitionAt < 0 || recognitionAt > now + MAX_RECOGNITION_LEAD_MILLIS)
+                throw new Rejected("protocol");
+            if (recognitionAt > 0 && physical.released() && physical.releasedElapsedAt() < recognitionAt)
+                throw new Rejected("released_before_recognition");
             Snapshot snapshot = Snapshot.read(command);
             Bundle request = new Bundle(); request.putString("nonce", nonce);
             Bundle ticket = call(user, "capture_take", request);
@@ -354,10 +424,13 @@ public final class SystemProbe {
                     || uid < 0 || uid / 100000 != user) throw new Rejected("protocol");
             if (!snapshot.valid(source, SystemClock.elapsedRealtime())) throw new Rejected("snapshot");
             validateForeground(source, user, snapshot);
+            if (scopeCapture != null && !scopeCapture.tryYieldLinkToHost(source, uid, user, snapshot.capturedAt()))
+                throw new Rejected("busy");
             Session accepted;
             synchronized (lock) {
                 previous = session;
-                accepted = new Session(gate.arm(nonce, source, uid, user, SystemClock.elapsedRealtime()), snapshot, callback,ticket.getBoolean("system_runtime"));
+                accepted = new Session(gate.arm(nonce, source, uid, user, SystemClock.elapsedRealtime()), snapshot,
+                        callback, ticket.getBoolean("system_runtime"), recognitionAt);
                 session = accepted;
             }
             if (previous != null) send(previous.callback(), ProbeContract.FAILED,
@@ -371,16 +444,32 @@ public final class SystemProbe {
             module.log(5, TAG, "probe stage=failed reason=" + reason);
         }
     }
+    private void releaseWaitingProbe() {
+        Session owner = session;
+        if (owner != null) release(owner);
+    }
     private void release(Session owner) {
+        if (owner.recognitionAt() > 0 && physical.released()
+                && physical.releasedElapsedAt() < owner.recognitionAt()) {
+            fail(owner, "released_before_recognition"); return;
+        }
+        boolean dragUp = longPressDrag != null && longPressDrag.fingerReleasedForLink();
+        if (DragGestureGate.suppressLongPress() && !dragUp) { fail(owner, "dragging"); return; }
         if(owner.autonomous() && (runtime==null || !runtime.captureValid(owner.ticket().nonce(),owner.ticket().user()))) {
             fail(owner,"cancelled");return;
         }
         if(session==owner && physical.unavailable()) { fail(owner,"touch_unknown");return; }
-        if (session != owner || !gate.awaitingRelease(owner.ticket()) || !physical.released()) return;
+        boolean up = physical.released() || dragUp;
+        if (session != owner || !gate.awaitingRelease(owner.ticket()) || !up) {
+            if (dragUp) module.log(4, TAG, "probe stage=drag_release_skipped reason="
+                    + (session != owner ? "session" : !gate.awaitingRelease(owner.ticket()) ? "phase" : "touch"));
+            return;
+        }
+        if (dragUp && !physical.released()) module.log(4, TAG, "probe stage=drag_release");
         try {
             validateForeground(owner.ticket().source(), owner.ticket().user(), owner.snapshot());
             synchronized (lock) {
-                if (session != owner || !physical.released() || !gate.released(owner.ticket(), SystemClock.elapsedRealtime())) return;
+                if (session != owner || !up || !gate.released(owner.ticket(), SystemClock.elapsedRealtime())) return;
             }
             Bundle ready = envelope(owner.ticket().nonce(), owner.ticket().user(), true, "ready");
             ready.putBoolean("release_confirmed", true);
@@ -393,12 +482,17 @@ public final class SystemProbe {
     private void tap(Intent command) {
         Session owner = session;
         if (owner == null) return;
+        if (DragGestureGate.suppressLongPress() && (longPressDrag == null || !longPressDrag.fingerReleasedForLink())) {
+            fail(owner, "dragging"); return;
+        }
         try {
             command.setExtrasClassLoader(ResultReceiver.class.getClassLoader());
             if (command.getIntExtra("protocol", -1) != ProbeContract.VERSION
                     || !ProbeContract.MODE.equals(command.getStringExtra("mode"))
                     || !owner.ticket().nonce().equals(command.getStringExtra("nonce"))
                     || command.getIntExtra("user", -1) != owner.ticket().user()) return;
+            if (longPressDrag != null && longPressDrag.ownsLinkFallback(owner.ticket().source())
+                    && !longPressDrag.fingerReleasedForLink()) { fail(owner, "dragging"); return; }
             inspectInputWindow(owner);
             synchronized (lock) {
                 if (session != owner || !gate.tap(owner.ticket().nonce(), owner.ticket().user(), SystemClock.elapsedRealtime())) return;
@@ -451,6 +545,7 @@ public final class SystemProbe {
         Bundle response = envelope(owner.ticket().nonce(), owner.ticket().user(), true, result.reason());
         if (result.url() != null) response.putString("url", result.url());
         send(owner.callback(), result.url() == null ? ProbeContract.FAILED : ProbeContract.CAPTURED, response);
+        if (result.url() != null && longPressDrag != null) longPressDrag.offerCardLink(result.url());
         module.log(4, TAG, "probe stage=blocked outcome=" + (result.url() == null ? "NO_UNIQUE_URL" : "URL_FOUND"));
     }
     private void report(Session owner, Captured result) {
@@ -493,7 +588,8 @@ public final class SystemProbe {
     private ProbeClickPlan.Window inspectInputWindow(Session owner) throws ReflectiveOperationException {
         if(owner.autonomous() && (runtime==null || !runtime.captureValid(owner.ticket().nonce(),owner.ticket().user())))throw new Rejected("cancelled");
         if(physical.unavailable())throw new Rejected("touch_unknown");
-        if (!physical.released()) throw new Rejected("touch_active");
+        if (!physical.released() && (longPressDrag == null || !longPressDrag.fingerReleasedForLink()))
+            throw new Rejected("touch_active");
         ProbeGate.Ticket ticket = owner.ticket(); Snapshot snapshot = owner.snapshot();
         validateForeground(ticket.source(), ticket.user(), snapshot);
         return windows.inspect(atmsInstance, ticket.source(), snapshot.activity(), ticket.uid(), ticket.user(),
@@ -533,12 +629,28 @@ public final class SystemProbe {
         data.putBoolean("block_ready", ready); data.putString("nonce", nonce); data.putInt("user", user); data.putString("reason", reason);
         return data;
     }
+    private int hostUid() {
+        if (hostUid >= 10000 && hostUid < 100000) return hostUid;
+        Context context = system;
+        if (context == null) return -1;
+        try {
+            hostUid = context.getPackageManager().getApplicationInfo(HostPolicy.HOST_PACKAGE, 0).uid;
+        } catch (RuntimeException | android.content.pm.PackageManager.NameNotFoundException ignored) {
+            return -1;
+        }
+        return hostUid;
+    }
     private static String reason(Exception failure, String fallback) {
         if (failure instanceof Rejected rejected) return rejected.reason;
         if (failure instanceof ProbeGate.Rejected rejected) return rejected.reason;
         if (failure instanceof SourceWindowAccess.Rejected) return "window_occluded";
         if (failure instanceof SourceWindowAccess.Unavailable) return "window_unavailable";
         return fallback;
+    }
+    static void recordTransferredTouch(PhysicalTouchState physical, int display, int device, long downAt,
+                                       long eventAt, int action, long nowUptime, long nowElapsed) {
+        physical.event(display, device, downAt, eventAt, action, nowUptime);
+        if (action == MotionEvent.ACTION_UP && physical.released()) physical.markReleasedElapsed(nowElapsed);
     }
     private static void send(ResultReceiver receiver, int code, Bundle data) {
         try { if (receiver != null) receiver.send(code, data); } catch (RuntimeException ignored) { }

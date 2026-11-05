@@ -16,6 +16,8 @@ import android.os.Binder;
 import android.os.Bundle;
 import android.os.Process;
 import java.util.Arrays;
+import java.util.ArrayList;
+import java.util.List;
 import io.github.yudigaga.taplusbridge.config.ConfigStore;
 import io.github.yudigaga.taplusbridge.capture.CaptureBroker;
 import io.github.yudigaga.taplusbridge.capture.CaptureLease;
@@ -47,7 +49,8 @@ public final class BridgeProvider extends ContentProvider {
         if (context == null || (!BridgeContract.PREPARE.equals(method) && !"resolve".equals(method)
                 && !"recognition_status".equals(method) && !"capture_available".equals(method)
                 && !"capture_arm".equals(method) && !"probe_arm".equals(method) && !"probe_status".equals(method) && !"capture_cancel".equals(method)
-                && !"source_scope".equals(method) && !"lens_config".equals(method))) return Bundle.EMPTY;
+                && !"source_scope".equals(method) && !"lens_config".equals(method)
+                && !"drag_take".equals(method) && !"drag_complete".equals(method) && !"drag_import".equals(method))) return Bundle.EMPTY;
         int uid = Binder.getCallingUid();
         if (uid / 100000 != Process.myUid() / 100000) return Bundle.EMPTY;
         String[] callers = context.getPackageManager().getPackagesForUid(uid);
@@ -56,6 +59,33 @@ public final class BridgeProvider extends ContentProvider {
         try {
             PackageInfo host = context.getPackageManager().getPackageInfo(BridgeContract.HOST_PACKAGE, 0);
             if (!HostPolicy.supportedVersion(host.versionName, host.getLongVersionCode())) return declined("unsupported_host");
+            if ("drag_import".equals(method)) return io.github.yudigaga.taplusbridge.drag.DragNativeImport.receive(context, extras);
+            if ("drag_complete".equals(method)) {
+                ConfigStore config = new ConfigStore(context);
+                if (!config.enabled() || !config.getDragSettings().enabled || extras == null
+                        || !(extras.get("token") instanceof String token)
+                        || !(extras.get("text") instanceof String text) || text.length() > 128 * 1024)
+                    return declined("invalid_request");
+                Object rawLinks = extras.containsKey("links") ? extras.get("links") : List.of();
+                if (!io.github.yudigaga.taplusbridge.drag.DragPayload.validRecognizedLinks(rawLinks))
+                    return declined("invalid_request");
+                List<String> links = new ArrayList<>();
+                for (Object link : (List<?>) rawLinks) links.add((String) link);
+                String ready = io.github.yudigaga.taplusbridge.drag.DragActionStore.complete(context, token, text, links);
+                if (ready == null) return declined("drag_expired");
+                Bundle response = new Bundle(); response.putString("token", ready); return response;
+            }
+            if ("drag_take".equals(method)) {
+                ConfigStore config = new ConfigStore(context);
+                if (!config.enabled() || !config.getDragSettings().enabled) return declined("disabled");
+                Bundle payload=io.github.yudigaga.taplusbridge.drag.DragActionStore.take(context,
+                        extras == null ? null : extras.getString("token"));
+                if (payload != null && !config.sourceScope().allows(payload.getString("source"))) {
+                    if (payload.get("fd") instanceof android.os.ParcelFileDescriptor fd) fd.close();
+                    return declined("source_denied");
+                }
+                return payload == null ? declined("drag_expired") : payload;
+            }
             if ("lens_config".equals(method)) {
                 Bundle result = new Bundle(); result.putBoolean("enabled", new ConfigStore(context).lensEnabled()); return result;
             }
@@ -66,10 +96,12 @@ public final class BridgeProvider extends ContentProvider {
                 Bundle result = new Bundle(); result.putBoolean("saved", CaptureBroker.recordProbeStatus(context, extras)); return result;
             }
             if ("capture_available".equals(method)) {
+                ConfigStore config = new ConfigStore(context);
                 Bundle result = new Bundle(); result.putBoolean("enabled", android.os.Build.VERSION.SDK_INT >= 33
-                        && new ConfigStore(context).enabled() && new ConfigStore(context).captureEnabled()
-                        && new ConfigStore(context).recognitionEnabled()
-                        && extras != null && CaptureLease.allowedSource(extras.getString("source"))); return result;
+                        && config.enabled() && config.captureEnabled() && config.recognitionEnabled()
+                        && extras != null && CaptureLease.allowedSource(extras.getString("source")));
+                result.putInt("recognition_delay", config.getDragSettings().recognitionDelayMillis);
+                return result;
             }
             if ("probe_arm".equals(method) && !new ConfigStore(context).recognitionEnabled()) return declined("recognition_disabled");
             if ("capture_arm".equals(method) || "probe_arm".equals(method)) return android.os.Build.VERSION.SDK_INT >= 33
@@ -137,6 +169,10 @@ public final class BridgeProvider extends ContentProvider {
     }
     public static Bundle consume(Context context, String token) {
         return token != null && token.startsWith("p_") ? EphemeralTicketStore.consume(token) : new TicketStore(context).consume(token);
+    }
+    /** Called only from the module's own foreground drop screen after local rule validation. */
+    public static String issueDrag(Context context, Bundle request) {
+        return LaunchPlanner.plan(context, request) == null ? null : new TicketStore(context).issue(request);
     }
     @Override public Cursor query(Uri uri, String[] projection, String selection, String[] args, String order) { return null; }
     @Override public String getType(Uri uri) { return null; }

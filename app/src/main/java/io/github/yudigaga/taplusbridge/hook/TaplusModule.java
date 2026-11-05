@@ -39,6 +39,7 @@ public final class TaplusModule extends XposedModule {
         if (apiSupported) {
             log(4, TAG, "System framework callback reached; installing invisible probe");
             SystemProbe.install(this, param.getClassLoader());
+            io.github.yudigaga.taplusbridge.drag.SystemDragHooks.install(this, param.getClassLoader());
         }
     }
 
@@ -68,6 +69,7 @@ public final class TaplusModule extends XposedModule {
         recognitionHooks = RecognitionHooks.install(this, loader, this::recommendationSource);
         HostScopeCaptureHooks.install(this, loader);
         PortalLensHooks.install(this, loader);
+        HostDragHooks.install(this, loader, recognitionHooks);
         try {
             Class<?> apps = loader.loadClass(HOST_ROOT + "utils.AppsUtils");
             Class<?> info = loader.loadClass(HOST_ROOT + "data.recognition.TextRecommendationInfo");

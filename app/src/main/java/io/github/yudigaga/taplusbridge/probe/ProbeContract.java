@@ -8,5 +8,6 @@ public final class ProbeContract {
     public static final String ARM = "io.github.yudigaga.taplusbridge.PROBE_ARM";
     public static final String TAP = "io.github.yudigaga.taplusbridge.PROBE_TAP";
     public static final long TIMEOUT_MILLIS = 6000;
+    public static final long LINK_RESULT_GRACE_MILLIS = TIMEOUT_MILLIS + 500;
     private ProbeContract() { }
 }

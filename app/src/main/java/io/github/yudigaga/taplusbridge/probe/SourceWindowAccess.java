@@ -3,6 +3,7 @@ package io.github.yudigaga.taplusbridge.probe;
 import android.content.ComponentName;
 import android.graphics.Rect;
 import android.view.WindowManager;
+import io.github.yudigaga.taplusbridge.hook.HostPolicy;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 
@@ -51,6 +52,115 @@ public final class SourceWindowAccess {
                               int display, float x, float y) throws ReflectiveOperationException {
         if (inspect(atms, source, activity, uid, user, display, x, y) != ProbeClickPlan.Window.MAIN)
             throw new Rejected();
+    }
+
+    /** Where a card tap may go. A covering menu is dismissed somewhere else first; the card point is not clicked while covered. */
+    public static final class CardPlan {
+        private final boolean dismiss;
+        private final float dismissX, dismissY;
+        private CardPlan(boolean dismiss, float dismissX, float dismissY) {
+            this.dismiss = dismiss; this.dismissX = dismissX; this.dismissY = dismissY;
+        }
+        public boolean dismiss() { return dismiss; }
+        public float dismissX() { return dismissX; }
+        public float dismissY() { return dismissY; }
+        static CardPlan tap() { return new CardPlan(false, 0, 0); }
+        static CardPlan dismiss(float x, float y) { return new CardPlan(true, x, y); }
+    }
+
+    public CardPlan planCardTap(Object atms, String source, String activity, int uid, int user,
+                                int display, float x, float y, int hostUid) throws ReflectiveOperationException {
+        available(atms);
+        Object service = windowManager.get(atms), monitor = globalLock.get(service);
+        Object window, focus;
+        synchronized (monitor) {
+            Object content = displayContent.invoke(root.get(service), display);
+            window = content == null ? null : touchableWindow.invoke(content, x, y);
+            focus = content == null ? null : focusedWindow.get(content);
+            if (window == null) throw new Rejected();
+            if (isHostOverlay(window, hostUid) || (focus != null && isHostOverlay(focus, hostUid)
+                    && (window == focus || sourceMain(window, source, activity, uid, user, x, y))))
+                return CardPlan.tap();
+            if (coveringMenu(window, focus, source, activity, uid, user, x, y)) {
+                float[] outside = outsideMenu(window, x, y);
+                if (outside == null) throw new Rejected();
+                return CardPlan.dismiss(outside[0], outside[1]);
+            }
+        }
+        ProbeClickPlan.Window kind = inspect(atms, source, activity, uid, user, display, x, y);
+        if (kind == ProbeClickPlan.Window.MAIN) return CardPlan.tap();
+        if (kind == ProbeClickPlan.Window.OUTSIDE_POPUP) return CardPlan.dismiss(x, y);
+        throw new Rejected();
+    }
+
+    private boolean isHostOverlay(Object window, int hostUid) throws ReflectiveOperationException {
+        if (hostUid < 10000 || hostUid >= 100000) return false;
+        WindowManager.LayoutParams params = (WindowManager.LayoutParams) attributes.get(window);
+        return params != null && ownerUid.getInt(window) == hostUid && showUser.getInt(window) == 0
+                && HostPolicy.HOST_PACKAGE.equals(params.packageName)
+                && (params.type == WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY || params.type == 2002)
+                && Boolean.TRUE.equals(visible.invoke(window))
+                && (params.flags & WindowManager.LayoutParams.FLAG_SECURE) == 0;
+    }
+
+    private boolean sourceMain(Object window, String source, String activity, int uid, int user, float x, float y)
+            throws ReflectiveOperationException {
+        WindowManager.LayoutParams params = (WindowManager.LayoutParams) attributes.get(window);
+        Object record = activityRecord.get(window);
+        ComponentName component = record == null ? null : (ComponentName) activityComponent.get(record);
+        Rect bounds = (Rect) frame.invoke(window);
+        return params != null && record != null && component != null && bounds != null
+                && ownerUid.getInt(window) == uid && showUser.getInt(window) == user
+                && (params.type == WindowManager.LayoutParams.TYPE_BASE_APPLICATION
+                || params.type == WindowManager.LayoutParams.TYPE_APPLICATION)
+                && source.equals(params.packageName) && source.equals(component.getPackageName())
+                && activity.equals(component.getClassName()) && activityUser.getInt(record) == user
+                && mainWindow.invoke(record, false) == window && Boolean.TRUE.equals(visible.invoke(window))
+                && bounds.contains((int) x, (int) y);
+    }
+
+    private boolean coveringMenu(Object window, Object focus, String source, String activity, int uid, int user,
+                                 float x, float y) throws ReflectiveOperationException {
+        if (focus != window) return false;
+        WindowManager.LayoutParams params = (WindowManager.LayoutParams) attributes.get(window);
+        if (params == null || params.type < 1000 || params.type > 1999
+                || (params.flags & (WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+                | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                | WindowManager.LayoutParams.FLAG_SECURE)) != 0) return false;
+        Object record = activityRecord.get(window);
+        ComponentName component = record == null ? null : (ComponentName) activityComponent.get(record);
+        Object main = record == null ? null : mainWindow.invoke(record, false);
+        Rect popupBounds = (Rect) frame.invoke(window);
+        Rect mainBounds = main == null ? null : (Rect) frame.invoke(main);
+        Object parent = parentWindow.invoke(window);
+        return ownerUid.getInt(window) == uid && showUser.getInt(window) == user
+                && source.equals(params.packageName) && component != null
+                && source.equals(component.getPackageName()) && activity.equals(component.getClassName())
+                && activityUser.getInt(record) == user && main != null && ownerUid.getInt(main) == uid
+                && (parent == main || parent == null) && popupBounds != null && mainBounds != null
+                && popupBounds.contains((int) x, (int) y) && mainBounds.contains((int) x, (int) y)
+                && Boolean.TRUE.equals(visible.invoke(window)) && Boolean.TRUE.equals(visible.invoke(main));
+    }
+
+    private float[] outsideMenu(Object popup, float avoidX, float avoidY) throws ReflectiveOperationException {
+        Object record = activityRecord.get(popup);
+        Object main = record == null ? null : mainWindow.invoke(record, false);
+        Rect menu = (Rect) frame.invoke(popup);
+        Rect bounds = main == null ? null : (Rect) frame.invoke(main);
+        if (menu == null || bounds == null) return null;
+        float[][] candidates = {
+                {bounds.right - 3f, bounds.top + 2f}, {bounds.left + 2f, bounds.bottom - 3f},
+                {bounds.right - 3f, bounds.bottom - 3f}, {bounds.left + 2f, bounds.top + 2f}
+        };
+        for (float[] point : candidates) {
+            if (point[0] < bounds.left || point[0] >= bounds.right || point[1] < bounds.top || point[1] >= bounds.bottom)
+                continue;
+            if (menu.contains((int) point[0], (int) point[1])) continue;
+            if (Math.hypot(point[0] - avoidX, point[1] - avoidY) < 48f) continue;
+            return point;
+        }
+        return null;
     }
 
     public ProbeClickPlan.Window inspect(Object atms, String source, String activity, int uid, int user,

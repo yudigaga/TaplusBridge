@@ -74,6 +74,8 @@ public final class ScopeLongPress {
 
     public synchronized void cancel() { state = IDLE; remainingOrigins = 0; }
 
+    public synchronized boolean isActive() { return state != IDLE; }
+
     private Trigger finish(long upAt) {
         Trigger result = new Trigger(downAt, upAt, device, 0, firstX, firstY);
         cancel(); return result;

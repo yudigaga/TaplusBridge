@@ -1,12 +1,14 @@
 package io.github.yudigaga.taplusbridge.probe;
 
 import android.content.Intent;
+import android.content.ComponentName;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.SystemClock;
 import android.view.MotionEvent;
 import io.github.yudigaga.taplusbridge.BuildConfig;
 import io.github.yudigaga.taplusbridge.capture.IntentObservation;
+import io.github.yudigaga.taplusbridge.capture.CaptureLease;
 import io.github.yudigaga.taplusbridge.runtime.RuntimeSnapshot;
 import java.util.Objects;
 import java.util.ArrayList;
@@ -28,17 +30,18 @@ public final class ScopeLinkProbe {
     private static final class Run {
         final ScopeCaptureWindow.Snapshot snapshot;
         final RuntimeSnapshot config;
-        final long downAt, gestureElapsed, threshold, expiresAt;
+        final long downAt, gestureElapsed, threshold, recognitionAtUptime, expiresAt;
         Phase phase = Phase.ARMED;
         String url;
         boolean observed, invalid, tapAttempted;
-        long tapDeadline;
+        long tapDeadline, recognitionAt;
         Consumer<String> complete;
         Runnable timeout;
         Run(ScopeCaptureWindow.Snapshot snapshot, RuntimeSnapshot config, long downAt,
-            long gestureElapsed, long threshold, long expiresAt) {
+            long gestureElapsed, long threshold, long recognitionAtUptime, long expiresAt) {
             this.snapshot = snapshot; this.config = config; this.downAt = downAt;
-            this.gestureElapsed = gestureElapsed; this.threshold = threshold; this.expiresAt = expiresAt;
+            this.gestureElapsed = gestureElapsed; this.threshold = threshold;
+            this.recognitionAtUptime = recognitionAtUptime; this.expiresAt = expiresAt;
         }
     }
     private final Handler worker;
@@ -71,7 +74,9 @@ public final class ScopeLinkProbe {
                 || gestureElapsed > SystemClock.elapsedRealtime() || !valid(config, snapshot) || !sameConfig(config, snapshot)) {
             log("rejected", "candidate_invalid"); return;
         }
-        Run run = new Run(snapshot, config, downUptime, gestureElapsed, timeoutMillis, now + MAX_GESTURE_MILLIS);
+        long recognitionAt = downUptime + timeoutMillis + config.drag.recognitionDelayMillis;
+        Run run = new Run(snapshot, config, downUptime, gestureElapsed, timeoutMillis,
+                recognitionAt, now + MAX_GESTURE_MILLIS);
         synchronized (lock) { retired.remove(snapshot); active = run; }
         scheduleTimeout(run, MAX_GESTURE_MILLIS);
         log("armed", "none");
@@ -79,6 +84,10 @@ public final class ScopeLinkProbe {
 
     /** Real physical input only: the caller must exclude its own injected stream before this method. */
     public void pointer(int action, int pointers, float x, float y, long downAt, float slop) {
+        pointer(action, pointers, x, y, downAt, SystemClock.uptimeMillis(), slop);
+    }
+
+    public void pointer(int action, int pointers, float x, float y, long downAt, long eventAt, float slop) {
         Run run;
         synchronized (lock) { if (action == MotionEvent.ACTION_DOWN) tail = null; run = active; }
         if (run == null) return;
@@ -87,6 +96,9 @@ public final class ScopeLinkProbe {
                 || !Float.isFinite(x) || !Float.isFinite(y) || !Float.isFinite(slop) || slop < 0
                 || Math.hypot(x - run.snapshot.x, y - run.snapshot.y) > slop) {
             finish(run, null, "touch_changed"); return;
+        }
+        if (action == MotionEvent.ACTION_UP && eventAt < run.recognitionAtUptime) {
+            finish(run, null, "released_before_recognition"); return;
         }
         if (action == MotionEvent.ACTION_UP && SystemClock.uptimeMillis() - run.downAt < run.threshold)
             finish(run, null, "short_press");
@@ -112,8 +124,8 @@ public final class ScopeLinkProbe {
         boolean owns;
         synchronized (lock) { owns = active == run; if (owns) phase = run.phase; }
         if (!owns) return interceptTail(uid, source, user);
-        if (phase == Phase.ARMED && now - run.downAt < run.threshold) return false;
-        String url = ordinary ? strictHttp(intent) : null;
+        if (phase == Phase.ARMED && now < run.recognitionAtUptime) return false;
+        String url = strictHttp(intent, source);
         try { check.validate(run.snapshot); }
         catch (ReflectiveOperationException | RuntimeException changed) {
             synchronized (lock) {
@@ -136,13 +148,28 @@ public final class ScopeLinkProbe {
         }
         if (!owns) return interceptTail(uid, source, user);
         if (confirmed) worker.post(() -> finishObserved(run));
+        if (url == null) log("rejected", rejectionReason(intent, source));
         log("blocked", url == null ? "unsupported_launch" : "http");
         return true;
     }
 
     /** The caller has verified the full long-press gesture and terminal physical UP. */
     public void confirm(ScopeCaptureWindow.Snapshot snapshot, RuntimeSnapshot config, Consumer<String> complete) {
+        long nowElapsed = SystemClock.elapsedRealtime();
+        Run run;
+        synchronized (lock) { run = active; }
+        long releasedAt = physical.releasedElapsedAt();
+        if (releasedAt < 0) releasedAt = nowElapsed;
+        long recognitionAt = run == null ? releasedAt
+                : run.gestureElapsed + run.threshold + run.config.drag.recognitionDelayMillis;
+        confirm(snapshot, config, recognitionAt, releasedAt, complete);
+    }
+
+    /** The fallback tap cannot run before recognition is ready for the same physical gesture. */
+    public void confirm(ScopeCaptureWindow.Snapshot snapshot, RuntimeSnapshot config, long recognitionAt,
+                        long releasedAt, Consumer<String> complete) {
         Objects.requireNonNull(complete);
+        long nowElapsed = SystemClock.elapsedRealtime();
         Run run;
         synchronized (lock) {
             if (retired.contains(snapshot)) { worker.post(() -> complete.accept(null)); return; }
@@ -152,51 +179,75 @@ public final class ScopeLinkProbe {
             if (run != null) finish(run, null, "configuration_changed");
             worker.post(() -> complete.accept(null)); return;
         }
+        if (recognitionAt < 0 || releasedAt < recognitionAt || releasedAt > nowElapsed
+                || (recognitionAt > nowElapsed && recognitionAt - nowElapsed > MAX_GESTURE_MILLIS)) {
+            worker.post(() -> complete.accept(null)); return;
+        }
         if (run != null && (run.snapshot != snapshot || !run.config.identity.equals(config.identity))) {
             finish(run, null, "candidate_changed"); worker.post(() -> complete.accept(null)); return;
         }
         if (run == null) {
             // Double-finger gestures are admitted only after the caller confirms them.
             long now = SystemClock.uptimeMillis();
-            run = new Run(snapshot, config, now, SystemClock.elapsedRealtime(), 0, now + CAPTURE_TIMEOUT_MILLIS);
+            run = new Run(snapshot, config, now, SystemClock.elapsedRealtime(), 0, now,
+                    now + CAPTURE_TIMEOUT_MILLIS);
             synchronized (lock) { if (active != null) { worker.post(() -> complete.accept(null)); return; } active = run; }
         }
         final Run confirmed = run;
         synchronized (lock) {
             if (active != confirmed || confirmed.complete != null) return;
             confirmed.complete = complete;
+            confirmed.recognitionAt = recognitionAt;
         }
         try {
             requireCurrent(confirmed); check.validate(snapshot);
+            long delay;
+            boolean observed;
             synchronized (lock) {
                 if (active != confirmed) return;
-                if (confirmed.observed) { worker.post(() -> finishObserved(confirmed)); return; }
-                confirmed.phase = Phase.TAPPED;
-                confirmed.tapDeadline = SystemClock.uptimeMillis() + CAPTURE_TIMEOUT_MILLIS;
-            }
-            scheduleTimeout(confirmed, CAPTURE_TIMEOUT_MILLIS);
-            boolean attempted = false, released = false;
-            long injectedDown = SystemClock.uptimeMillis();
-            try {
-                requireCurrent(confirmed); check.validate(snapshot);
-                synchronized (lock) {
-                    if (active != confirmed) throw new IllegalStateException("probe_cancelled");
-                    confirmed.tapAttempted = true;
-                }
-                attempted = true;
-                if (!tap.send(snapshot, MotionEvent.ACTION_DOWN, injectedDown)) throw new IllegalStateException("input_failed");
-                requireCurrent(confirmed); check.validate(snapshot);
-                released = tap.send(snapshot, MotionEvent.ACTION_UP, injectedDown);
-                if (!released) throw new IllegalStateException("input_failed");
-                log("tapped", "none");
-            } finally {
-                if (attempted && !released) {
-                    try { tap.send(snapshot, MotionEvent.ACTION_CANCEL, injectedDown); }
-                    catch (ReflectiveOperationException | RuntimeException ignored) { }
+                observed = confirmed.observed;
+                delay = Math.max(0, recognitionAt - SystemClock.elapsedRealtime());
+                if (!observed) {
+                    confirmed.phase = Phase.TAPPED;
+                    confirmed.tapDeadline = SystemClock.uptimeMillis() + delay + CAPTURE_TIMEOUT_MILLIS;
                 }
             }
+            if (observed) { worker.post(() -> finishObserved(confirmed)); return; }
+            scheduleTimeout(confirmed, delay + CAPTURE_TIMEOUT_MILLIS);
+            Runnable tapLater = () -> sendTap(confirmed);
+            if (delay == 0) tapLater.run(); else worker.postDelayed(tapLater, delay);
         } catch (ReflectiveOperationException | RuntimeException failure) {
             finish(confirmed, null, "input_or_window_changed");
+        }
+    }
+
+    private void sendTap(Run run) {
+        synchronized (lock) { if (active != run || run.tapAttempted) return; }
+        boolean attempted = false, released = false;
+        long injectedDown = SystemClock.uptimeMillis();
+        try {
+            requireCurrent(run); check.validate(run.snapshot);
+            if (SystemClock.elapsedRealtime() < run.recognitionAt) {
+                worker.postDelayed(() -> sendTap(run), run.recognitionAt - SystemClock.elapsedRealtime());
+                return;
+            }
+            synchronized (lock) {
+                if (active != run || run.tapAttempted) return;
+                run.tapAttempted = true;
+            }
+            attempted = true;
+            if (!tap.send(run.snapshot, MotionEvent.ACTION_DOWN, injectedDown)) throw new IllegalStateException("input_failed");
+            requireCurrent(run); check.validate(run.snapshot);
+            released = tap.send(run.snapshot, MotionEvent.ACTION_UP, injectedDown);
+            if (!released) throw new IllegalStateException("input_failed");
+            log("tapped", "none");
+        } catch (ReflectiveOperationException | RuntimeException failure) {
+            finish(run, null, "input_or_window_changed");
+        } finally {
+            if (attempted && !released) {
+                try { tap.send(run.snapshot, MotionEvent.ACTION_CANCEL, injectedDown); }
+                catch (ReflectiveOperationException | RuntimeException ignored) { }
+            }
         }
     }
 
@@ -204,6 +255,22 @@ public final class ScopeLinkProbe {
         Run run;
         synchronized (lock) { tail = null; run = active; }
         if (run != null) finish(run, null, "cancelled");
+    }
+
+    /** A host probe owns window passthrough and delivery; this candidate must not also click or consume. */
+    public boolean tryYieldToHost(ScopeCaptureWindow.Snapshot snapshot) {
+        synchronized (lock) {
+            if (snapshot == null || retired.contains(snapshot)) return false;
+            Run run = active;
+            if (run != null && (run.snapshot != snapshot || run.tapAttempted || run.observed)) return false;
+            if (run != null) finish(run, null, "host_probe_owner");
+            else {
+                retired.add(snapshot);
+                if (retired.size() > 8) retired.remove(0);
+            }
+            tail = null;
+            return true;
+        }
     }
 
     /** The opted-in link mode owns this same-source native result before its UI can cover the target. */
@@ -220,6 +287,11 @@ public final class ScopeLinkProbe {
 
     /** A native acceptance only wins over its own current gesture, never a new or other-source one. */
     public void nativeResult(String source, long occurredElapsed) {
+        nativeResult(source, occurredElapsed, true);
+    }
+
+    public void nativeResult(String source, long occurredElapsed, boolean hasValidUrl) {
+        if (!hasValidUrl) return;
         Run run;
         synchronized (lock) {
             if (tail != null && tail.snapshot.source.equals(source) && occurredElapsed >= tail.gestureElapsed
@@ -247,6 +319,7 @@ public final class ScopeLinkProbe {
     private void requireCurrent(Run run) {
         synchronized (lock) { if (active != run) throw new IllegalStateException("probe_cancelled"); }
         if (SystemClock.uptimeMillis() >= run.expiresAt || !physical.released()
+                || physical.releasedElapsedAt() < run.recognitionAt
                 || !sameConfig(run.config, run.snapshot)) throw new IllegalStateException("probe_cancelled");
     }
     private boolean sameConfig(RuntimeSnapshot accepted, ScopeCaptureWindow.Snapshot snapshot) {
@@ -302,9 +375,13 @@ public final class ScopeLinkProbe {
     }
 
     @SuppressWarnings("deprecation")
-    private static String strictHttp(Intent intent) {
+    static String strictHttp(Intent intent, String source) {
         try {
             if (!plain(intent)) return null;
+            ComponentName component = intent.getComponent();
+            if (component != null && CaptureLease.expectedDestination(source,
+                    component.getPackageName(), component.getClassName()))
+                return ProbePayload.uniqueHttpUrl(intent);
             if (Intent.ACTION_CHOOSER.equals(intent.getAction())) {
                 if (intent.getData() != null || intent.hasExtra(Intent.EXTRA_INITIAL_INTENTS)
                         || intent.hasExtra("android.intent.extra.ALTERNATE_INTENTS")
@@ -328,5 +405,16 @@ public final class ScopeLinkProbe {
         if (intent == null || intent.getSelector() != null || intent.getClipData() != null || (intent.getFlags() & GRANTS) != 0) return false;
         Bundle extras = intent.getExtras();
         return extras == null || !extras.hasFileDescriptors();
+    }
+
+    private static String rejectionReason(Intent intent, String source) {
+        try {
+            if (!plain(intent)) return "unsafe_intent";
+            ComponentName component = intent.getComponent();
+            if (component != null && CaptureLease.expectedDestination(source,
+                    component.getPackageName(), component.getClassName())) return "web_payload_invalid";
+            if (Intent.ACTION_CHOOSER.equals(intent.getAction())) return "chooser_invalid";
+            return Intent.ACTION_VIEW.equals(intent.getAction()) ? "http_data_invalid" : "unsupported_action";
+        } catch (RuntimeException unreadable) { return "unreadable_payload"; }
     }
 }

@@ -13,10 +13,14 @@ import java.util.function.Supplier;
 /** Stops owned web launches at the public ATMS boundary before an Activity can be created. */
 public final class ScopeLinkLaunchHooks {
     private ScopeLinkLaunchHooks() {}
+    @FunctionalInterface
+    public interface HostLaunch {
+        boolean intercept(int uid, String source, int user, Intent intent, boolean forResult);
+    }
 
     // These callbacks run in system_server; application target-SDK hidden API limits do not apply.
     @android.annotation.SuppressLint("SoonBlockedPrivateApi")
-    public static int install(XposedModule module, Class<?> atms, Supplier<ScopeLinkProbe> probe) {
+    public static int install(XposedModule module, Class<?> atms, Supplier<ScopeLinkProbe> probe, HostLaunch host) {
         int count = 0;
         for (Method entry : atms.getDeclaredMethods()) {
             String name = entry.getName();
@@ -46,13 +50,13 @@ public final class ScopeLinkLaunchHooks {
             module.hook(entry).setId("taplusbridge:scope-link:" + name + ":" + types.length)
                     .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).intercept(chain -> {
                         ScopeLinkProbe active = probe.get();
-                        if (active == null) return chain.proceed();
                         int uid = Binder.getCallingUid(), requestedUser = userAt < 0 ? uid / 100000 : (Integer) chain.getArg(userAt);
                         if (requestedUser == -2 || requestedUser == -3) requestedUser = uid / 100000;
                         Intent candidate = null;
                         boolean ordinary = profileAt < 0 || chain.getArg(profileAt) == null;
-                        if (resultAt >= 0 && requestAt >= 0 && chain.getArg(resultAt) != null
-                                && (Integer) chain.getArg(requestAt) >= 0) ordinary = false;
+                        boolean forResult = resultAt >= 0 && requestAt >= 0 && chain.getArg(resultAt) != null
+                                && (Integer) chain.getArg(requestAt) >= 0;
+                        if (forResult) ordinary = false;
                         Object input = chain.getArg(intentAt);
                         if (multiple) {
                             Intent[] inputs = input instanceof Intent[] values ? values : null;
@@ -61,7 +65,11 @@ public final class ScopeLinkLaunchHooks {
                         } else if (input instanceof Intent value) candidate = value;
                         boolean consumed;
                         long identity = Binder.clearCallingIdentity();
-                        try { consumed = active.intercept(uid, (String) chain.getArg(callerAt), requestedUser, candidate, ordinary); }
+                        try {
+                            String source = (String) chain.getArg(callerAt);
+                            consumed = host.intercept(uid, source, requestedUser, candidate, forResult)
+                                    || active != null && active.intercept(uid, source, requestedUser, candidate, ordinary);
+                        }
                         finally { Binder.restoreCallingIdentity(identity); }
                         if (!consumed) return chain.proceed();
                         // No original ATMS body or browser Activity runs for this owned request.

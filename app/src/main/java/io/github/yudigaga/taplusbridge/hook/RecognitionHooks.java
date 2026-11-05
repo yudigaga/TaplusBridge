@@ -21,6 +21,7 @@ import java.lang.reflect.Method;
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
 import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import io.github.yudigaga.taplusbridge.probe.HostProbeAction;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -42,6 +43,8 @@ public final class RecognitionHooks {
     private volatile Boolean supportedHost;
     private long epoch;
     private long scheduledEpoch = -1;
+    private DragPick fallbackDeadlinePick;
+    private long fallbackRecognitionDeadline;
     private boolean active;
     private final AutoProbeReadiness autoProbe;
     private final RecognitionEpochs origins=new RecognitionEpochs();
@@ -51,9 +54,49 @@ public final class RecognitionHooks {
     private boolean mixedImage, mixedPrepared;
     private final ProbeRecommendations scopeRecommendations = new ProbeRecommendations();
     private volatile Object pickService;
+    private DragPick dragPick;
     private volatile long lastPickAt;
     private volatile boolean probeGeometry;
+    private boolean keepRecognitionVisible;
+    private long recognitionOnlyEpoch = -1;
     private ArrayList<?> lastServer = new ArrayList<>();
+
+    record DragPick(long epoch, Object service, Object result, long pickedAt) {
+        boolean matches(Object expectedService, Object expectedResult, long expectedEpoch) {
+            return service == expectedService && result == expectedResult && (expectedEpoch < 0 || epoch == expectedEpoch);
+        }
+    }
+    record DragSnapshot(long epoch, boolean waiting, List<String> links) {
+        DragSnapshot {
+            links = List.copyOf(links.stream().filter(io.github.yudigaga.taplusbridge.capture.IntentObservation::validHttpUrl)
+                    .limit(io.github.yudigaga.taplusbridge.recognition.LinkExtractor.MAX_RESULTS)
+                    .collect(java.util.stream.Collectors.toList()));
+        }
+    }
+
+    /** Read only the exact live pick; a completed or replaced pick cannot supply another drag's links. */
+    DragSnapshot dragSnapshot(Object service, Object result, long expectedEpoch) {
+        synchronized (sessionLock) {
+            if (!active || dragPick == null || !dragPick.matches(service, result, expectedEpoch)) return null;
+            boolean waiting = false;
+            try {
+                Object task = recommendationTask == null ? null : recommendationTask.get(null);
+                waiting = pendingRecommendation(task, origins.owner(task), epoch);
+            } catch (ReflectiveOperationException | RuntimeException failure) { report(failure); }
+            return new DragSnapshot(epoch, waiting, enhancer.capturedLinks());
+        }
+    }
+
+    boolean nativeUrlAvailable(Object service, Object result) {
+        synchronized (sessionLock) {
+            return dragPick != null && dragPick.matches(service, result, -1) && !enhancer.capturedLinks().isEmpty();
+        }
+    }
+
+    @SuppressWarnings("deprecation")
+    static boolean pendingRecommendation(Object task, long owner, long epoch) {
+        return owner == epoch && task instanceof AsyncTask<?, ?, ?> pending && pending.getStatus() != AsyncTask.Status.FINISHED;
+    }
 
     public static RecognitionHooks install(XposedModule module, ClassLoader loader, Supplier<String> source) {
         try {
@@ -116,7 +159,11 @@ public final class RecognitionHooks {
                     .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).intercept(chain -> {
                         try {
                             if (contextSupported(chain.getThisObject())) {
-                                pickService = chain.getThisObject();
+                                synchronized (sessionLock) {
+                                    pickService = chain.getThisObject();
+                                    dragPick = new DragPick(epoch, pickService, chain.getArg(0), SystemClock.elapsedRealtime());
+                                    fallbackDeadlinePick = null; fallbackRecognitionDeadline = 0;
+                                }
                                 captureScopeContent(chain.getArg(0), "onPickImage".equals(name));
                                 rememberProbePick(chain.getArg(0), "onPickImage".equals(name));
                                 enhancer.capture(chain.getArg(0));
@@ -186,7 +233,8 @@ public final class RecognitionHooks {
                                 input = scopeLinkUrl == null ? input : scopeRecommendations.merge(input, enhancer::isProbeRecommendation);
                                 lastServer = new ArrayList<>(input);
                             }
-                            replacement = enhancer.merge(context, input, safeSource());
+                            replacement = synthetic.get() || recognitionReadyForCurrentPick()
+                                    ? enhancer.merge(context, input, safeSource()) : new ArrayList<>(input);
                             enhancer.diagnostic(synthetic.get() ? "publish_local" : "publish_server", "published",
                                     null, input.size(), replacement.size(), null, null);
                         }
@@ -219,7 +267,13 @@ public final class RecognitionHooks {
         module.hook(boundary).setId("taplusbridge:recognition-boundary-" + name)
                 .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).intercept(chain -> {
                     if (contextSupported(chain.getThisObject())) {
+                        boolean preserveRecognition = false;
+                        if ("pick".equals(name)) synchronized (sessionLock) {
+                            preserveRecognition = keepRecognitionVisible;
+                            keepRecognitionVisible = false;
+                        }
                         resetSession();
+                        if (preserveRecognition) synchronized (sessionLock) { recognitionOnlyEpoch = epoch; }
                         if ("pick".equals(name)) enhancer.beginPick();
                     }
                     return chain.proceed();
@@ -400,7 +454,8 @@ public final class RecognitionHooks {
             scopeLinkUrl = scopeText = null; mixedImage = mixedPrepared = false;
             scopeRecommendations.clear();
             probeGeometry = false; lastPickAt = 0;
-            autoProbe.reset(epoch); pickService = null;
+            autoProbe.reset(epoch); pickService = null; dragPick = null;
+            fallbackDeadlinePick = null; fallbackRecognitionDeadline = 0;
         }
         try {
             RecognitionTaskCleanup.reset(segmentTask,recommendationTask,ocrDisposable,segmenting);
@@ -518,18 +573,26 @@ public final class RecognitionHooks {
     }
     public boolean isProbeRecommendation(Object info) { return enhancer.isProbeRecommendation(info); }
 
+    void keepRecognitionVisibleForNextPick() {
+        synchronized (sessionLock) { keepRecognitionVisible = true; }
+    }
+
     private void scheduleAutoProbe() {
         final long pickedEpoch;
+        final Object nativeResult;
         synchronized (sessionLock) {
-            if (!active || !probeGeometry || pickService == null || !autoProbe.ready(epoch)
-                    || !HostCaptureAction.eligible(safeSource())) return;
+            if (!active || epoch == recognitionOnlyEpoch || !probeGeometry || pickService == null || !autoProbe.ready(epoch)
+                    || !enhancer.capturedLinks().isEmpty() || !HostCaptureAction.eligible(safeSource())) return;
             pickedEpoch = epoch;
+            nativeResult = dragPick != null && dragPick.epoch == epoch ? dragPick.result : null;
         }
         main.post(() -> {
             String origin = safeSource();
             Context context = hostContext();
             Object service = pickService;
             if (context == null || service == null || !currentProbe(pickedEpoch, origin)) return;
+            if (nativeUrlAvailable(service, nativeResult)) return;
+            long recognitionAt = HostDragHooks.recognitionDeadline(service, nativeResult);
             synchronized (sessionLock) {
                 if (!autoProbe.ready(pickedEpoch)) return;
             }
@@ -537,11 +600,28 @@ public final class RecognitionHooks {
                 Bundle request = new Bundle(); request.putString("source", origin);
                 Bundle available = io.github.yudigaga.taplusbridge.runtime.BridgeTransport.call(context,"capture_available",request);
                 if (available == null || !available.getBoolean("enabled")) return;
+                if (recognitionAt <= 0) {
+                    long pickedAt = pickedAt();
+                    if (pickedAt <= 0) return;
+                    recognitionAt = pickedAt + available.getInt("recognition_delay",
+                            io.github.yudigaga.taplusbridge.config.DragSettings.DEFAULT_RECOGNITION_DELAY);
+                }
+                final long deadline = recognitionAt;
+                long wait = deadline - SystemClock.elapsedRealtime();
+                if (wait > 0) {
+                    main.postDelayed(() -> {
+                        if (currentProbe(pickedEpoch, origin)) scheduleAutoProbe();
+                    }, wait);
+                    return;
+                }
+                if (!enhancer.capturedLinks().isEmpty()) return;
                 synchronized (sessionLock) {
                     if (!currentProbe(pickedEpoch, origin) || !autoProbe.claim(pickedEpoch)) return;
                 }
-                HostProbeAction.start(context, service, origin, pickedAt(),
-                        () -> currentProbe(pickedEpoch, origin) && autoProbe.current(pickedEpoch),
+                HostProbeAction.start(context, service, origin, pickedAt(), deadline,
+                        () -> currentProbe(pickedEpoch, origin) && autoProbe.current(pickedEpoch)
+                                && !nativeUrlAvailable(service, nativeResult),
+                        () -> HostDragHooks.dismissPreviewForLinkProbe(service, nativeResult, origin),
                         url -> acceptProbeUrl(pickedEpoch, origin, url));
             } catch (RuntimeException failure) { report(failure); }
         });
@@ -557,20 +637,81 @@ public final class RecognitionHooks {
         }
         // Local cards are published only after the task/segment listeners have created their views.
         main.post(() -> {
+            synchronized (sessionLock) {
+                if (!active || epoch != capturedEpoch) {
+                    if (scheduledEpoch == capturedEpoch) scheduledEpoch = -1;
+                    return;
+                }
+            }
+            DragPick selected;
+            synchronized (sessionLock) { selected = dragPick; }
+            long recognitionAt = selected == null ? 0 : recognitionDeadline(selected);
+            if (selected != null && recognitionAt <= 0) {
+                synchronized (sessionLock) { if (scheduledEpoch == capturedEpoch) scheduledEpoch = -1; }
+                return;
+            }
+            long wait = recognitionAt - SystemClock.elapsedRealtime();
+            if (wait > 0) {
+                main.postDelayed(() -> {
+                    synchronized (sessionLock) { if (scheduledEpoch == capturedEpoch) scheduledEpoch = -1; }
+                    schedulePublish();
+                }, wait);
+                return;
+            }
             ArrayList<?> server;
             synchronized (sessionLock) {
                 if (scheduledEpoch == capturedEpoch) scheduledEpoch = -1;
-                if (!active || epoch != capturedEpoch) return;
+                if (!active || epoch != capturedEpoch || dragPick != selected) return;
                 server = new ArrayList<>(lastServer);
             }
             Context context = hostContext();
             if (!supported(context)) return;
+            if (selected != null && !enhancer.capturedLinks().isEmpty())
+                HostDragHooks.offerRecognizedLinks(selected.service(), selected.result(), enhancer.capturedLinks());
             recordStatus(context);
             synthetic.set(true);
             try { publish.invoke(null, server); }
             catch (ReflectiveOperationException | RuntimeException failure) { report(failure); }
             finally { synthetic.remove(); }
         });
+    }
+
+    private boolean recognitionReadyForCurrentPick() {
+        DragPick selected;
+        synchronized (sessionLock) { selected = dragPick; }
+        if (selected == null) return true;
+        long deadline = recognitionDeadline(selected);
+        return deadline > 0 && io.github.yudigaga.taplusbridge.drag.LongPressStageSchedule
+                .isReady(deadline, SystemClock.elapsedRealtime());
+    }
+
+    private long recognitionDeadline(DragPick selected) {
+        if (selected == null) return 0;
+        long cachedFallback;
+        synchronized (sessionLock) {
+            if (!active || dragPick != selected) return 0;
+            cachedFallback = fallbackDeadlinePick == selected ? fallbackRecognitionDeadline : 0;
+        }
+        long nativeDeadline = HostDragHooks.recognitionDeadline(selected.service(), selected.result());
+        if (nativeDeadline > 0) return nativeDeadline;
+        if (cachedFallback > 0) return cachedFallback;
+        Context context = hostContext();
+        if (context == null || selected.pickedAt() < 0) return 0;
+        try {
+            Bundle request = new Bundle(); request.putString("source", safeSource());
+            Bundle available = io.github.yudigaga.taplusbridge.runtime.BridgeTransport.call(context,
+                    "capture_available", request);
+            if (available == null) return 0;
+            long fallback = io.github.yudigaga.taplusbridge.drag.LongPressStageSchedule.resolveRecognitionAt(
+                    0, selected.pickedAt(), available.getInt("recognition_delay", -1));
+            if (fallback <= 0) return 0;
+            synchronized (sessionLock) {
+                if (active && dragPick == selected) {
+                    fallbackDeadlinePick = selected; fallbackRecognitionDeadline = fallback;
+                } else return 0;
+            }
+            return fallback;
+        } catch (RuntimeException failure) { report(failure); return 0; }
     }
 
     private Context hostContext() {

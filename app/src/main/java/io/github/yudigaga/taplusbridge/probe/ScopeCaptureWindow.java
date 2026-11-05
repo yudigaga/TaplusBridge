@@ -20,6 +20,19 @@ public final class ScopeCaptureWindow {
     private final Method displayContent, displayWindows, touchableWindow, frame, mainWindow, parentWindow, visible, surface, children;
     private final CaptureBackend backend;
 
+    public static final class TransferResult {
+        public final boolean transferred;
+        public final String reason;
+
+        private TransferResult(boolean transferred, String reason) {
+            this.transferred = transferred;
+            this.reason = reason;
+        }
+
+        static TransferResult success() { return new TransferResult(true, "none"); }
+        static TransferResult failure(String reason) { return new TransferResult(false, reason); }
+    }
+
     public static final class Snapshot {
         public final String source, activity;
         public final int uid, user, display;
@@ -140,7 +153,104 @@ public final class ScopeCaptureWindow {
         validateWindows(atms, original);
     }
 
+    /** Recheck an already claimed gesture behind the native host's UI; this path never captures pixels. */
+    public void validateBehindHost(Object atms, Snapshot original, int hostUid) throws ReflectiveOperationException {
+        if (hostUid < 10000 || hostUid >= 100000) throw rejected("capture_host_identity");
+        validateWindows(atms, original, hostUid);
+    }
+
+    /** Transfers only this still-active source gesture to the registered, touchable host mask. */
+    public boolean transferTouchToMask(Object atms, Snapshot original, int hostUid, String title)
+            throws ReflectiveOperationException {
+        TransferResult result = transferTouchToMaskDetailed(atms, original, hostUid, title);
+        if (result.transferred) return true;
+        if (isWindowRejection(result.reason)) throw rejected(result.reason);
+        if ("input_transfer_exception".equals(result.reason))
+            throw new ReflectiveOperationException(result.reason);
+        return false;
+    }
+
+    /** Same guarded transfer with a fixed, content-free failure reason for diagnostics. */
+    public TransferResult transferTouchToMaskDetailed(Object atms, Snapshot original, int hostUid, String title) {
+        try {
+            return transferTouchToMaskChecked(atms, original, hostUid, title);
+        } catch (RuntimeException rejected) {
+            return TransferResult.failure(checkedWindowReason(rejected.getMessage()));
+        } catch (ReflectiveOperationException unavailable) {
+            return TransferResult.failure("window_inspection_failed");
+        }
+    }
+
+    private TransferResult transferTouchToMaskChecked(Object atms, Snapshot original, int hostUid, String title)
+            throws ReflectiveOperationException {
+        if (original == null || original.display != 0 || hostUid < 10000 || hostUid >= 100000
+                || title == null || title.length() > 128) return TransferResult.failure("drag_transfer_request");
+        Object service = service(atms), monitor = globalLock.get(service), sourceWindow = original.window;
+        Object[] channels = new Object[2];
+        synchronized (monitor) {
+            validateWindows(atms, original, hostUid);
+            Object content = displayContent.invoke(root.get(service), original.display);
+            ReflectiveOperationException[] failure = new ReflectiveOperationException[1];
+            RuntimeException[] rejected = new RuntimeException[1];
+            int[] matches = new int[1];
+            displayWindows.invoke(content, (Consumer<Object>) window -> {
+                if (failure[0] != null || rejected[0] != null) return;
+                try {
+                    WindowManager.LayoutParams params = params(window);
+                    CharSequence windowTitle = params.getTitle();
+                    if (windowTitle == null || !title.contentEquals(windowTitle)) return;
+                    matches[0]++;
+                    if (matches[0] != 1) throw rejected("drag_mask_not_unique");
+                    if (ownerUid.getInt(window) != hostUid) throw rejected("drag_mask_owner_uid");
+                    if (showUser.getInt(window) != 0) throw rejected("drag_mask_user");
+                    if (!HostPolicy.HOST_PACKAGE.equals(params.packageName)) throw rejected("drag_mask_package");
+                    if (params.type != WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY && params.type != 2002)
+                        throw rejected("drag_mask_type");
+                    if (params.width != WindowManager.LayoutParams.MATCH_PARENT
+                            || params.height != WindowManager.LayoutParams.MATCH_PARENT)
+                        throw rejected("drag_mask_dimensions");
+                    if ((params.flags & WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE) != 0)
+                        throw rejected("drag_mask_not_touchable");
+                    if (!Boolean.TRUE.equals(visible.invoke(window))) throw rejected("drag_mask_not_visible");
+                    Rect bounds = (Rect) frame.invoke(window);
+                    if (bounds == null || !bounds.contains((int) original.x, (int) original.y))
+                        throw rejected("drag_mask_bounds");
+                    channels[0] = inputChannel(sourceWindow);
+                    channels[1] = inputChannel(window);
+                    if (channels[0] == null || channels[1] == null) throw rejected("drag_input_channel");
+                } catch (ReflectiveOperationException error) { failure[0] = error; }
+                catch (RuntimeException error) { rejected[0] = error; }
+            }, true);
+            if (failure[0] != null) throw failure[0];
+            if (rejected[0] != null) throw rejected[0];
+            if (matches[0] != 1 || channels[0] == null || channels[1] == null) throw rejected("drag_mask_missing");
+        }
+        return transferInputGestureDetailed(service, channels[0], channels[1]);
+    }
+
+    public static String diagnosticWindowReason(String value) {
+        for (String reason : new String[]{"drag_transfer_request", "capture_snapshot", "capture_display",
+                "capture_host_identity", "capture_focus", "capture_ime", "capture_window_changed",
+                "capture_secure", "capture_surface", "capture_hidden", "capture_bounds",
+                "drag_mask_not_unique", "drag_mask_owner_uid",
+                "drag_mask_user", "drag_mask_package", "drag_mask_type", "drag_mask_dimensions",
+                "drag_mask_not_touchable", "drag_mask_not_visible", "drag_mask_bounds",
+                "drag_input_channel", "drag_mask_missing", "capture_popup_limit"})
+            if (reason.equals(value)) return reason;
+        return "window_rejected";
+    }
+
+    private static String checkedWindowReason(String value) { return diagnosticWindowReason(value); }
+
+    private static boolean isWindowRejection(String reason) {
+        return reason.startsWith("capture_") || reason.startsWith("drag_") || "window_rejected".equals(reason);
+    }
+
     private Object[] validateWindows(Object atms, Snapshot original) throws ReflectiveOperationException {
+        return validateWindows(atms, original, -1);
+    }
+
+    private Object[] validateWindows(Object atms, Snapshot original, int hostUid) throws ReflectiveOperationException {
         if (original == null || original.display != 0 || !original.bounds.equals(original.expectedBounds))
             throw rejected("capture_snapshot");
         Object service = service(atms), monitor = globalLock.get(service);
@@ -158,16 +268,83 @@ public final class ScopeCaptureWindow {
                     || activityUser.getInt(original.record) != original.user || component == null
                     || !original.source.equals(component.getPackageName()) || !original.activity.equals(component.getClassName())
                     || !original.source.equals(params.packageName) || !normalMain(params.type)
-                    || parentWindow.invoke(window) != null || surface.invoke(window) != original.surface
+                    || parentWindow.invoke(window) != null || !sameSurface(surface.invoke(window), original.surface)
                     || !original.expectedBounds.equals(checkedBounds(window, original.x, original.y)))
                 throw rejected("capture_window_changed");
             requireVisibleSafe(window);
             if (!backend.validSurface(original.surface)) throw rejected("capture_surface");
             if (focus == null || hit == null) throw rejected("capture_focus");
-            if (focus != window) requireSameActivityForeground(original, focus);
-            if (hit != window) requireSameActivityForeground(original, hit);
-            return exclusions(original);
+            List<Object> chrome = new ArrayList<>();
+            admitForeground(original, focus, window, hostUid, chrome);
+            if (hit != focus) admitForeground(original, hit, window, hostUid, chrome);
+            return mergeExclusions(exclusions(original), chrome);
         }
+    }
+
+    /** Android 16 may hand back a new SurfaceControl wrapper for the same native layer. */
+    private static boolean sameSurface(Object current, Object original) {
+        if (current == original) return true;
+        Long currentId = nativeSurfaceId(current), originalId = nativeSurfaceId(original);
+        return currentId != null && currentId != 0L && currentId.equals(originalId);
+    }
+
+    private static Long nativeSurfaceId(Object surface) {
+        if (surface == null) return null;
+        try {
+            java.lang.reflect.Field field = surface.getClass().getDeclaredField("mNativeObject");
+            if (field.getType() != long.class) return null;
+            field.setAccessible(true);
+            return field.getLong(surface);
+        } catch (ReflectiveOperationException | RuntimeException ignored) { return null; }
+    }
+
+    private void admitForeground(Snapshot original, Object candidate, Object window, int hostUid, List<Object> chrome)
+            throws ReflectiveOperationException {
+        if (candidate == window || trustedHostOverlay(candidate, hostUid)) return;
+        try { requireSameActivityForeground(original, candidate); }
+        catch (RuntimeException rejected) {
+            if (!sameAppChrome(original, candidate)) throw rejected;
+            rememberChrome(candidate, chrome);
+        }
+    }
+
+    private void rememberChrome(Object candidate, List<Object> chrome) throws ReflectiveOperationException {
+        Object layer = surface.invoke(candidate);
+        if (!backend.validSurface(layer) || chrome.contains(layer)) return;
+        if (chrome.size() >= 32) throw rejected("capture_popup_limit");
+        chrome.add(layer);
+    }
+
+    private boolean sameAppChrome(Snapshot snapshot, Object window) throws ReflectiveOperationException {
+        if (window == null || window == snapshot.window) return false;
+        WindowManager.LayoutParams params = params(window);
+        if (params.type == WindowManager.LayoutParams.TYPE_INPUT_METHOD
+                || params.type == WindowManager.LayoutParams.TYPE_INPUT_METHOD_DIALOG
+                || (params.flags & WindowManager.LayoutParams.FLAG_SECURE) != 0
+                || !snapshot.source.equals(params.packageName)
+                || ownerUid.getInt(window) != snapshot.uid || showUser.getInt(window) != snapshot.user
+                || !Boolean.TRUE.equals(visible.invoke(window))) return false;
+        Object record = activityRecord.get(window);
+        return record == null || record == snapshot.record;
+    }
+
+    private Object[] mergeExclusions(Object[] excluded, List<Object> chrome) {
+        if (chrome.isEmpty()) return excluded;
+        List<Object> merged = new ArrayList<>();
+        if (excluded != null) for (Object layer : excluded) merged.add(layer);
+        for (Object layer : chrome) if (!merged.contains(layer)) merged.add(layer);
+        if (merged.size() > 32) throw rejected("capture_popup_limit");
+        return merged.toArray();
+    }
+
+    private boolean trustedHostOverlay(Object window, int hostUid) throws ReflectiveOperationException {
+        if (hostUid < 10000 || hostUid >= 100000) return false;
+        WindowManager.LayoutParams params = params(window);
+        if (ownerUid.getInt(window) != hostUid || showUser.getInt(window) != 0
+                || !HostPolicy.HOST_PACKAGE.equals(params.packageName)
+                || (params.type != WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY && params.type != 2002)) return false;
+        requireVisibleSafe(window);
+        return true;
     }
 
     private Object[] exclusions(Snapshot snapshot) throws ReflectiveOperationException {
@@ -178,7 +355,8 @@ public final class ScopeCaptureWindow {
             if (child == snapshot.window || failure[0] != null || rejected[0] != null) return;
             try {
                 if (!Boolean.TRUE.equals(visible.invoke(child))) return;
-                requirePopup(snapshot, child);
+                try { requirePopup(snapshot, child); }
+                catch (RuntimeException strict) { if (!sameAppChrome(snapshot, child)) throw strict; }
                 Object layer = surface.invoke(child);
                 if (!backend.validSurface(layer)) throw rejected("capture_surface");
                 if (excluded.size() >= 32) throw rejected("capture_popup_limit");
@@ -257,6 +435,80 @@ public final class ScopeCaptureWindow {
         if (service == null || globalLock.get(service) == null || root.get(service) == null)
             throw rejected("capture_window_unavailable");
         return service;
+    }
+
+    private static Object inputChannel(Object window) throws ReflectiveOperationException {
+        Object channel = optionalField(window.getClass(), "mInputChannel", window);
+        if (channel != null) return channel;
+        Object token = optionalField(window.getClass(), "mInputChannelToken", window);
+        return token;
+    }
+
+    private static Object optionalField(Class<?> type, String name, Object target) throws IllegalAccessException {
+        try { return field(type, name).get(target); }
+        catch (NoSuchFieldException ignored) { return null; }
+    }
+
+    private static TransferResult transferInputGestureDetailed(Object windowManager, Object from, Object to) {
+        boolean foundApi = false;
+        try {
+            Object input = optionalField(windowManager.getClass(), "mInputManager", windowManager);
+            Method transfer = input == null ? null : findTransfer(input.getClass(), from, to);
+            if (transfer != null) {
+                foundApi = true;
+                if (invokeTransfer(transfer, input, from, to)) return TransferResult.success();
+            }
+            ClassLoader loader = windowManager.getClass().getClassLoader();
+            try {
+                Class<?> localServices = Class.forName("com.android.server.LocalServices", false, loader);
+                Class<?> inputInternal = Class.forName("com.android.server.input.InputManagerInternal", false, loader);
+                Method getService = method(localServices, "getService", Class.class);
+                Object internal = getService.invoke(null, inputInternal);
+                transfer = internal == null ? null : findTransfer(internal.getClass(), from, to);
+                if (transfer != null) {
+                    foundApi = true;
+                    if (invokeTransfer(transfer, internal, from, to)) return TransferResult.success();
+                }
+            } catch (ClassNotFoundException | NoSuchMethodException unavailable) { }
+        } catch (ReflectiveOperationException | RuntimeException unavailable) {
+            return TransferResult.failure("input_transfer_exception");
+        }
+        return TransferResult.failure(foundApi ? "input_transfer_rejected" : "input_api_missing");
+    }
+
+    private static boolean invokeTransfer(Method transfer, Object target, Object from, Object to)
+            throws ReflectiveOperationException {
+        Object first = argument(transfer.getParameterTypes()[0], from);
+        Object second = argument(transfer.getParameterTypes()[1], to);
+        Object result = transfer.getParameterCount() == 3
+                ? transfer.invoke(target, first, second, false) : transfer.invoke(target, first, second);
+        return Boolean.TRUE.equals(result);
+    }
+
+    private static Method findTransfer(Class<?> type, Object from, Object to) {
+        for (String name : new String[]{"transferTouchGesture", "transferTouchFocus"}) {
+            for (Class<?> current = type; current != null; current = current.getSuperclass()) {
+                for (Method candidate : current.getDeclaredMethods()) {
+                    Class<?>[] params = candidate.getParameterTypes();
+                    if (!name.equals(candidate.getName()) || candidate.getReturnType() != boolean.class
+                            || (params.length != 2 && params.length != 3)
+                            || (params.length == 3 && params[2] != boolean.class)
+                            || argument(params[0], from) == null || argument(params[1], to) == null) continue;
+                    candidate.setAccessible(true);
+                    return candidate;
+                }
+            }
+        }
+        return null;
+    }
+
+    private static Object argument(Class<?> expected, Object channel) {
+        if (channel == null) return null;
+        if (expected.isInstance(channel)) return channel;
+        try {
+            Object token = method(channel.getClass(), "getToken").invoke(channel);
+            return token != null && expected.isInstance(token) ? token : null;
+        } catch (ReflectiveOperationException | RuntimeException unavailable) { return null; }
     }
 
     private static boolean normalMain(int type) {

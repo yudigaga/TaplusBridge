@@ -40,13 +40,36 @@ internal object SettingsIcons {
     val Home = line("Home") { moveTo(3f, 10f); lineTo(12f, 3f); lineTo(21f, 10f); moveTo(5f, 9f); verticalLineTo(21f); horizontalLineTo(10f); verticalLineTo(15f); horizontalLineTo(14f); verticalLineTo(21f); horizontalLineTo(19f); verticalLineTo(9f) }
     val Rules = line("Rules") { moveTo(8f, 5f); horizontalLineTo(21f); moveTo(8f, 12f); horizontalLineTo(21f); moveTo(8f, 19f); horizontalLineTo(21f); moveTo(3f, 5f); horizontalLineTo(3.1f); moveTo(3f, 12f); horizontalLineTo(3.1f); moveTo(3f, 19f); horizontalLineTo(3.1f) }
     val More = line("More") { moveTo(4f, 4f); horizontalLineTo(9f); verticalLineTo(9f); horizontalLineTo(4f); close(); moveTo(15f, 4f); horizontalLineTo(20f); verticalLineTo(9f); horizontalLineTo(15f); close(); moveTo(4f, 15f); horizontalLineTo(9f); verticalLineTo(20f); horizontalLineTo(4f); close(); moveTo(15f, 15f); horizontalLineTo(20f); verticalLineTo(20f); horizontalLineTo(15f); close() }
+    val Apps = line("Apps") { moveTo(4f, 5f); horizontalLineTo(20f); verticalLineTo(19f); horizontalLineTo(4f); close(); moveTo(8f, 9f); horizontalLineTo(16f); moveTo(8f, 13f); horizontalLineTo(16f) }
+    val Gesture = line("Gesture") { moveTo(8f, 20f); curveTo(6f, 18f, 6f, 15f, 7f, 12f); lineTo(8f, 7f); curveTo(8f, 5f, 11f, 5f, 11f, 7f); lineTo(11f, 12f); lineTo(12f, 4f); curveTo(12f, 2f, 15f, 2f, 15f, 4f); lineTo(15f, 12f); lineTo(16f, 6f); curveTo(16f, 4f, 19f, 4f, 19f, 6f); lineTo(18f, 14f); curveTo(18f, 18f, 15f, 21f, 12f, 21f); close() }
     val Back = line("Back") { moveTo(14f, 5f); lineTo(7f, 12f); lineTo(14f, 19f) }
     val Plus = line("Plus") { moveTo(12f, 5f); verticalLineTo(19f); moveTo(5f, 12f); horizontalLineTo(19f) }
     val Link = line("Link") { moveTo(10f, 7f); lineTo(12f, 5f); curveTo(16f, 1f, 23f, 8f, 19f, 12f); lineTo(16f, 15f); moveTo(14f, 17f); lineTo(12f, 19f); curveTo(8f, 23f, 1f, 16f, 5f, 12f); lineTo(8f, 9f); moveTo(8f, 16f); lineTo(16f, 8f) }
 }
 
 @Composable internal fun SettingsCard(modifier: Modifier = Modifier, content: @Composable ColumnScope.() -> Unit) {
-    Card(modifier = modifier.fillMaxWidth(), cornerRadius = 20.dp, content = content)
+    Card(modifier = modifier.fillMaxWidth(), cornerRadius = 8.dp, content = content)
+}
+
+@Composable internal fun SettingsPageHeader(
+    title: String,
+    subtitle: String,
+    discardTag: String,
+    saveTag: String,
+    onDiscard: () -> Unit,
+    onSave: () -> Unit,
+) {
+    Column {
+        TopAppBar(title = title, subtitle = subtitle)
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 16.dp).padding(bottom = 8.dp),
+            horizontalArrangement = Arrangement.End,
+            verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+        ) {
+            TextButton("放弃", onDiscard, Modifier.testTag(discardTag))
+            TextButton("保存", onSave, Modifier.testTag(saveTag))
+        }
+    }
 }
 
 @Composable internal fun SectionLabel(title: String) {

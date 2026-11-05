@@ -37,6 +37,17 @@ public final class ConfigStore {
     public void setRecognitionEnabled(boolean value) { prefs.edit().putBoolean("recognition", value).commit(); }
     public boolean lensEnabled() { return prefs.getBoolean("google_lens", true); }
     public void setLensEnabled(boolean value) { prefs.edit().putBoolean("google_lens", value).commit(); }
+    public DragSettings getDragSettings() {
+        try {
+            String raw = prefs.getString(DragSettings.KEY, null);
+            return raw == null ? DragSettings.defaults() : DragSettings.parse(raw);
+        } catch (RuntimeException malformed) { return DragSettings.defaults(); }
+    }
+    public void setDragSettings(DragSettings value) {
+        if (value == null) throw new IllegalArgumentException("拖拽配置无效，请重新设置");
+        if (!prefs.edit().putString(DragSettings.KEY, value.toJson()).commit())
+            throw new IllegalStateException("拖拽设置保存失败，请重试");
+    }
     public boolean captureEnabled() { return prefs.getBoolean("capture", true); }
     public void setCaptureEnabled(boolean value) { prefs.edit().putBoolean("capture", value).commit(); }
     public boolean independentEnabled(){return prefs.getBoolean("independent_runtime",true);}

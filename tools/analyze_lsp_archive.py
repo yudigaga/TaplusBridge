@@ -135,15 +135,46 @@ MODULE_SCOPE_CAPTURE = re.compile(re.escape(MODULE_TAG) + r"[^\]\r\n]+\]\s+([sS]
 HOST_SCOPE_CAPTURE = re.compile(HOST_LOGCAT_PREFIX + r"([sS]cope capture stage=.*)$")
 HOST_PRIVACY_THREAD_GUARD = re.compile(HOST_LOGCAT_PREFIX.replace("TaplusBridge", "Privacy_PrivacyManager")
     + r"can not request privacy update in main thread!(?=\s|$)")
-SCOPE_LINK_STAGES = frozenset(("rejected", "armed", "blocked", "tapped", "finished", "captured"))
+SCOPE_LINK_STAGES = frozenset(("rejected", "armed", "blocked", "tapped", "finished", "captured", "observed"))
 SCOPE_LINK_REASONS = frozenset((
     "none", "candidate_invalid", "new_touch", "touch_changed", "short_press", "configuration_changed",
     "window_changed", "unsupported_launch", "http", "candidate_changed", "input_or_window_changed",
     "cancelled", "native_won", "native_pick", "same_gesture_tail", "timeout", "captured", "window_or_configuration_changed",
+    "released_before_recognition", "host_probe_owner", "unsafe_intent", "web_payload_invalid", "chooser_invalid",
+    "http_data_invalid", "unsupported_action", "unreadable_payload",
 ))
 SCOPE_LINK_MESSAGE = re.compile(r"^scope link stage=([a-z_]+)(?=\s|$)")
 MODULE_SCOPE_LINK = re.compile(re.escape(MODULE_TAG) + r"[^\]\r\n]+\]\s+(scope link stage=.*)$")
 HOST_SCOPE_LINK = re.compile(HOST_LOGCAT_PREFIX + r"(scope link stage=.*)$")
+DRAG_GESTURE_STAGES = frozenset((
+    "installed", "armed", "claimed", "cancelled", "timeout", "direction", "released", "imported",
+    "import_failed", "claim_failed", "content_skipped", "content_upgraded", "content_upgrade_failed",
+    "overlay_requested", "overlay_attach_failed", "overlay_transferred", "overlay_transfer_failed",
+    "overlay_skipped_after_release", "takeover_succeeded", "takeover_failed", "orphaned_takeover_reset",
+    "links_attached",
+    "overlay_hidden_for_link_probe",
+    "ready_haptic_requested", "ready_haptic_unavailable", "source_changed", "lease_invalid",
+    "takeover_cancelled", "card_link", "card_link_failed", "card_click_unhooked",
+))
+DRAG_GESTURE_REASONS = frozenset((
+    "drag_transfer_request", "capture_snapshot", "capture_display", "capture_host_identity",
+    "capture_focus", "capture_ime", "capture_window_changed", "capture_secure", "capture_surface",
+    "capture_hidden", "capture_bounds",
+    "drag_mask_window", "drag_mask_not_unique", "drag_mask_owner_uid", "drag_mask_user",
+    "drag_mask_package", "drag_mask_type", "drag_mask_dimensions", "drag_mask_not_touchable",
+    "drag_mask_not_visible", "drag_mask_bounds", "drag_input_channel", "drag_mask_missing",
+    "capture_popup_limit", "window_rejected", "window_inspection_failed", "input_api_missing",
+    "input_transfer_rejected", "input_transfer_exception", "host_package_missing",
+    "system_reflection_failed", "system_runtime_failure", "source_changed", "source_validation_failed",
+    "host_window_attach_failed",
+    "host_window_update_failed", "runtime_unavailable", "system_transfer_not_accepted",
+    "host_transfer_unexpected_failure",
+))
+DRAG_GESTURE_MESSAGE = re.compile(r"drag gesture(?: host)? stage=([a-z_]+)(?=\\s|$)")
+MODULE_DRAG_GESTURE = re.compile(re.escape(MODULE_TAG) + r"[^\\]\\r\\n]+\\]\\s+(drag gesture(?: host)? stage=.*)$")
+HOST_DRAG_GESTURE = re.compile(HOST_LOGCAT_PREFIX + r"(drag gesture(?: host)? stage=.*)$")
+DRAG_GESTURE_MESSAGE_SAFE = re.compile(r"drag gesture(?: host)? stage=([a-z_]+)(?=\s|$)")
+MODULE_DRAG_GESTURE_SAFE = re.compile(re.escape(MODULE_TAG) + r"[^\]\r\n]+\]\s+(drag gesture(?: host)? stage=.*)$")
 NATIVE_SOURCE_SCOPE = re.compile(HOST_LOGCAT_PREFIX.replace("TaplusBridge", "ContentCatcher_TaplusBlackListHelper")
     + r"blackList size:\s*([0-9]{1,6})\s+(?:package is\s*(.*?)\s+)?isInTaplusWhiteList:\s*(true|false)(?=\s|$)")
 HOST_OBSERVE_CONTROL = re.compile(HOST_LOGCAT_PREFIX.replace("TaplusBridge", "Taplus\\.TextContentExtensionService")
@@ -231,6 +262,24 @@ def scope_link_metadata(message):
             "source_kind": source.group(1) if source and source.group(1) in SOURCE_SCOPE_KINDS else "unknown"}
 
 
+def drag_gesture_metadata(message):
+    match = DRAG_GESTURE_MESSAGE_SAFE.search(message)
+    if not match or match.group(1) not in DRAG_GESTURE_STAGES:
+        return None
+    reason_match = re.search(r"(?:^|\s)reason=([A-Za-z0-9_]+)(?=\s|$)", message)
+    if reason_match:
+        reason = reason_match.group(1) if reason_match.group(1) in DRAG_GESTURE_REASONS else "unknown"
+    else:
+        reason = "unknown"
+        failure = re.search(r"(?:^|\s)exception=([A-Za-z_$][A-Za-z0-9_.$]*)", message)
+        if failure is None:
+            failure = re.search(r"(?:^|\s)stage=takeover_failed=([A-Za-z_$][A-Za-z0-9_.$]*)", message)
+        if failure:
+            simple = failure.group(1).rsplit(".", 1)[-1]
+            reason = simple if simple in EXCEPTIONS else "OTHER"
+    return {"stage": match.group(1), "reason": reason}
+
+
 def probe_metadata(line, stage):
     fields = {"stage": stage}
     if stage in ("ready", "waiting_release"):
@@ -263,6 +312,7 @@ def analyze(path, after=None, date=None):
         source_scope_events = []
         scope_capture_events = []
         scope_link_events = []
+        drag_gesture_events = []
         earlier_system = {}
         for name, number, line, at in records:
             if selected_date and (not at or at[:10] != selected_date):
@@ -278,6 +328,12 @@ def analyze(path, after=None, date=None):
             link_metadata = scope_link_metadata(scope_link.group(1)) if scope_link else None
             if link_metadata:
                 scope_link_events.append({**provenance, **link_metadata})
+            drag_line = MODULE_DRAG_GESTURE_SAFE.search(line)
+            drag_metadata = drag_gesture_metadata(drag_line.group(1)) if drag_line else None
+            if drag_metadata:
+                drag_gesture_events.append({**provenance,
+                                            "process": "host" if " host stage=" in drag_line.group(1) else "system",
+                                            **drag_metadata})
             scope_capture = MODULE_SCOPE_CAPTURE.search(line)
             capture_metadata = scope_capture_metadata(scope_capture.group(1)) if scope_capture else None
             if capture_metadata:
@@ -369,6 +425,12 @@ def analyze(path, after=None, date=None):
             link_metadata = scope_link_metadata(scope_link.group(1)) if scope_link else None
             if link_metadata:
                 scope_link_events.append({"source": "full.log", "line": number, "at": stamped.group(), **link_metadata})
+            drag_line = HOST_DRAG_GESTURE.match(line) if in_window else None
+            drag_metadata = drag_gesture_metadata(drag_line.group(1)) if drag_line else None
+            if drag_metadata:
+                drag_gesture_events.append({"source": "full.log", "line": number, "at": stamped.group(),
+                                            "process": "host" if " host stage=" in drag_line.group(1) else "system",
+                                            **drag_metadata})
             scope_capture = HOST_SCOPE_CAPTURE.match(line) if in_window else None
             capture_metadata = scope_capture_metadata(scope_capture.group(1)) if scope_capture else None
             if capture_metadata:
@@ -445,11 +507,13 @@ def analyze(path, after=None, date=None):
             "source_scope_events": source_scope_events,
             "scope_capture_events": scope_capture_events,
             "scope_link_events": scope_link_events,
+            "drag_gesture_events": drag_gesture_events,
             "observed_stages": sorted({event["stage"] for event in diagnostic_events}),
             "observed_capture_stages": sorted({event["stage"] for event in capture_events}),
             "observed_probe_stages": sorted({event["stage"] for event in probe_events}),
             "observed_scope_capture_stages": sorted({event["stage"] for event in scope_capture_events}),
             "observed_scope_link_stages": sorted({event["stage"] for event in scope_link_events}),
+            "observed_drag_gesture_stages": sorted({event["stage"] for event in drag_gesture_events}),
             "system_capture_apks": sorted(component_paths), "text_events": text_events, "image_events": image_events,
             "raw_content_persisted": False, "url_hosts_persisted": False,
             "limits": "Only fixed log events and bounded metadata are retained. An armed event does not prove host acknowledgement. Earlier startup events are context, not proof that their process remained alive. Missing events do not prove missing URL fields or reconstruct a destination."}

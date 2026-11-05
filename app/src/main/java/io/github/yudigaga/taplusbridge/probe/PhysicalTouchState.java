@@ -14,7 +14,7 @@ public final class PhysicalTouchState {
     private final Map<Integer,Long> uncertain=new HashMap<>();
     private final LinkedHashMap<Stream,Long> injected=new LinkedHashMap<>();
     private boolean observedUp, overflow;
-    private long releasedAt=-1;
+    private long releasedAt=-1, releasedElapsedAt=-1;
     public synchronized void injected(int display,int device,long downAt,long now) {
         prune(now); injected.put(new Stream(display,device,downAt),now+30000);
         while(injected.size()>32) injected.remove(injected.keySet().iterator().next());
@@ -52,6 +52,10 @@ public final class PhysicalTouchState {
                 && activeDown != null && activeDown == downAt;
     }
     public synchronized long releasedAt() { return released()?releasedAt:-1; }
+    public synchronized long releasedElapsedAt() { return released()?releasedElapsedAt:-1; }
+    public synchronized void markReleasedElapsed(long nowElapsed) {
+        if (released() && nowElapsed >= 0) releasedElapsedAt = nowElapsed;
+    }
     public synchronized void unknown() { observedUp=false; overflow=true; }
     /** A readable device with one malformed event cannot disable unrelated future gestures globally. */
     public synchronized void uncertainDevice(int device,long now) {

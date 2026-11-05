@@ -2,9 +2,12 @@ package io.github.yudigaga.taplusbridge.ui;
 
 import android.app.Activity;
 import android.content.Context;
+import android.content.ComponentName;
+import android.content.Intent;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
+import android.content.pm.ResolveInfo;
 import android.graphics.drawable.Drawable;
 import android.os.Handler;
 import android.os.Looper;
@@ -16,6 +19,7 @@ import io.github.yudigaga.taplusbridge.bridge.LaunchPlanner;
 import io.github.yudigaga.taplusbridge.capture.CaptureBroker;
 import io.github.yudigaga.taplusbridge.capture.IntentObservation;
 import io.github.yudigaga.taplusbridge.config.ConfigStore;
+import io.github.yudigaga.taplusbridge.config.DragSettings;
 import io.github.yudigaga.taplusbridge.config.SourceScopePolicy;
 import io.github.yudigaga.taplusbridge.hook.HostPolicy;
 import io.github.yudigaga.taplusbridge.routing.RouteRule;
@@ -31,6 +35,7 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Set;
 import java.util.Objects;
+import java.util.LinkedHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -112,11 +117,13 @@ public final class SettingsController implements AutoCloseable {
         public final String hostVersionName, hostVersion, shizukuStatus, versionName;
         public final long hostVersionCode;
         public final int versionCode;
+        public final DragSettings dragSettings;
         private Snapshot(ConfigStore config, boolean hostInstalled, boolean hostSupported,
                          String hostVersionName, long hostVersionCode, boolean shizukuGranted, String shizukuStatus) {
             enabled = config.enabled(); nativeEnabled = config.nativeEnabled();
             recognitionEnabled = config.recognitionEnabled(); captureEnabled = config.captureEnabled();
             lensEnabled = config.lensEnabled();
+            dragSettings = config.getDragSettings();
             mode = config.mode(); this.hostInstalled = hostInstalled; this.hostSupported = hostSupported;
             this.hostVersionName = hostVersionName; this.hostVersionCode = hostVersionCode;
             hostVersion = hostInstalled ? hostVersionName + " / " + hostVersionCode : "未安装传送门";
@@ -243,6 +250,8 @@ public final class SettingsController implements AutoCloseable {
     }
     public void setNativeEnabled(boolean enabled) { requireOpen(); config.setNativeEnabled(enabled); }
     public void setLensEnabled(boolean enabled) { requireOpen(); config.setLensEnabled(enabled); }
+    public DragSettings getDragSettings() { return config.getDragSettings(); }
+    public void setDragSettings(DragSettings settings) { requireOpen(); config.setDragSettings(settings); }
     public void setRecognitionEnabled(boolean enabled) {
         requireOpen(); config.setRecognitionEnabled(enabled); if (!enabled) CaptureBroker.cancelCurrent(context);
     }
@@ -292,6 +301,42 @@ public final class SettingsController implements AutoCloseable {
         private AppEntry(String label, String packageName, Drawable icon, boolean enabled) {
             this.label = label; this.packageName = packageName; this.icon = icon; this.enabled = enabled;
         }
+    }
+
+    public static final class ShareTarget {
+        public final String component, label, packageName;
+        public final Drawable icon;
+        private ShareTarget(String component, String label, String packageName, Drawable icon) {
+            this.component = component; this.label = label; this.packageName = packageName; this.icon = icon;
+        }
+    }
+
+    /** Combine text and image destinations; the actual share filters these again by payload type. */
+    public List<ShareTarget> installedShareTargets() {
+        PackageManager pm = context.getPackageManager();
+        LinkedHashMap<String, ShareTarget> targets = new LinkedHashMap<>();
+        for (String mime : List.of("text/plain", "image/*")) {
+            List<ResolveInfo> resolved;
+            try { resolved = pm.queryIntentActivities(new Intent(Intent.ACTION_SEND).setType(mime),
+                    PackageManager.MATCH_DEFAULT_ONLY | PackageManager.MATCH_DISABLED_COMPONENTS); }
+            catch (RuntimeException unavailable) { continue; }
+            for (ResolveInfo item : resolved) {
+                if (item.activityInfo == null || !item.activityInfo.exported
+                        || !HostPolicy.validTarget(item.activityInfo.packageName)) continue;
+                String component = new ComponentName(item.activityInfo.packageName, item.activityInfo.name).flattenToString();
+                String label; Drawable icon = null;
+                try { label = item.loadLabel(pm).toString(); } catch (RuntimeException unavailable) { label = item.activityInfo.packageName; }
+                try { icon = item.loadIcon(pm); } catch (RuntimeException unavailable) { }
+                targets.putIfAbsent(component, new ShareTarget(component, label, item.activityInfo.packageName, icon));
+            }
+        }
+        List<ShareTarget> result = new ArrayList<>(targets.values());
+        Collator collator = Collator.getInstance();
+        result.sort((a, b) -> { int label = collator.compare(a.label, b.label); return label == 0 ? a.component.compareTo(b.component) : label; });
+        return result;
+    }
+    public void loadShareTargets(Consumer<List<ShareTarget>> callback) {
+        Objects.requireNonNull(callback, "callback"); submit(this::installedShareTargets, callback);
     }
 
     /** Call off the UI thread for a full installed-app picker. Includes installed disabled/hidden apps. */

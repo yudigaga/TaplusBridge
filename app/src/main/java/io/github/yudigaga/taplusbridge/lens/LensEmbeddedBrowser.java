@@ -1,7 +1,9 @@
 package io.github.yudigaga.taplusbridge.lens;
 
 import android.os.Build;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
 import android.view.Display;
 import android.view.SurfaceControlViewHost;
 import android.view.SurfaceHolder;
@@ -54,7 +56,8 @@ public final class LensEmbeddedBrowser implements SurfaceHolder.Callback, View.O
 
     public boolean attachSurface(SurfaceControlViewHost.SurfacePackage incoming) {
         if (incoming == null) return false;
-        if (Build.VERSION.SDK_INT < 30 || closed || !requested || surface == null
+        if (Build.VERSION.SDK_INT < 30) return false;
+        if (closed || !requested || surface == null
                 || !surface.isAttachedToWindow()) {
             incoming.release(); return false;
         }
@@ -69,6 +72,10 @@ public final class LensEmbeddedBrowser implements SurfaceHolder.Callback, View.O
     }
 
     public void destroy() {
+        destroy(true);
+    }
+
+    private void destroy(boolean removeSurface) {
         if (closed) return;
         closed = true;
         anchor.removeOnAttachStateChangeListener(this);
@@ -76,7 +83,7 @@ public final class LensEmbeddedBrowser implements SurfaceHolder.Callback, View.O
         if (previous != null) {
             previous.getHolder().removeCallback(this); previous.removeOnAttachStateChangeListener(this);
             previous.clearFocus();
-            if (previous.getParent() instanceof ViewGroup parent) parent.removeView(previous);
+            if (removeSurface && previous.getParent() instanceof ViewGroup parent) parent.removeView(previous);
         }
         container = null;
         listener.onClosed();
@@ -108,7 +115,15 @@ public final class LensEmbeddedBrowser implements SurfaceHolder.Callback, View.O
         this.width = width; this.height = height; sendGeometry();
     }
 
-    @Override public void surfaceDestroyed(SurfaceHolder holder) { destroy(); }
+    @Override public void surfaceDestroyed(SurfaceHolder holder) {
+        SurfaceView previous = surface;
+        destroy(false);
+        // Detach callbacks can run before ViewGroup finishes removing this child.
+        if (previous != null && previous.getParent() instanceof ViewGroup parent)
+            new Handler(Looper.getMainLooper()).post(() -> {
+                if (previous.getParent() == parent) parent.removeView(previous);
+            });
+    }
     @Override public void onViewAttachedToWindow(View view) { sendGeometry(); }
-    @Override public void onViewDetachedFromWindow(View view) { destroy(); }
+    @Override public void onViewDetachedFromWindow(View view) { destroy(false); }
 }

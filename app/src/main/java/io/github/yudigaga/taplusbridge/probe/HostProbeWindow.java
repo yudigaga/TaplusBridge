@@ -32,7 +32,7 @@ public final class HostProbeWindow implements AutoCloseable {
     private final int width;
     private final int height;
     private final List<WindowState> windows;
-    private boolean closed;
+    private boolean closed, passed;
 
     private HostProbeWindow(Object service, String source, String activity, Rect content,
                             float x, float y, long capturedElapsed, int width, int height,
@@ -90,11 +90,24 @@ public final class HostProbeWindow implements AutoCloseable {
         HostProbeWindow result = new HostProbeWindow(service, expectedSource, activity, content,
                 selected.x, selected.y, capturedElapsed, screen.x, screen.y, windows);
         try {
-            result.apply();
+            // Stay visible until the finger is actually up. Passthrough is applied on READY.
             result.checkCurrent();
             return result;
         } catch (ReflectiveOperationException | RuntimeException failure) {
             try { result.close(); } catch (RuntimeException restoreFailure) { failure.addSuppressed(restoreFailure); }
+            throw failure;
+        }
+    }
+
+    /** Lets the later source click pass through. The recognition panel stays up until this call. */
+    public void passthrough() throws ReflectiveOperationException {
+        requireMain();
+        if (closed) throw invalid("probe_closed");
+        if (passed) return;
+        passed = true;
+        try { apply(); }
+        catch (ReflectiveOperationException | RuntimeException failure) {
+            try { close(); } catch (RuntimeException restoreFailure) { failure.addSuppressed(restoreFailure); }
             throw failure;
         }
     }
@@ -167,7 +180,8 @@ public final class HostProbeWindow implements AutoCloseable {
         }
         for (WindowState window : windows) {
             if (field(service.getClass(), window.serviceField).get(service) != window.owner
-                    || !window.matchesOwner() || window.params.flags != window.appliedFlags || window.params.alpha != window.appliedAlpha
+                    || !window.matchesOwner() || window.params.flags != window.expectedFlags()
+                    || window.params.alpha != window.expectedAlpha()
                     || window.visible != visible(window.view)) throw invalid("host_window_changed");
             Point size = screen(window.view);
             if (size.x != width || size.y != height) throw invalid("display_changed");
@@ -281,6 +295,8 @@ public final class HostProbeWindow implements AutoCloseable {
             originalFlags = params.flags;
             originalAlpha = params.alpha;
         }
+        int expectedFlags() { return changed ? appliedFlags : originalFlags; }
+        float expectedAlpha() { return changed ? appliedAlpha : originalAlpha; }
         boolean matchesOwner() throws ReflectiveOperationException {
             return view.isAttachedToWindow() && Boolean.TRUE.equals(field(owner.getClass(), "mIsShowing").get(owner))
                     && field(owner.getClass(), "mMainView").get(owner) == view

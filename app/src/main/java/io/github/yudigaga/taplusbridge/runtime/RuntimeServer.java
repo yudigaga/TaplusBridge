@@ -33,6 +33,7 @@ public final class RuntimeServer {
     private final SystemPackageOps packages;
     private final java.util.function.Consumer<String> logger;
     private final LinkedHashMap<String,Ticket> tickets=new LinkedHashMap<>();
+    private final LinkedHashMap<String,Long> dragLaunches=new LinkedHashMap<>();
     private final SecureRandom random=new SecureRandom();
     private final Object snapshotLock=new Object();
     private volatile String snapshotRaw;
@@ -46,6 +47,21 @@ public final class RuntimeServer {
     }
     private volatile SourceCapture sourceCapture;
     public void setSourceCapture(SourceCapture capture) { sourceCapture = capture; }
+    public interface DragGestures {
+        Bundle claim(Bundle request, RuntimeSnapshot config);
+        Bundle poll(Bundle request, RuntimeSnapshot config);
+        Bundle consume(Bundle request, RuntimeSnapshot config);
+        default Bundle overlayReady(Bundle request, RuntimeSnapshot config) { return Bundle.EMPTY; }
+        default Bundle update(Bundle request, RuntimeSnapshot config) { return Bundle.EMPTY; }
+        default void nativeResult(String source, long occurredElapsed, boolean hasValidUrl) { }
+    }
+    private volatile DragGestures dragGestures;
+    public void setDragGestures(DragGestures gestures) { dragGestures = gestures; }
+    public RuntimeSnapshot dragConfiguration() {
+        RuntimeSnapshot config = current();
+        return config != null && config.build == BuildConfig.VERSION_CODE && config.user == 0 && config.enabled
+                && config.drag.enabled ? config : null;
+    }
     /** Local system use only; capture support does not require the independent routing toggle. */
     public RuntimeSnapshot sourceCaptureConfiguration() {
         RuntimeSnapshot config = current();
@@ -140,12 +156,31 @@ public final class RuntimeServer {
     /** Binder identity is checked before clearing it or reading private configuration. */
     public Bundle handle(int uid,String method,Bundle input){
         boolean isHost=host(uid);
-        if(!isHost && !("status".equals(method) && module(uid))) {
+        boolean dragLaunch="drag_launch".equals(method);
+        boolean dragConsume="drag_gesture_consume".equals(method);
+        if(!isHost && !(("status".equals(method) || dragLaunch || dragConsume) && module(uid))) {
             return declined("unauthorized");
         }
+        if((dragLaunch || dragConsume) && isHost)return declined("unauthorized");
         long identity=Binder.clearCallingIdentity();
         try {
             RuntimeSnapshot config=current();
+            if ("drag_gesture_claim".equals(method) || "drag_gesture_poll".equals(method)
+                    || "drag_gesture_overlay_ready".equals(method) || "drag_gesture_update".equals(method) || dragConsume) {
+                if (config == null || config.build != BuildConfig.VERSION_CODE || !config.enabled || !config.drag.enabled
+                        || dragGestures == null) return declined("disabled");
+                return dragConsume ? dragGestures.consume(input, config)
+                        : "drag_gesture_claim".equals(method) ? dragGestures.claim(input, config)
+                        : "drag_gesture_poll".equals(method) ? dragGestures.poll(input, config)
+                        : "drag_gesture_overlay_ready".equals(method) ? dragGestures.overlayReady(input, config)
+                        : dragGestures.update(input, config);
+            }
+            if(dragLaunch)return launchDrag(input,config);
+            if("drag_choose".equals(method))return chooseDrag(input,config);
+            if("drag_active".equals(method)) {
+                Bundle active=new Bundle();active.putBoolean("active",
+                        io.github.yudigaga.taplusbridge.drag.DragGestureGate.suppressLongPress());return active;
+            }
             if ("scope_link_probe_owns".equals(method)) {
                 Bundle result = new Bundle(); SourceCapture capture = sourceCapture;
                 result.putBoolean("owned", config != null && config.build == BuildConfig.VERSION_CODE
@@ -155,7 +190,11 @@ public final class RuntimeServer {
                 return result;
             }
             if ("scope_capture_native".equals(method)) {
-                SourceCapture capture = sourceCapture; if (capture != null) capture.nativeResult(input); return Bundle.EMPTY;
+                SourceCapture capture = sourceCapture; if (capture != null) capture.nativeResult(input);
+                DragGestures drag = dragGestures;
+                if (drag != null && input != null && input.get("native_elapsed") instanceof Long at)
+                    drag.nativeResult(input.getString("source"), at, input.getBoolean("has_valid_url"));
+                return Bundle.EMPTY;
             }
             if ("scope_capture_take".equals(method)) {
                 if (config == null || config.build != BuildConfig.VERSION_CODE || !config.enabled
@@ -189,7 +228,7 @@ public final class RuntimeServer {
             }
             Bundle request=input==null?new Bundle():new Bundle(input);
             return switch(method==null?"":method) {
-                case "capture_available" -> {Bundle b=new Bundle();b.putBoolean("enabled",config.capture && config.recognition && CaptureLease.allowedSource(request.getString("source")));yield b;}
+                case "capture_available" -> {Bundle b=new Bundle();b.putBoolean("enabled",config.capture && config.recognition && CaptureLease.allowedSource(request.getString("source")));b.putInt("recognition_delay",config.drag.recognitionDelayMillis);yield b;}
                 case "probe_arm", "capture_arm" -> arm(uid,request,config);
                 case "capture_cancel" -> cancel(uid,request);
                 case "recognition_status", "probe_status" -> Bundle.EMPTY;
@@ -197,6 +236,61 @@ public final class RuntimeServer {
                 default -> declined("unsupported_request");
             };
         }catch(RuntimeException failed){return declined("exception");}finally{Binder.restoreCallingIdentity(identity);}
+    }
+    private synchronized Bundle launchDrag(Bundle request,RuntimeSnapshot config) {
+        if(config==null || config.build!=BuildConfig.VERSION_CODE || !config.enabled || !config.drag.enabled)
+            return declined("disabled");
+        if(request==null || request.size()!=2 || !(request.get("token") instanceof String token)
+                || !token.matches("[A-Za-z0-9_-]{43}") || !(request.get("source") instanceof String source)
+                || !config.sourceScope.allows(source) || BridgeContract.APP_PACKAGE.equals(source)
+                || BridgeContract.HOST_PACKAGE.equals(source))return declined("invalid_request");
+        try {
+            long now=SystemClock.elapsedRealtime();
+            dragLaunches.entrySet().removeIf(entry -> now-entry.getValue()>30_000);
+            if(dragLaunches.containsKey(token)) {
+                Bundle result=new Bundle();result.putBoolean("accepted",true);return result;
+            }
+            KeyguardManager keyguard=context.getSystemService(KeyguardManager.class);
+            PowerManager power=context.getSystemService(PowerManager.class);
+            if(keyguard==null || keyguard.isKeyguardLocked() || power==null || !power.isInteractive())
+                return declined("device_locked");
+            var host=context.getPackageManager().getPackageInfo(BridgeContract.HOST_PACKAGE,0);
+            if(!HostPolicy.supportedVersion(host.versionName,host.getLongVersionCode()))return declined("unsupported_host");
+            var app=context.getPackageManager().getApplicationInfo(source,0);
+            if(app.uid<10000 || app.uid>=100000)return declined("invalid_source");
+            Intent launch=new Intent("io.github.yudigaga.taplusbridge.DRAG_ACTION")
+                    .setClassName(BridgeContract.HOST_PACKAGE,"com.miui.contentextension.services.TextContentExtensionService")
+                    .putExtra("drag_token",token);
+            if(context.startService(launch)==null)return declined("host_unavailable");
+            if(dragLaunches.size()>=8)dragLaunches.remove(dragLaunches.keySet().iterator().next());
+            dragLaunches.put(token,now);
+            Bundle result=new Bundle();result.putBoolean("accepted",true);return result;
+        }catch(PackageManager.NameNotFoundException|RuntimeException unavailable){return declined("host_unavailable");}
+    }
+    private synchronized Bundle chooseDrag(Bundle request,RuntimeSnapshot config) {
+        if(config==null || config.build!=BuildConfig.VERSION_CODE || !config.enabled || !config.drag.enabled)
+            return declined("disabled");
+        if(request==null || request.size()!=1 || !(request.get("token") instanceof String token)
+                || !token.matches("[A-Za-z0-9_-]{43}"))return declined("invalid_request");
+        try {
+            KeyguardManager keyguard=context.getSystemService(KeyguardManager.class);
+            PowerManager power=context.getSystemService(PowerManager.class);
+            if(keyguard==null || keyguard.isKeyguardLocked() || power==null || !power.isInteractive())
+                return declined("device_locked");
+            var app=context.getPackageManager().getApplicationInfo(BridgeContract.APP_PACKAGE,0);
+            if(!app.enabled)return declined("disabled");
+            long now=SystemClock.elapsedRealtime();
+            dragLaunches.entrySet().removeIf(entry -> now-entry.getValue()>60_000);
+            if(!dragLaunches.containsKey(token)) {
+                context.startActivity(new Intent().setClassName(BridgeContract.APP_PACKAGE,
+                        BridgeContract.APP_PACKAGE+".drag.DragActivity")
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK|Intent.FLAG_ACTIVITY_NO_ANIMATION|Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS)
+                        .putExtra("result_token",token));
+                if(dragLaunches.size()>=8)dragLaunches.remove(dragLaunches.keySet().iterator().next());
+                dragLaunches.put(token,now);
+            }
+            Bundle result=new Bundle();result.putBoolean("accepted",true);return result;
+        }catch(PackageManager.NameNotFoundException|RuntimeException unavailable){return declined("module_unavailable");}
     }
     /** Only a validated framework snapshot can publish; no caller-supplied package list is used. */
     private synchronized boolean publishSourceScope(RuntimeSnapshot config) {

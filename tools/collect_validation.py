@@ -40,6 +40,14 @@ def collect(build, artifacts, version, code, warnings, variant="debug", certific
     release = variant == "release"
     suffix = "-release" if release else "-dev"
     version_name = version if release else version + "-dev"
+    mapping = build / "outputs/mapping/release/mapping.txt"
+    renamed = {}
+    mapping_lines = []
+    code_presence = {}
+    if release:
+        assert mapping.is_file(), "Release R8 mapping missing"
+        mapping_lines = mapping.read_text(encoding="utf-8").splitlines()
+        renamed = dict(match.groups() for line in mapping_lines if (match := re.fullmatch(r"(\S+) -> (\S+):", line)))
     apk = artifacts / ("TaplusBridge-" + version + suffix + ".apk")
     suites = []
     results = build / "test-results/testDebugUnitTest"
@@ -82,10 +90,29 @@ def collect(build, artifacts, version, code, warnings, variant="debug", certific
         assert not any(name.startswith(("Lio/github/libxposed/api/", "Lde/robv/android/xposed/")) for name in classes)
         assert "Lio/github/yudigaga/taplusbridge/bridge/GenericLinkLauncher;" not in classes
         assert "Lio/github/yudigaga/taplusbridge/rules/FluidCloudRuleCatalog;" not in classes
-        assert "Lio/github/yudigaga/taplusbridge/runtime/RuntimeServer;" in classes
-        assert "Lio/github/yudigaga/taplusbridge/runtime/RuntimeLaunchEntry;" in classes
-        assert "Lio/github/libxposed/service/XposedService;" in classes
-        assert "Ltop/yukonga/miuix/kmp/basic/ScaffoldKt;" in classes, "Real Miuix UI not packaged"
+        for original in ("io.github.yudigaga.taplusbridge.runtime.RuntimeServer",
+                         "io.github.yudigaga.taplusbridge.runtime.RuntimeLaunchEntry",
+                         "io.github.libxposed.service.XposedService",
+                         "top.yukonga.miuix.kmp.basic.ScaffoldKt"):
+            packaged = renamed.get(original, original)
+            descriptor = "L" + packaged.replace(".", "/") + ";"
+            if descriptor in classes:
+                code_presence[original] = {"kind": "class", "owner": packaged}
+                continue
+            # R8 can inline and remove helper classes; verify the surviving method named in its mapping.
+            owner = None
+            frame = re.compile(r"\s" + re.escape(original) + r"\.[A-Za-z_$<>][A-Za-z0-9_$<>]*\(")
+            for line in mapping_lines:
+                heading = re.fullmatch(r"(\S+) -> (\S+):", line)
+                if heading:
+                    owner = heading.group(2)
+                elif owner is not None and frame.search(line) and " -> " in line:
+                    method = line.rsplit(" -> ", 1)[1]
+                    members = classes.get("L" + owner.replace(".", "/") + ";", {})
+                    if any(member.startswith(method + "(") for member in members):
+                        code_presence[original] = {"kind": "inlined", "owner": owner, "method": method}
+                        break
+            assert original in code_presence, "Packaged code missing: " + original
         assert hashlib.sha256(archive.read("assets/icebridge-rules/revisions/rules-000001.json")).hexdigest() == "e840f50919b022b085621c34394c7d09fde1373e22467e490bbb8c8633a05203"
         native_libraries = native_alignment(archive)
     ns = "{http://schemas.android.com/apk/res/android}"
@@ -105,6 +132,8 @@ def collect(build, artifacts, version, code, warnings, variant="debug", certific
         "apk": apk.name, "size": apk.stat().st_size,
         "sha256": hashlib.sha256(apk.read_bytes()).hexdigest().upper(),
         "versionName": version_name, "versionCode": code,
+        "r8": {"enabled": release, "mapping_sha256": hashlib.sha256(mapping.read_bytes()).hexdigest() if release else None,
+               "code_presence": code_presence},
         "signing": {"type": "long-term release" if release else "Android Debug", "v2": True,
                     "v3": "v3): true" in certificate,
                     "certificate_sha256": actual_certificate.group(1).lower()},

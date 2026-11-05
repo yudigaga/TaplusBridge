@@ -44,12 +44,14 @@ public final class HostScopeCaptureHooks {
         Thread thread = new Thread(r, "TaplusBridge-scope-image-timeout"); thread.setDaemon(true); return thread;
     });
     private final ThreadLocal<Boolean> synthetic = ThreadLocal.withInitial(() -> false);
+    private final ThreadLocal<NativeImage> nativeImage = new ThreadLocal<>();
+    private record NativeImage(Context context, Object service, Object result) {}
     private final LinkedHashMap<String, Long> nonces = new LinkedHashMap<>();
     private final PendingNative pendingNative = new PendingNative();
     private volatile NativeCapture nativeCapture;
     private record NativeCapture(String source, long at) {}
     private volatile Admission admission;
-    private record Admission(String source, long at, boolean synthetic) {}
+    private record Admission(String source, long at, boolean synthetic, Object service, Object result) {}
 
     private HostScopeCaptureHooks(XposedModule module, ClassLoader loader) throws ReflectiveOperationException {
         this.module = module; payloads = new ScopeCapturePayload.Factory(loader);
@@ -96,12 +98,15 @@ public final class HostScopeCaptureHooks {
             Method pick = method(service, name, false, void.class, result);
             module.hook(pick).setId("taplusbridge:scope-capture-native-" + name)
                     .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).intercept(chain -> {
+                        NativeImage observed = null;
                         if (chain.getThisObject() instanceof Context context && supported(context)) {
                             try {
                                 String source = (String) sourcePackage.invoke(null);
                                 if (HostPolicy.validPackage(source)) {
                                     long at = SystemClock.elapsedRealtime();
-                                    if (!synthetic.get()) {
+                                    boolean syntheticPick = syntheticPick(synthetic.get(), chain.getThisObject(), chain.getArg(0));
+                                    if (!syntheticPick) {
+                                        HostDragHooks.observeNative(context, chain.getThisObject(), chain.getArg(0), "onPickImage".equals(name));
                                         String identity = ownedLinkPick(context, source, at);
                                         if (identity != null) {
                                             PendingNative.Held held = pendingNative.hold("onPickImage".equals(name),
@@ -112,31 +117,73 @@ public final class HostScopeCaptureHooks {
                                                 if (current != null) pendingNative.expire(current);
                                             }, 30, TimeUnit.SECONDS);
                                             admission = null;
-                                            module.log(4, "TaplusBridge", "scope link stage=blocked reason=native_pick");
-                                            return null;
+                                            // Remember the probe, but let portal recognition and the source menu run.
+                                            module.log(4, "TaplusBridge", "scope link stage=observed reason=native_pick");
                                         }
+                                        if ("onPickImage".equals(name)) observed = new NativeImage(context,
+                                                chain.getThisObject(), chain.getArg(0));
                                     }
-                                    admission = new Admission(source, at, synthetic.get());
+                                    admission = new Admission(source, at, syntheticPick, chain.getThisObject(), chain.getArg(0));
+                                    if (HostDragHooks.delivering(chain.getThisObject(), chain.getArg(0)))
+                                        module.log(4, "TaplusBridge", "drag delivery stage=native_replay_admitted");
                                 }
                             } catch (ReflectiveOperationException | RuntimeException failure) { report("native", failure); }
                         }
-                        return chain.proceed();
+                        NativeImage previous = nativeImage.get();
+                        if (observed == null) nativeImage.remove(); else nativeImage.set(observed);
+                        try { return chain.proceed(); }
+                        finally { if (previous == null) nativeImage.remove(); else nativeImage.set(previous); }
                     });
         }
+        installResolvedImageObserver(service);
         for (String name : new String[]{"startPickTextTask", "startPickImageTask"}) {
             Method task = method(service, name, false, void.class);
             module.hook(task).setId("taplusbridge:scope-capture-accepted-" + name)
                     .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).intercept(chain -> {
                         Admission admitted = admission;
+                        Context reportContext = null;
                         if (admitted != null && chain.getThisObject() instanceof Context context && supported(context)) {
                             if (admission == admitted) admission = null;
                             if (!admitted.synthetic && SystemClock.elapsedRealtime() - admitted.at <= 10_000) {
                                 nativeCapture = new NativeCapture(admitted.source, admitted.at);
-                                signals.execute(() -> reportNative(context, admitted.source, admitted.at, 0));
+                                reportContext = context;
                             }
                         }
-                        return chain.proceed();
+                        Object outcome = chain.proceed();
+                        if (reportContext != null) {
+                            boolean hasValidUrl = HostDragHooks.nativeUrlAvailable(admitted.service, admitted.result);
+                            if (!hasValidUrl) try {
+                                String text = nativeText(admitted.result);
+                                hasValidUrl = !io.github.yudigaga.taplusbridge.recognition.LinkExtractor.extract(
+                                        text == null ? "" : text).isEmpty();
+                            } catch (ReflectiveOperationException | RuntimeException ignored) { }
+                            Context report = reportContext;
+                            boolean urlAvailable = hasValidUrl;
+                            signals.execute(() -> reportNative(report, admitted.source, admitted.at, urlAvailable, 0));
+                        }
+                        return outcome;
                     });
+        }
+    }
+
+    private void installResolvedImageObserver(Class<?> service) {
+        try {
+            Method setter = method(service, "setBitmap", true, void.class, Bitmap.class);
+            module.hook(setter).setId("taplusbridge:scope-native-resolved-image")
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).intercept(chain -> {
+                        Object outcome = chain.proceed();
+                        try {
+                            NativeImage observed = nativeImage.get();
+                            if (observed != null && !synthetic.get() && chain.getArg(0) instanceof Bitmap bitmap
+                                    && !bitmap.isRecycled())
+                                HostDragHooks.observeNativeResolved(observed.context, observed.service, observed.result, bitmap);
+                        } catch (Throwable unavailable) {
+                            try { report("resolved_image", unavailable); } catch (Throwable ignored) { }
+                        }
+                        return outcome;
+                    });
+        } catch (ReflectiveOperationException | RuntimeException unavailable) {
+            report("resolved_image_optional", unavailable);
         }
     }
 
@@ -232,11 +279,12 @@ public final class HostScopeCaptureHooks {
         } finally { if (!bitmapHanded && bitmap != null && !bitmap.isRecycled()) bitmap.recycle(); }
     }
 
-    private void reportNative(Context context, String source, long occurredAt, int attempt) {
+    private void reportNative(Context context, String source, long occurredAt, boolean hasValidUrl, int attempt) {
         Bundle request = new Bundle(); request.putString("source", source); request.putLong("native_elapsed", occurredAt);
+        request.putBoolean("has_valid_url", hasValidUrl);
         if (RuntimeClient.call(context, "scope_capture_native", request) == null && attempt < 3) {
             RuntimeClient.connect(context, null);
-            main.postDelayed(() -> signals.execute(() -> reportNative(context, source, occurredAt, attempt + 1)), 300);
+            main.postDelayed(() -> signals.execute(() -> reportNative(context, source, occurredAt, hasValidUrl, attempt + 1)), 300);
         }
     }
 
@@ -248,13 +296,17 @@ public final class HostScopeCaptureHooks {
                 && identity.matches("[A-Za-z0-9_-]{16,128}") ? identity : null;
     }
 
+    static boolean syntheticPick(boolean scopeSynthetic, Object service, Object result) {
+        return scopeSynthetic || HostDragHooks.delivering(service, result);
+    }
+
     static String nativeText(Object result) throws ReflectiveOperationException {
         if (result == null) return null;
         Object params = result.getClass().getMethod("getParams", String.class).invoke(result, "text_pick");
         Object value = params instanceof Map<?, ?> map ? map.get("pick_mode") : null;
         String text = value instanceof CharSequence chars ? chars.toString() : null;
         if (value instanceof Bundle bundle) {
-            if (bundle.containsKey("viewContent")) text = bundle.getString("viewContent");
+            if (bundle.containsKey("viewContent")) text = bundle.get("viewContent") instanceof CharSequence chars ? chars.toString() : null;
             else {
                 String[] keys = bundle.getStringArray("apkParamList");
                 if (keys != null) for (int i = 0; i < Math.min(keys.length, 128); i++) {

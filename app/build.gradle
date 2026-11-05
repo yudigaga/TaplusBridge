@@ -14,8 +14,8 @@ android {
         applicationId 'io.github.yudigaga.taplusbridge'
         minSdk 28
         targetSdk 35
-        versionCode 31
-        versionName '0.14.6'
+        versionCode 58
+        versionName '0.15.26'
     }
     signingConfigs {
         taplusRelease {
@@ -64,6 +64,7 @@ tasks.configureEach {
 }
 dependencies {
     compileOnly 'io.github.libxposed:api:102.0.0'
+    testImplementation 'io.github.libxposed:api:102.0.0'
     implementation 'io.github.libxposed:service:102.0.0'
     testImplementation 'junit:junit:4.13.2'
     testImplementation 'org.robolectric:robolectric:4.14.1'

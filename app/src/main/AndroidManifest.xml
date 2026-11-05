@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android" xmlns:tools="http://schemas.android.com/tools">
     <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.VIBRATE" />
     <permission android:name="io.github.yudigaga.taplusbridge.CANCEL_CAPTURE" android:protectionLevel="signature" />
     <uses-permission android:name="io.github.yudigaga.taplusbridge.CANCEL_CAPTURE" />
     <!-- The rule editor selects any installed or frozen application, including custom source apps. -->
@@ -19,6 +20,11 @@
         </activity>
         <activity android:name=".ui.TransitActivity" android:exported="true"
             android:theme="@style/TransitTheme" android:excludeFromRecents="true" />
+        <activity android:name=".drag.DragActivity" android:exported="false"
+            android:theme="@style/DragTheme" android:excludeFromRecents="true"
+            android:taskAffinity="${applicationId}.drag" />
+        <provider android:name=".drag.DragShareProvider" android:authorities="${applicationId}.drag.images"
+            android:exported="false" android:grantUriPermissions="true" />
         <service android:name=".lens.LensService" android:exported="true" android:process=":lens" />
         <activity android:name=".lens.LensInteractionActivity" android:exported="false"
             android:process=":lens" android:excludeFromRecents="true" />
