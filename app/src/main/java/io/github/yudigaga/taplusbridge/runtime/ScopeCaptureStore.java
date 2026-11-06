@@ -42,11 +42,17 @@ public final class ScopeCaptureStore {
         return issue(owner, config, metadata, "resume", null, null);
     }
 
+    public synchronized String issueContent(int owner, RuntimeSnapshot config, Bundle metadata, String text, String url) {
+        if (!ScopeCapturePayload.validContent(text)) throw new IllegalArgumentException("scope_content_invalid");
+        Bundle data = new Bundle(metadata); data.putString("text", text);
+        return issue(owner, config, data, "content", null, url);
+    }
+
     private String issue(int owner, RuntimeSnapshot config, Bundle metadata, String kind, byte[] png, String url) {
         String source = metadata == null ? null : metadata.getString("source");
         boolean text = "text".equals(kind), image = "image".equals(kind);
         if (owner < 10000 || owner / 100000 != 0 || config == null || !config.enabled
-                || (image ? !config.scopeCapture : !config.scopeLinkProbe)
+                || (image ? !config.scopeCapture : "content".equals(kind) ? !config.recognition : !config.scopeLinkProbe)
                 || !config.sourceScope.managed || !config.sourceScope.allows(source)
                 || (url != null && (!config.scopeLinkProbe || !ScopeCapturePayload.validTextUrl(url)))
                 || (text && url == null)
@@ -68,7 +74,8 @@ public final class ScopeCaptureStore {
                 || !current.nonce.equals(request.getString("nonce"))) return Bundle.EMPTY;
         entry = null;
         if (SystemClock.elapsedRealtime() >= current.until || config == null || !config.enabled
-                || ("image".equals(current.kind) ? !config.scopeCapture : !config.scopeLinkProbe)
+                || ("image".equals(current.kind) ? !config.scopeCapture
+                    : "content".equals(current.kind) ? !config.recognition : !config.scopeLinkProbe)
                 || !config.identity.equals(current.identity) || !config.sourceScope.managed
                 || !config.sourceScope.allows(current.source)) {
             erase(current); return Bundle.EMPTY;
@@ -102,7 +109,11 @@ public final class ScopeCaptureStore {
     }
 
     public synchronized void nativeResult(String source) {
-        if (entry != null && entry.source.equals(source)) clear();
+        nativeResult(source, true);
+    }
+    public synchronized void nativeResult(String source, boolean hasValidUrl) {
+        if (entry != null && entry.source.equals(source)
+                && (hasValidUrl || !ScopeCapturePayload.validContent(entry.metadata.get("text")))) clear();
     }
     private synchronized void expire(String nonce) { if (entry != null && entry.nonce.equals(nonce)) clear(); }
     public synchronized void clear() {

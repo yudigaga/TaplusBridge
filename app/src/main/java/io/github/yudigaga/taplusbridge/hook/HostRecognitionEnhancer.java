@@ -13,6 +13,8 @@ import android.view.View;
 import android.widget.TextView;
 import io.github.yudigaga.taplusbridge.bridge.BridgeContract;
 import io.github.yudigaga.taplusbridge.recognition.LinkExtractor;
+import io.github.yudigaga.taplusbridge.config.RecognitionChannels;
+import io.github.yudigaga.taplusbridge.config.RecognitionChannels.Channel;
 import java.lang.reflect.Array;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
@@ -27,6 +29,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.WeakHashMap;
 import java.util.function.Consumer;
+import java.util.function.BiConsumer;
 
 /** Local links join the host's existing cards; no destination is inferred from a title. */
 public final class HostRecognitionEnhancer {
@@ -47,6 +50,8 @@ public final class HostRecognitionEnhancer {
     private final Set<String> reported = new LinkedHashSet<>();
     private long pickStartedNanos;
     private int performanceEvents;
+    private int sourceEvents;
+    private final Set<String> sourceChannels = new LinkedHashSet<>();
     private volatile Consumer<String> reporter = ignored -> { };
     private static final Set<String> DIAGNOSTIC_STAGES = Set.of("capture_text", "capture_catcher",
             "capture_image", "capture_clipboard", "capture_ocr", "capture_recommendation", "capture_segment",
@@ -129,6 +134,8 @@ public final class HostRecognitionEnhancer {
         synchronized (reported) {
             reported.clear();
             performanceEvents = 0;
+            sourceEvents = 0;
+            sourceChannels.clear();
         }
     }
 
@@ -136,10 +143,26 @@ public final class HostRecognitionEnhancer {
 
     /** Adds links without retaining the recognized text, message XML, or complete view metadata. */
     public synchronized void captureText(String text) {
+        captureText(text, "native");
+    }
+
+    public synchronized void captureText(String text, String channel) {
+        if (channel == null || !Set.of("native", "assist", "ocr", "server", "clipboard", "probe").contains(channel)) return;
         int previousSize = links.size();
-        for (String url : LinkExtractor.extract(text)) {
+        List<String> found = LinkExtractor.extract(text);
+        for (String url : found) {
             if (links.size() >= LinkExtractor.MAX_RESULTS) break;
             links.add(url);
+        }
+        if (!found.isEmpty()) {
+            boolean first = sourceChannels.add(channel);
+            // Reserve one event for every source so repeated server results cannot hide late OCR evidence.
+            if (sourceEvents < 32 && (first || sourceEvents < 32 - (6 - sourceChannels.size()))) {
+                sourceEvents++;
+                try { reporter.accept("recognition source stage=links channel=" + channel + " found=" + found.size()
+                        + " added=" + (links.size() - previousSize) + " total=" + links.size()); }
+                catch (RuntimeException ignored) { }
+            }
         }
         diagnostic("capture_text", links.isEmpty() ? "empty" : "captured", null,
                 text == null ? 0 : text.length(), links.size(), null, null);
@@ -149,19 +172,28 @@ public final class HostRecognitionEnhancer {
 
     public synchronized List<String> capturedLinks() { return new ArrayList<>(links); }
 
+    private static void addLinks(Set<String> links, String text) {
+        for (String url : LinkExtractor.extract(text)) {
+            if (links.size() >= LinkExtractor.MAX_RESULTS) break;
+            links.add(url);
+        }
+    }
+
     /** Existing server URL cards also end the need to simulate a click on the original source. */
     public synchronized void captureRecommendationLinks(List<?> recommendations) {
         if(recommendations==null)return;
+        Set<String> found = new LinkedHashSet<>();
         for(Object info:recommendations)if(modelClass.isInstance(info) && !HostCaptureAction.isAction(info)) {
-            captureText(read(detailUrl,info));
+            addLinks(found, read(detailUrl,info));
             Intent candidate=nativeCandidate(info);
-            if(candidate!=null)captureText(candidate.getDataString());
+            if(candidate!=null)addLinks(found, candidate.getDataString());
         }
+        captureText(String.join("\n", found), "server");
     }
 
     public synchronized void captureProbeUrl(String url) {
         if (!io.github.yudigaga.taplusbridge.capture.IntentObservation.validHttpUrl(url)) return;
-        captureText(url); probeLinks.add(url);
+        captureText(url, "probe"); probeLinks.add(url);
     }
     public synchronized boolean isProbeRecommendation(Object info) {
         return modelClass.isInstance(info) && probeLinks.contains(read(detailUrl, info));
@@ -169,18 +201,62 @@ public final class HostRecognitionEnhancer {
 
     /** ContentCatcher supplies richer pick_mode metadata on some ROM/app combinations. */
     public void capture(Object catcherResult) {
+        capture(catcherResult, RecognitionChannels.defaults());
+    }
+
+    public void capture(Object catcherResult, RecognitionChannels channels) {
+        if (catcherResult == null) return;
+        captureChannels(catcherResult, channels, (text, channel) -> {
+            if (channel == null) synchronized (this) { addLinks(links, text); }
+            else if ("probe".equals(channel)) captureProbeUrl(text);
+            else captureText(text, channel);
+        });
+        diagnostic("capture_catcher", "captured", null, 0, capturedLinks().size(), null, null);
+    }
+
+    /** Shares the recognition scanner without requiring the host's recommendation model. */
+    static List<String> catcherLinks(Object catcherResult) {
+        return catcherLinks(catcherResult, RecognitionChannels.defaults());
+    }
+
+    static List<String> catcherLinks(Object catcherResult, RecognitionChannels channels) {
+        Set<String> found = new LinkedHashSet<>();
+        captureChannels(catcherResult, channels, (text, channel) -> addLinks(found, text));
+        return new ArrayList<>(found);
+    }
+
+    private static void captureChannels(Object result, RecognitionChannels channels, BiConsumer<String, String> capture) {
+        boolean forwarded = RecognitionPolicy.marked(result, "taplus_drag");
+        Map<?, ?> properties = RecognitionPolicy.properties(result);
+        if ((forwarded || channels.enabled(Channel.ASSIST)) && properties.get("taplus_scope_text") instanceof String text)
+            capture.accept(text, forwarded ? null : "assist");
+        if (properties.get("taplus_scope_link_url") instanceof String url && ScopeCapturePayload.validTextUrl(url))
+            capture.accept(url, forwarded ? null : "probe");
+        if (forwarded) {
+            try { capture.accept(HostScopeCaptureHooks.nativeText(result), null); }
+            catch (ReflectiveOperationException | RuntimeException ignored) { }
+        } else if (channels.enabled(Channel.NATIVE)) {
+            Set<String> found = new LinkedHashSet<>();
+            if (properties.get("taplus_native_text") instanceof String text) addLinks(found, text);
+            catcherPayloads(result, payload -> scanPayload(payload, text -> addLinks(found, text)), ignored -> { });
+            capture.accept(String.join("\n", found), "native");
+        }
+    }
+
+    private static void catcherPayloads(Object catcherResult, Consumer<Object> capture,
+                                        Consumer<Class<?>> failure) {
         if (catcherResult == null) return;
         try {
             Method params = catcherResult.getClass().getMethod("getParams", String.class);
-            capturePayload(params.invoke(catcherResult, "text_pick"));
-            capturePayload(params.invoke(catcherResult, "image_pick"));
+            capture.accept(params.invoke(catcherResult, "text_pick"));
+            capture.accept(params.invoke(catcherResult, "image_pick"));
             try {
                 Method properties = catcherResult.getClass().getMethod("getPropertyMap");
-                capturePayload(properties.invoke(catcherResult));
+                capture.accept(properties.invoke(catcherResult));
             } catch (NoSuchMethodException ignored) { }
         } catch (ReflectiveOperationException | RuntimeException ignored) {
             // Missing structured metadata is not a reason to invent a destination.
-            diagnostic("capture_catcher", "failed", null, 0, capturedLinks().size(), ignored.getClass(), null);
+            failure.accept(ignored.getClass());
         }
         // ContentCatcher may return results under a job tag other than text_pick/image_pick.
         // This SDK container is optional; inspect only its bounded Map payload and keep
@@ -188,64 +264,69 @@ public final class HostRecognitionEnhancer {
         try {
             Method results = catcherResult.getClass().getMethod("getResults");
             Object payload = results.invoke(catcherResult);
-            if (payload instanceof Map<?, ?>) capturePayload(payload);
+            if (payload instanceof Map<?, ?>) capture.accept(payload);
         } catch (NoSuchMethodException ignored) {
             // Keep the existing getParams/getPropertyMap path if this optional method is absent.
         } catch (ReflectiveOperationException | RuntimeException ignored) {
-            diagnostic("capture_catcher", "failed", null, 0, capturedLinks().size(), ignored.getClass(), null);
+            failure.accept(ignored.getClass());
         }
-        diagnostic("capture_catcher", "captured", null, 0, capturedLinks().size(), null, null);
     }
 
     /** Only scalar strings and bounded containers are inspected; arbitrary message objects are not walked. */
     public void capturePayload(Object payload) {
+        scanPayload(payload, this::captureText);
+    }
+
+    private static void scanPayload(Object payload, Consumer<String> capture) {
         Set<Object> visited = Collections.newSetFromMap(new IdentityHashMap<>());
         int[] budget = {MAX_METADATA_NODES};
-        capturePayload(payload, visited, budget, 0);
+        scanPayload(payload, capture, visited, budget, 0);
     }
 
     @SuppressWarnings("deprecation")
-    private void capturePayload(Object payload, Set<Object> visited, int[] budget, int depth) {
+    private static void scanPayload(Object payload, Consumer<String> capture, Set<Object> visited,
+                                    int[] budget, int depth) {
         if (payload == null || depth > 5 || budget[0]-- <= 0) return;
         if (payload instanceof CharSequence text) {
             if (payload instanceof Spanned spanned) {
                 URLSpan[] spans = spanned.getSpans(0, spanned.length(), URLSpan.class);
                 for (int i = 0; i < Math.min(spans.length, MAX_METADATA_NODES); i++)
-                    captureText(spans[i].getURL());
+                    capture.accept(spans[i].getURL());
             }
-            captureText(text.toString());
+            capture.accept(text.toString());
             return;
         }
         if (!visited.add(payload)) return;
         if (payload instanceof Uri uri) {
-            captureText(uri.toString());
+            capture.accept(uri.toString());
         } else if (payload instanceof Intent capturedIntent) {
-            capturePayload(capturedIntent.getData(), visited, budget, depth + 1);
-            capturePayload(capturedIntent.getExtras(), visited, budget, depth + 1);
+            scanPayload(capturedIntent.getData(), capture, visited, budget, depth + 1);
+            scanPayload(capturedIntent.getExtras(), capture, visited, budget, depth + 1);
         } else if (payload instanceof Bundle bundle) {
+            if (bundle.getBoolean("taplus_scope_capture") || bundle.getBoolean("taplus_drag")) return;
             for (String key : bundle.keySet()) {
                 if (budget[0] <= 0) break;
                 // An image thumbnail URL is not the shared card's landing page.
-                if (!imageMetadata(key)) {
-                    try { capturePayload(bundle.get(key), visited, budget, depth + 1); }
+                if (!key.startsWith("taplus_") && !imageMetadata(key)) {
+                    try { scanPayload(bundle.get(key), capture, visited, budget, depth + 1); }
                     catch (RuntimeException ignored) { }
                 }
             }
         } else if (payload instanceof Map<?, ?> map) {
             for (Map.Entry<?, ?> entry : map.entrySet()) {
                 if (budget[0] <= 0) break;
-                if (!imageMetadata(String.valueOf(entry.getKey())))
-                    capturePayload(entry.getValue(), visited, budget, depth + 1);
+                if (!String.valueOf(entry.getKey()).startsWith("taplus_") && !imageMetadata(String.valueOf(entry.getKey())))
+                    scanPayload(entry.getValue(), capture, visited, budget, depth + 1);
             }
         } else if (payload instanceof Iterable<?> values) {
             for (Object value : values) {
                 if (budget[0] <= 0) break;
-                capturePayload(value, visited, budget, depth + 1);
+                scanPayload(value, capture, visited, budget, depth + 1);
             }
         } else if (payload.getClass().isArray() && !payload.getClass().getComponentType().isPrimitive()) {
             int size = Math.min(Array.getLength(payload), MAX_METADATA_NODES);
             for (int i = 0; i < size && budget[0] > 0; i++)
-                capturePayload(Array.get(payload, i), visited, budget, depth + 1);
+                scanPayload(Array.get(payload, i), capture, visited, budget, depth + 1);
         }
     }
 

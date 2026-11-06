@@ -44,6 +44,7 @@ public final class RuntimeServer {
         void nativeResult(Bundle request);
         default boolean linkReady() { return false; }
         default boolean ownsLinkPick(Bundle request) { return false; }
+        default Bundle linkWindow(Bundle request, RuntimeSnapshot config, boolean ready) { return Bundle.EMPTY; }
     }
     private volatile SourceCapture sourceCapture;
     public void setSourceCapture(SourceCapture capture) { sourceCapture = capture; }
@@ -53,6 +54,8 @@ public final class RuntimeServer {
         Bundle consume(Bundle request, RuntimeSnapshot config);
         default Bundle overlayReady(Bundle request, RuntimeSnapshot config) { return Bundle.EMPTY; }
         default Bundle update(Bundle request, RuntimeSnapshot config) { return Bundle.EMPTY; }
+        default Bundle prepare(Bundle request, RuntimeSnapshot config) { return Bundle.EMPTY; }
+        default Bundle requestLink(Bundle request, RuntimeSnapshot config) { return Bundle.EMPTY; }
         default void nativeResult(String source, long occurredElapsed, boolean hasValidUrl) { }
     }
     private volatile DragGestures dragGestures;
@@ -66,11 +69,17 @@ public final class RuntimeServer {
     public RuntimeSnapshot sourceCaptureConfiguration() {
         RuntimeSnapshot config = current();
         return config != null && config.build == BuildConfig.VERSION_CODE && config.enabled
-                && (config.scopeCapture || config.scopeLinkProbe) && config.sourceScope.managed
+                && (config.recognition || config.scopeCapture || config.scopeLinkProbe) && config.sourceScope.managed
                 ? config : null;
     }
+
+    public RuntimeSnapshot sourceContentConfiguration() {
+        RuntimeSnapshot config = current();
+        return config != null && config.build == BuildConfig.VERSION_CODE && config.user == 0 && config.enabled
+                && config.recognition && config.sourceScope.managed ? config : null;
+    }
     private record Ticket(LaunchPlanner.Plan plan,String identity,int owner,long until,String origin){}
-    private record Lease(String nonce,String source,int sourceUid,int owner,long issued,boolean taken,String identity){}
+    private record Lease(String nonce,String source,int sourceUid,int owner,long issued,boolean taken,String identity,boolean probe){}
     public RuntimeServer(Context context,Handler worker,Supplier<SharedPreferences> preferences,SystemPackageOps packages,
                          java.util.function.Consumer<String> logger){
         this.context=context;this.worker=worker;this.preferences=preferences;this.packages=packages;this.logger=logger;
@@ -132,6 +141,8 @@ public final class RuntimeServer {
                 }else{
                     result=RuntimeSnapshot.parse(raw);
                     snapshotRaw=raw;snapshot=result;outcome="parsed";
+                    event("runtime config stage=loaded build="+result.build
+                            +" supplemental_tap="+(result.scopeLinkProbe?"on":"off"));
                 }
             }
             if(!"cache_hit".equals(outcome))perf("snapshot_read",started,outcome);
@@ -165,11 +176,20 @@ public final class RuntimeServer {
         long identity=Binder.clearCallingIdentity();
         try {
             RuntimeSnapshot config=current();
+            if ("scope_link_window_check".equals(method) || "scope_link_window_ready".equals(method)) {
+                SourceCapture capture = sourceCapture;
+                return config == null || config.build != BuildConfig.VERSION_CODE || !config.enabled
+                        || !config.scopeLinkProbe || capture == null ? Bundle.EMPTY
+                        : capture.linkWindow(input, config, "scope_link_window_ready".equals(method));
+            }
             if ("drag_gesture_claim".equals(method) || "drag_gesture_poll".equals(method)
+                    || "drag_gesture_prepare".equals(method) || "drag_gesture_link".equals(method)
                     || "drag_gesture_overlay_ready".equals(method) || "drag_gesture_update".equals(method) || dragConsume) {
                 if (config == null || config.build != BuildConfig.VERSION_CODE || !config.enabled || !config.drag.enabled
                         || dragGestures == null) return declined("disabled");
                 return dragConsume ? dragGestures.consume(input, config)
+                        : "drag_gesture_prepare".equals(method) ? dragGestures.prepare(input, config)
+                        : "drag_gesture_link".equals(method) ? dragGestures.requestLink(input, config)
                         : "drag_gesture_claim".equals(method) ? dragGestures.claim(input, config)
                         : "drag_gesture_poll".equals(method) ? dragGestures.poll(input, config)
                         : "drag_gesture_overlay_ready".equals(method) ? dragGestures.overlayReady(input, config)
@@ -198,7 +218,8 @@ public final class RuntimeServer {
             }
             if ("scope_capture_take".equals(method)) {
                 if (config == null || config.build != BuildConfig.VERSION_CODE || !config.enabled
-                        || (!config.scopeCapture && !config.scopeLinkProbe) || !config.sourceScope.managed) return Bundle.EMPTY;
+                        || (!config.recognition && !config.scopeCapture && !config.scopeLinkProbe)
+                        || !config.sourceScope.managed) return Bundle.EMPTY;
                 SourceCapture capture = sourceCapture;
                 return capture == null ? Bundle.EMPTY : capture.take(uid, input, config);
             }
@@ -218,7 +239,14 @@ public final class RuntimeServer {
                 Bundle result = new Bundle(); result.putString("policy", config.sourceScope.encode());
                 result.putString("identity", config.identity);
                 result.putBoolean("scope_capture_enabled", config.enabled && config.scopeCapture);
+                result.putBoolean("source_content_enabled", config.enabled && config.recognition);
                 result.putBoolean("scope_link_probe_enabled", config.enabled && config.scopeLinkProbe); return result;
+            }
+            if ("recognition_channels".equals(method)) {
+                if (config == null || config.build != BuildConfig.VERSION_CODE) return declined("runtime_unavailable");
+                Bundle result = new Bundle(); result.putString("channels", config.channels.toJson());
+                result.putString("identity", config.identity);
+                result.putBoolean("active", config.enabled && config.recognition); return result;
             }
             if(config==null || !config.usable() || !packages.ready()) {
                 return declined("runtime_unavailable");
@@ -228,8 +256,8 @@ public final class RuntimeServer {
             }
             Bundle request=input==null?new Bundle():new Bundle(input);
             return switch(method==null?"":method) {
-                case "capture_available" -> {Bundle b=new Bundle();b.putBoolean("enabled",config.capture && config.recognition && CaptureLease.allowedSource(request.getString("source")));b.putInt("recognition_delay",config.drag.recognitionDelayMillis);yield b;}
-                case "probe_arm", "capture_arm" -> arm(uid,request,config);
+                case "capture_available" -> {Bundle b=new Bundle();b.putBoolean("enabled",config.capture && config.recognition && config.scopeLinkProbe && CaptureLease.allowedSource(request.getString("source")));b.putInt("recognition_delay",config.drag.recognitionDelayMillis);yield b;}
+                case "probe_arm", "capture_arm" -> arm(uid,request,config,"probe_arm".equals(method));
                 case "capture_cancel" -> cancel(uid,request);
                 case "recognition_status", "probe_status" -> Bundle.EMPTY;
                 case "resolve", BridgeContract.PREPARE -> route(uid,method,request,config);
@@ -342,12 +370,12 @@ public final class RuntimeServer {
         }catch(PackageManager.NameNotFoundException missing){return declined("target_missing");}
         finally{perf("target_preview",started,outcome);}
     }
-    private synchronized Bundle arm(int owner,Bundle input,RuntimeSnapshot config){
+    private synchronized Bundle arm(int owner,Bundle input,RuntimeSnapshot config,boolean probe){
         String source=input.getString("source");
-        if(!config.capture || !config.recognition || !CaptureLease.allowedSource(source))return declined("disabled");
+        if(!config.capture || !config.recognition || (probe && !config.scopeLinkProbe) || !CaptureLease.allowedSource(source))return declined("disabled");
         try {
             int uid=context.getPackageManager().getApplicationInfo(source,0).uid;if(uid/100000!=0)return declined("invalid_request");
-            String nonce=token();capture=new Lease(nonce,source,uid,owner,SystemClock.elapsedRealtime(),false,config.identity);
+            String nonce=token();capture=new Lease(nonce,source,uid,owner,SystemClock.elapsedRealtime(),false,config.identity,probe);
             Bundle result=new Bundle();result.putString("nonce",nonce);result.putInt("user",0);return result;
         }catch(PackageManager.NameNotFoundException missing){return declined("source_missing");}
     }
@@ -364,19 +392,20 @@ public final class RuntimeServer {
         Lease lease=capture;
         if(user!=0 || config==null || !config.usable() || !config.enabled || !config.capture || !config.recognition
                 || lease==null || !lease.nonce().equals(nonce) || !lease.identity().equals(config.identity))return null;
+        if(lease.probe() && !config.scopeLinkProbe)return Bundle.EMPTY;
         if("capture_take".equals(method)){
             if(lease.taken() || now<lease.issued() || now-lease.issued()>=2500)return Bundle.EMPTY;
-            capture=new Lease(lease.nonce(),lease.source(),lease.sourceUid(),lease.owner(),lease.issued(),true,lease.identity());
+            capture=new Lease(lease.nonce(),lease.source(),lease.sourceUid(),lease.owner(),lease.issued(),true,lease.identity(),lease.probe());
             Bundle b=new Bundle();b.putString("source",lease.source());b.putInt("source_uid",lease.sourceUid());b.putInt("user",0);
-            b.putBoolean("system_runtime",true);return b;
+            b.putBoolean("system_runtime",true);b.putBoolean("probe",lease.probe());return b;
         }
         if("capture_report".equals(method)){capture=null;return Bundle.EMPTY;}
         return Bundle.EMPTY;
     }
     public synchronized boolean captureValid(String nonce,int user){
         RuntimeSnapshot config=current();
-        return user==0 && capture!=null && capture.taken() && capture.nonce().equals(nonce)
-                && config!=null && config.usable() && config.enabled && config.recognition && config.capture
+        return user==0 && capture!=null && capture.probe() && capture.taken() && capture.nonce().equals(nonce)
+                && config!=null && config.usable() && config.enabled && config.recognition && config.capture && config.scopeLinkProbe
                 && config.identity.equals(capture.identity());
     }
     /** Called at the public ATMS entry, before any launch locks; no Activity exists for this token. */

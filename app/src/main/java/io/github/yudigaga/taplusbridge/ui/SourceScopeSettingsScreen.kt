@@ -8,6 +8,7 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalWindowInfo
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
@@ -16,9 +17,10 @@ import androidx.compose.ui.state.ToggleableState
 import androidx.compose.ui.unit.dp
 import io.github.yudigaga.taplusbridge.config.SourceScopePolicy
 import top.yukonga.miuix.kmp.basic.*
+import top.yukonga.miuix.kmp.overlay.OverlayDialog
+import top.yukonga.miuix.kmp.preference.ArrowPreference
 import top.yukonga.miuix.kmp.preference.CheckboxPreference
 import top.yukonga.miuix.kmp.preference.RadioButtonPreference
-import top.yukonga.miuix.kmp.preference.SwitchPreference
 
 /** Both lists stay in the draft until one explicit save commits the selected mode and lists. */
 @Composable internal fun SourceScopeSettingsScreen(
@@ -27,25 +29,25 @@ import top.yukonga.miuix.kmp.preference.SwitchPreference
     onSaved: () -> Unit,
 ) {
     val initial = remember(controller) { controller.sourceScope() }
-    val configurationError = remember(controller) { controller.sourceScopeError() }
+    var managed by remember(controller) { mutableStateOf(initial.managed) }
+    var configurationError by remember(controller) { mutableStateOf(controller.sourceScopeError()) }
     val context = LocalContext.current
     var modeName by rememberSaveable { mutableStateOf(initial.mode.name) }
     var blacklist by rememberSaveable { mutableStateOf(ArrayList(initial.blacklist.sorted())) }
     var whitelist by rememberSaveable { mutableStateOf(ArrayList(initial.whitelist.sorted())) }
-    var captureFallback by rememberSaveable { mutableStateOf(controller.scopeCaptureEnabled()) }
-    var linkProbe by rememberSaveable { mutableStateOf(controller.scopeLinkProbeEnabled()) }
     var query by rememberSaveable { mutableStateOf("") }
+    var showPicker by rememberSaveable { mutableStateOf(false) }
     var saveError by rememberSaveable { mutableStateOf("") }
     val mode = SourceScopePolicy.Mode.valueOf(modeName)
     val selected = if (mode == SourceScopePolicy.Mode.BLACKLIST) blacklist else whitelist
     val appMap = remember(apps) { apps.associateBy { it.packageName } }
-    val found = remember(apps, query, selected) {
+    val candidates = remember(apps, query, selected) {
         val filter = query.trim()
-        val matches = apps.filter { it.label.contains(filter, true) || it.packageName.contains(filter, true) }
-        matches.filter { it.packageName in selected } + matches.filter { it.packageName !in selected }
+        apps.filter { it.packageName !in selected && (it.label.contains(filter, true) || it.packageName.contains(filter, true)) }
     }
-    val missing = remember(selected, appMap, query) {
-        selected.filter { it !in appMap && it.contains(query.trim(), true) }.sorted()
+    val selectedApps = remember(apps, selected) { apps.filter { it.packageName in selected } }
+    val missing = remember(selected, appMap) {
+        selected.filter { it !in appMap }.sorted()
     }
     fun select(packageName: String, checked: Boolean) {
         val next = selected.toMutableSet()
@@ -56,12 +58,13 @@ import top.yukonga.miuix.kmp.preference.SwitchPreference
     }
     fun discardDraft() {
         val persisted = controller.sourceScope()
+        managed = persisted.managed
+        configurationError = controller.sourceScopeError()
         modeName = persisted.mode.name
         blacklist = ArrayList(persisted.blacklist.sorted())
         whitelist = ArrayList(persisted.whitelist.sorted())
-        captureFallback = controller.scopeCaptureEnabled()
-        linkProbe = controller.scopeLinkProbeEnabled()
         query = ""
+        showPicker = false
         saveError = ""
     }
     Scaffold(
@@ -72,10 +75,15 @@ import top.yukonga.miuix.kmp.preference.SwitchPreference
                 subtitle = "选择传送门可使用的来源应用",
                 discardTag = "source_scope.back",
                 saveTag = "source_scope.save",
+                discardText = "放弃名单",
+                saveText = "保存名单",
                 onDiscard = ::discardDraft,
                 onSave = {
                     try {
-                        controller.saveSourceScope(mode, blacklist, whitelist, captureFallback, linkProbe)
+                        controller.saveSourceScope(mode, blacklist, whitelist)
+                        managed = controller.sourceScope().managed
+                        configurationError = controller.sourceScopeError()
+                        saveError = ""
                         Toast.makeText(context, "已保存；来源应用可能需要退出后重新进入", Toast.LENGTH_LONG).show()
                         onSaved()
                     } catch (error: RuntimeException) {
@@ -87,7 +95,7 @@ import top.yukonga.miuix.kmp.preference.SwitchPreference
         LazyColumn(Modifier.fillMaxSize().padding(padding).imePadding().testTag("source_scope.list"),
             contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             item {
-                QuietText(if (initial.managed) "设置来源应用是否允许触发传送门。返回可放弃本次修改。"
+                QuietText(if (managed) "修改暂存于本页，点击保存名单后生效；点击放弃名单可恢复已保存名单。"
                     else "保存后接管传送门的应用范围。首次保存前沿用传送门原设置。",
                     Modifier.padding(horizontal = 8.dp).testTag("source_scope.hint"))
             }
@@ -110,24 +118,6 @@ import top.yukonga.miuix.kmp.preference.SwitchPreference
                 }
             }
             item {
-                SettingsCard {
-                    SwitchPreference(captureFallback, { captureFallback = it; saveError = "" },
-                        title = "截图识别兜底", summary = "原生无法取数时，在允许的应用内松开长按后截图识别",
-                        modifier = Modifier.testTag("source_scope.capture_fallback")
-                            .semantics { toggleableState = if (captureFallback) ToggleableState.On else ToggleableState.Off })
-                }
-            }
-            item {
-                SettingsCard {
-                    SwitchPreference(linkProbe, { linkProbe = it; saveError = "" },
-                        title = "长按取链接", summary = "长按松开后自动点一次原位置，拦截网页启动并提取链接",
-                        modifier = Modifier.testTag("source_scope.link_probe")
-                            .semantics { toggleableState = if (linkProbe) ToggleableState.On else ToggleableState.Off })
-                    QuietText("链接补充到原生识别结果，保留图片和文字操作；截图仍由兜底开关控制。仅对确认会打开链接的入口使用，普通按钮可能执行原操作",
-                        Modifier.padding(start = 16.dp, end = 16.dp, bottom = 16.dp).testTag("source_scope.link_probe_hint"))
-                }
-            }
-            item {
                 QuietText(if (mode == SourceScopePolicy.Mode.BLACKLIST)
                     "已选 ${selected.size} 个应用不生效；空黑名单允许所有应用。"
                 else "已选 ${selected.size} 个应用生效；空白名单禁止所有应用。",
@@ -137,8 +127,10 @@ import top.yukonga.miuix.kmp.preference.SwitchPreference
                 QuietText(saveError, Modifier.padding(horizontal = 8.dp).testTag("source_scope.error"))
             }
             item {
-                TextField(query, { query = it }, label = "搜索应用名或包名", singleLine = true,
-                    modifier = Modifier.fillMaxWidth().testTag("source_scope.search"))
+                SettingsCard {
+                    ArrowPreference(title = "添加应用", summary = "从已安装应用中选择，添加后点击页面顶部保存名单",
+                        onClick = { query = ""; showPicker = true }, modifier = Modifier.testTag("source_scope.add"))
+                }
             }
             if (missing.isNotEmpty()) item { SectionLabel("已选应用 · 当前未安装或不可见") }
             items(missing, key = { "missing:$it" }) { packageName ->
@@ -149,22 +141,50 @@ import top.yukonga.miuix.kmp.preference.SwitchPreference
                             .semantics { toggleableState = ToggleableState.On })
                 }
             }
-            if (found.isNotEmpty()) item { SectionLabel("已安装应用") }
-            items(found, key = { it.packageName }) { app ->
+            if (selectedApps.isNotEmpty()) item { SectionLabel("已选应用") }
+            items(selectedApps, key = { it.packageName }) { app ->
                 SettingsCard {
                     CheckboxPreference(title = app.label, summary = app.packageName + if (app.enabled) "" else " · 已停用",
-                        checked = app.packageName in selected, onCheckedChange = { select(app.packageName, it) },
+                        checked = true, onCheckedChange = { select(app.packageName, it) },
                         startAction = { AppIcon(app.icon) }, modifier = Modifier.testTag("source_scope.app.${app.packageName}")
-                            .semantics { toggleableState = if (app.packageName in selected) ToggleableState.On else ToggleableState.Off })
+                            .semantics { toggleableState = ToggleableState.On })
                 }
             }
-            if (found.isEmpty() && missing.isEmpty()) item {
-                QuietText("没有找到应用，请调整搜索内容或确认应用已安装在当前用户中。", Modifier.padding(16.dp))
+            if (selected.isEmpty()) item {
+                QuietText("尚未选择应用，点击添加应用编辑当前名单。", Modifier.padding(horizontal = 8.dp).testTag("source_scope.empty"))
             }
             item { QuietText("切换模式会保留两份名单，只有当前模式生效。保存后，来源应用可能需要退出后重新进入。",
                 Modifier.padding(horizontal = 8.dp)) }
-            item { QuietText("截图识别兜底默认关闭，开启并保存后才生效。仅主用户、Android 13+；锁屏、安全窗口和显示输入法时不截图。",
+            item { QuietText("截图、识别通道与不可见点击可在识别页独立切换，开关立即保存；此页的保存和放弃只影响应用名单。",
                 Modifier.padding(horizontal = 8.dp).testTag("source_scope.fallback_hint")) }
+        }
+    }
+    if (showPicker) {
+        OverlayDialog(show = true, title = "添加应用", summary = "选择后暂存于名单，返回页面点击保存名单后生效。",
+            onDismissRequest = { showPicker = false }) {
+            Column(Modifier.fillMaxWidth().heightIn(max = LocalWindowInfo.current.containerDpSize.height * .62f).imePadding(),
+                verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                TextField(query, { query = it }, label = "搜索应用名或包名", singleLine = true,
+                    modifier = Modifier.fillMaxWidth().testTag("source_scope.search"))
+                LazyColumn(Modifier.fillMaxWidth().weight(1f, fill = false).testTag("source_scope.picker.list"),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    items(candidates, key = { it.packageName }) { app ->
+                        CheckboxPreference(title = app.label, summary = app.packageName + if (app.enabled) "" else " · 已停用",
+                            checked = false, onCheckedChange = { select(app.packageName, it) },
+                            startAction = { AppIcon(app.icon) }, modifier = Modifier.testTag("source_scope.candidate.${app.packageName}")
+                                .semantics { toggleableState = ToggleableState.Off })
+                    }
+                    if (candidates.isEmpty()) item {
+                        QuietText(when {
+                            apps.isEmpty() -> "当前用户没有可添加的应用。"
+                            query.isNotBlank() -> "没有匹配的未选应用，请调整搜索内容。"
+                            else -> "已安装应用均已加入当前名单。"
+                        }, Modifier.padding(16.dp).testTag("source_scope.picker.empty"))
+                    }
+                }
+                TextButton("完成", { showPicker = false }, Modifier.fillMaxWidth().testTag("source_scope.picker.close"),
+                    colors = ButtonDefaults.textButtonColorsPrimary())
+            }
         }
     }
 }

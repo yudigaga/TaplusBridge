@@ -20,12 +20,14 @@ import io.github.yudigaga.taplusbridge.capture.CaptureBroker;
 import io.github.yudigaga.taplusbridge.capture.IntentObservation;
 import io.github.yudigaga.taplusbridge.config.ConfigStore;
 import io.github.yudigaga.taplusbridge.config.DragSettings;
+import io.github.yudigaga.taplusbridge.config.RecognitionChannels;
 import io.github.yudigaga.taplusbridge.config.SourceScopePolicy;
 import io.github.yudigaga.taplusbridge.hook.HostPolicy;
 import io.github.yudigaga.taplusbridge.routing.RouteRule;
 import io.github.yudigaga.taplusbridge.rules.LinkRuleEntry;
 import io.github.yudigaga.taplusbridge.rules.RuleRepository;
 import io.github.yudigaga.taplusbridge.rules.RuleConfigTransfer;
+import io.github.yudigaga.taplusbridge.runtime.RuntimePublisher;
 import io.github.yudigaga.taplusbridge.thaw.ThawEngine;
 import io.github.yudigaga.taplusbridge.thaw.ShizukuAccess;
 import java.lang.ref.WeakReference;
@@ -118,12 +120,14 @@ public final class SettingsController implements AutoCloseable {
         public final long hostVersionCode;
         public final int versionCode;
         public final DragSettings dragSettings;
+        public final RecognitionChannels recognitionChannels;
         private Snapshot(ConfigStore config, boolean hostInstalled, boolean hostSupported,
                          String hostVersionName, long hostVersionCode, boolean shizukuGranted, String shizukuStatus) {
             enabled = config.enabled(); nativeEnabled = config.nativeEnabled();
             recognitionEnabled = config.recognitionEnabled(); captureEnabled = config.captureEnabled();
             lensEnabled = config.lensEnabled();
             dragSettings = config.getDragSettings();
+            recognitionChannels = config.recognitionChannels();
             mode = config.mode(); this.hostInstalled = hostInstalled; this.hostSupported = hostSupported;
             this.hostVersionName = hostVersionName; this.hostVersionCode = hostVersionCode;
             hostVersion = hostInstalled ? hostVersionName + " / " + hostVersionCode : "未安装传送门";
@@ -222,7 +226,21 @@ public final class SettingsController implements AutoCloseable {
         catch (IllegalArgumentException malformed) { return "应用范围配置损坏，请重新选择名单并保存"; }
     }
     public boolean scopeCaptureEnabled() { return config.scopeCaptureEnabled(); }
+    public void setScopeCaptureEnabled(boolean enabled) {
+        requireOpen(); config.setScopeCaptureEnabled(enabled);
+        RuntimePublisher.publishSavedSettings(context);
+    }
+    public RecognitionChannels recognitionChannels() { return config.recognitionChannels(); }
+    public void setRecognitionChannel(RecognitionChannels.Channel channel, boolean enabled) {
+        requireOpen(); config.setRecognitionChannel(channel, enabled);
+        RuntimePublisher.publishSavedSettings(context);
+    }
     public boolean scopeLinkProbeEnabled() { return config.scopeLinkProbeEnabled(); }
+    public void setScopeLinkProbeEnabled(boolean enabled) {
+        requireOpen(); config.setScopeLinkProbeEnabled(enabled);
+        if (!enabled) CaptureBroker.cancelProbe(context);
+        RuntimePublisher.publishSavedSettings(context);
+    }
     public void saveSourceScope(SourceScopePolicy.Mode mode, Collection<String> blacklist,
                                 Collection<String> whitelist) {
         requireOpen();
@@ -249,9 +267,16 @@ public final class SettingsController implements AutoCloseable {
         requireOpen(); config.setEnabled(enabled); if (!enabled) CaptureBroker.cancelCurrent(context);
     }
     public void setNativeEnabled(boolean enabled) { requireOpen(); config.setNativeEnabled(enabled); }
-    public void setLensEnabled(boolean enabled) { requireOpen(); config.setLensEnabled(enabled); }
+    public void setLensEnabled(boolean enabled) {
+        requireOpen(); config.setLensEnabled(enabled);
+        RuntimePublisher.publishSavedSettings(context);
+    }
     public DragSettings getDragSettings() { return config.getDragSettings(); }
     public void setDragSettings(DragSettings settings) { requireOpen(); config.setDragSettings(settings); }
+    public void setDragSettings(DragSettings settings, boolean linkProbe) {
+        requireOpen(); config.setDragSettings(settings, linkProbe);
+        if (!linkProbe) CaptureBroker.cancelProbe(context);
+    }
     public void setRecognitionEnabled(boolean enabled) {
         requireOpen(); config.setRecognitionEnabled(enabled); if (!enabled) CaptureBroker.cancelCurrent(context);
     }

@@ -1,7 +1,6 @@
 package io.github.yudigaga.taplusbridge.drag;
 
-import android.app.Activity;
-import android.app.AlertDialog;
+import androidx.activity.ComponentActivity;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.ComponentName;
@@ -34,6 +33,7 @@ import io.github.yudigaga.taplusbridge.config.DragSettings;
 import io.github.yudigaga.taplusbridge.hook.HostPolicy;
 import io.github.yudigaga.taplusbridge.runtime.RuntimeClient;
 import io.github.yudigaga.taplusbridge.ui.TransitActivity;
+import io.github.yudigaga.taplusbridge.ui.DragMenuUi;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -46,7 +46,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 
 /** A transient target for an already active global drag, launched only by system_server. */
-public final class DragActivity extends Activity {
+public final class DragActivity extends ComponentActivity {
     private static final String TAG = "TaplusBridge-Drag";
     private static final ExecutorService IO = Executors.newFixedThreadPool(2);
     private final Handler main = new Handler(Looper.getMainLooper());
@@ -177,9 +177,7 @@ public final class DragActivity extends Activity {
         }
         Log.i(TAG, "stage=link_selection outcome=available count=" + links.size());
         if (links.size() == 1) { action.accept(links.get(0)); return; }
-        new AlertDialog.Builder(this).setTitle("选择要打开的链接")
-                .setItems(links.toArray(new String[0]), (dialog, which) -> action.accept(links.get(which)))
-                .setNegativeButton("取消", (dialog, which) -> finish()).setOnCancelListener(dialog -> finish()).show();
+        DragMenuUi.showActions(this, "选择要打开的链接", links, index -> action.accept(links.get(index)));
     }
 
     private void rules(String url) {
@@ -276,8 +274,7 @@ public final class DragActivity extends Activity {
         String[] labels = new String[choices.size()];
         for (int i = 0; i < choices.size(); i++) labels[i] = choices.get(i).loadLabel(getPackageManager()).toString()
                 + "\n" + choices.get(i).activityInfo.packageName;
-        new AlertDialog.Builder(this).setTitle(title).setItems(labels, (dialog, which) -> selected.accept(choices.get(which)))
-                .setNegativeButton("取消", (dialog, which) -> finish()).setOnCancelListener(dialog -> finish()).show();
+        DragMenuUi.showActions(this, title, java.util.Arrays.asList(labels), index -> selected.accept(choices.get(index)));
     }
 
     private void handoff(String action, boolean recognize) {
@@ -339,39 +336,10 @@ public final class DragActivity extends Activity {
             return;
         }
         String title = "选择用于" + actionLabel(action) + "的内容";
-        if (choice.payload().image != null && choice.recognizedText().isBlank()) title += "\n未识别到图片文字，可选择已有内容";
-        if (urlsOnly) {
-            String[] labels = contents.stream().map(Content::label).toArray(String[]::new);
-            int[] selected = {0};
-            new AlertDialog.Builder(this).setTitle(title).setSingleChoiceItems(labels, 0, (dialog, index) -> selected[0] = index)
-                    .setPositiveButton("执行" + actionLabel(action), (dialog, which) -> applyChoice(action, contents, new boolean[]{true}, selected[0]))
-                    .setNegativeButton("取消", (dialog, which) -> finish()).setOnCancelListener(dialog -> finish()).show();
-            return;
-        }
-        boolean hasAll = contents.size() > 1;
-        String[] labels = new String[contents.size() + (hasAll ? 1 : 0)];
-        boolean[] checked = new boolean[labels.length]; java.util.Arrays.fill(checked, true);
-        int offset = hasAll ? 1 : 0;
-        if (hasAll) labels[0] = "全部内容";
-        for (int i = 0; i < contents.size(); i++) labels[i + offset] = contents.get(i).label;
-        AlertDialog dialog = new AlertDialog.Builder(this).setTitle(title)
-                .setMultiChoiceItems(labels, checked, (window, index, selected) -> {
-                    checked[index] = selected;
-                    AlertDialog popup = (AlertDialog) window;
-                    if (hasAll && index == 0) {
-                        for (int i = 1; i < checked.length; i++) { checked[i] = selected; popup.getListView().setItemChecked(i, selected); }
-                    } else if (hasAll) {
-                        boolean every = true; for (int i = 1; i < checked.length; i++) every &= checked[i];
-                        checked[0] = every; popup.getListView().setItemChecked(0, every);
-                    }
-                }).setPositiveButton("执行" + actionLabel(action), null)
-                .setNegativeButton("取消", (window, which) -> finish()).setOnCancelListener(window -> finish()).create();
-        dialog.setOnShowListener(window -> dialog.getButton(android.content.DialogInterface.BUTTON_POSITIVE).setOnClickListener(button -> {
-            boolean[] selected = new boolean[contents.size()];
-            for (int i = 0; i < selected.length; i++) selected[i] = checked[i + offset];
-            if (applyChoice(action, contents, selected, -1)) dialog.dismiss();
-        }));
-        dialog.show();
+        String summary = choice.payload().image != null && choice.recognizedText().isBlank()
+                ? "未识别到图片文字，可选择已有内容" : urlsOnly ? "每次打开一个链接" : "可同时选择多种内容";
+        DragMenuUi.showSelection(this, title, summary, java.util.Arrays.asList(contents.stream().map(Content::label).toArray(String[]::new)),
+                !urlsOnly, "执行" + actionLabel(action), checked -> applyChoice(action, contents, checked, -1));
     }
 
     private boolean applyChoice(String action, List<Content> contents, boolean[] checked, int single) {

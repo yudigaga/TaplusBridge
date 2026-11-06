@@ -12,6 +12,8 @@ import android.os.SystemClock;
 import io.github.libxposed.api.XposedInterface;
 import io.github.libxposed.api.XposedModule;
 import io.github.yudigaga.taplusbridge.runtime.RuntimeClient;
+import io.github.yudigaga.taplusbridge.config.RecognitionChannels;
+import io.github.yudigaga.taplusbridge.config.RecognitionChannels.Channel;
 import java.io.IOException;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
@@ -84,6 +86,12 @@ public final class HostScopeCaptureHooks {
                     Object outcome = chain.proceed();
                     try {
                         if (chain.getThisObject() instanceof Context context && supported(context)
+                                && chain.getArg(0) instanceof Intent intent
+                                && io.github.yudigaga.taplusbridge.probe.SystemScopeCapture.LINK_PREPARE.equals(intent.getAction())) {
+                            String nonce=intent.getStringExtra("link_nonce");
+                            if(nonce!=null && nonce.matches("[A-Za-z0-9_-]{32}"))
+                                prepareLinkWindow(context,chain.getThisObject(),nonce,SystemClock.elapsedRealtime());
+                        } else if (chain.getThisObject() instanceof Context context && supported(context)
                                 && chain.getArg(0) instanceof Intent intent && ACTION.equals(intent.getAction())) {
                             String nonce = intent.getStringExtra("scope_nonce");
                             if (nonce != null && nonce.matches("[A-Za-z0-9_-]{16,128}") && claim(nonce)) {
@@ -145,7 +153,8 @@ public final class HostScopeCaptureHooks {
                         if (admitted != null && chain.getThisObject() instanceof Context context && supported(context)) {
                             if (admission == admitted) admission = null;
                             if (!admitted.synthetic && SystemClock.elapsedRealtime() - admitted.at <= 10_000) {
-                                nativeCapture = new NativeCapture(admitted.source, admitted.at);
+                                if (RecognitionPolicy.read(context).enabled(Channel.NATIVE))
+                                    nativeCapture = new NativeCapture(admitted.source, admitted.at);
                                 reportContext = context;
                             }
                         }
@@ -153,7 +162,7 @@ public final class HostScopeCaptureHooks {
                         if (reportContext != null) {
                             boolean hasValidUrl = HostDragHooks.nativeUrlAvailable(admitted.service, admitted.result);
                             if (!hasValidUrl) try {
-                                String text = nativeText(admitted.result);
+                                String text = RecognitionPolicy.nativeText(admitted.result, RecognitionPolicy.read(reportContext));
                                 hasValidUrl = !io.github.yudigaga.taplusbridge.recognition.LinkExtractor.extract(
                                         text == null ? "" : text).isEmpty();
                             } catch (ReflectiveOperationException | RuntimeException ignored) { }
@@ -193,6 +202,39 @@ public final class HostScopeCaptureHooks {
         nonces.put(nonce, now); return true;
     }
 
+    private void prepareLinkWindow(Context context,Object service,String nonce,long started) {
+        Bundle request=new Bundle();request.putString("nonce",nonce);
+        worker.execute(()->{
+            Bundle check=RuntimeClient.call(context,"scope_link_window_check",request);
+            if(check==null && SystemClock.elapsedRealtime()-started<4_000){
+                main.postDelayed(()->prepareLinkWindow(context,service,nonce,started),100);return;
+            }
+            if(check==null || !check.getBoolean("accepted"))return;
+            main.post(()->{
+                try {
+                    AutoCloseable lease=io.github.yudigaga.taplusbridge.probe.HostProbeWindow.passthroughOwnedWindows(service);
+                    main.postDelayed(()->{
+                        Bundle ready=RuntimeClient.call(context,"scope_link_window_ready",request);
+                        if(ready==null || !ready.getBoolean("accepted")){closeLinkWindow(lease);return;}
+                        pollLinkWindow(context,request,lease,SystemClock.elapsedRealtime()+8_000);
+                    },64);
+                } catch(ReflectiveOperationException | RuntimeException failure){report("link_window",failure);}
+            });
+        });
+    }
+
+    private void pollLinkWindow(Context context,Bundle request,AutoCloseable lease,long until) {
+        main.postDelayed(()->worker.execute(()->{
+            Bundle state=RuntimeClient.call(context,"scope_link_window_check",request);
+            if(SystemClock.elapsedRealtime()>=until || state!=null && !state.getBoolean("accepted"))
+                main.post(()->closeLinkWindow(lease));
+            else pollLinkWindow(context,request,lease,until);
+        }),100);
+    }
+    private static void closeLinkWindow(AutoCloseable lease) {
+        try {lease.close();} catch(Exception ignored) { }
+    }
+
     private void take(Context context, Object service, String nonce, long requestedAt, int attempt) {
         try {
             if (SystemClock.elapsedRealtime() - requestedAt > 5000) return;
@@ -206,7 +248,8 @@ public final class HostScopeCaptureHooks {
                 return;
             }
             Object descriptor = response.get("fd");
-            if ("text".equals(response.get("kind")) || "resume".equals(response.get("kind"))) {
+            if ("text".equals(response.get("kind")) || "resume".equals(response.get("kind"))
+                    || "content".equals(response.get("kind"))) {
                 try {
                     ScopeCapturePayload.Metadata metadata = ScopeCapturePayload.validate(response, SystemClock.elapsedRealtime());
                     String url = response.getString("url");
@@ -244,18 +287,23 @@ public final class HostScopeCaptureHooks {
             Bundle current = RuntimeClient.call(context, "source_scope", Bundle.EMPTY);
             String identity = response.getString("scope_identity");
             boolean text = "text".equals(metadata.kind());
+            boolean provided = "content".equals(metadata.kind());
             boolean linkMode = current != null && current.getBoolean("scope_link_probe_enabled");
-            if (current == null || !("image".equals(metadata.kind()) ? current.getBoolean("scope_capture_enabled") || linkMode : linkMode) || identity == null
+            if (current == null || !("image".equals(metadata.kind()) ? current.getBoolean("scope_capture_enabled") || linkMode
+                    : provided ? current.getBoolean("source_content_enabled") : linkMode) || identity == null
                     || !identity.equals(current.getString("identity"))) return;
             NativeCapture nativeResult = nativeCapture;
-            if (!current.getBoolean("scope_link_probe_enabled") && nativeResult != null && nativeResult.source().equals(metadata.source())
-                    && nativeResult.at() >= response.getLong("gesture_elapsed", metadata.capturedElapsed())) return;
+            RecognitionChannels channels = RecognitionPolicy.read(context);
+            if (channels.enabled(Channel.NATIVE) && !current.getBoolean("scope_link_probe_enabled") && nativeResult != null && nativeResult.source().equals(metadata.source())
+                    && nativeResult.at() >= response.getLong("gesture_elapsed", metadata.capturedElapsed())
+                    && !ScopeCapturePayload.validContent(response.get("text"))) return;
             PackageInfo info = context.getPackageManager().getPackageInfo(metadata.source(), 0);
             if (info.applicationInfo == null || info.applicationInfo.uid != metadata.uid()) throw new IllegalStateException("scope_capture_identity");
             PendingNative.Picks originals = pendingNative.take(metadata.source(), identity,
                     response.getLong("gesture_elapsed", metadata.capturedElapsed()), metadata.capturedElapsed(), SystemClock.elapsedRealtime());
             NativeContents contents = nativeContents(originals);
-            String originalText = contents.text();
+            String originalText = channels.enabled(Channel.NATIVE) ? contents.text() : null;
+            String sourceText = channels.enabled(Channel.ASSIST) ? response.getString("text") : null;
             Object result;
             boolean usesBitmap = false;
             if (contents.image() != null) result = payloads.enrich(contents.image(), url);
@@ -264,8 +312,20 @@ public final class HostScopeCaptureHooks {
                 usesBitmap = true;
             } else if (originals.text() != null) result = payloads.enrich(originals.text(), url);
             else if (text) result = payloads.createText(metadata, url, info.versionCode, nonce);
+            else if (provided && ScopeCapturePayload.validContent(sourceText))
+                result = payloads.createContent(metadata, sourceText, url, info.versionCode, nonce);
+            else if (provided && ScopeCapturePayload.validTextUrl(url))
+                result = payloads.createContent(metadata, url, url, info.versionCode, nonce);
             else return;
-            attachContent(result, originalText, linkMode && (contents.image() != null || usesBitmap));
+            attachContent(result, sourceText, (linkMode || originalText != null || sourceText != null)
+                    && (contents.image() != null || usesBitmap));
+            if (originalText != null) {
+                Object raw = result.getClass().getMethod("getPropertyMap").invoke(result);
+                if (raw instanceof Map<?, ?> properties) {
+                    @SuppressWarnings("unchecked") Map<String, Object> flags = (Map<String, Object>) properties;
+                    flags.put("taplus_native_text", originalText);
+                }
+            }
             Object listener = callback.get(service);
             if (listener == null) throw new IllegalStateException("scope_capture_callback_missing");
             synthetic.set(true);

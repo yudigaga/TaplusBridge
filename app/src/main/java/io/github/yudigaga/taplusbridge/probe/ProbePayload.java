@@ -36,6 +36,45 @@ public final class ProbePayload {
         }
     }
 
+    /** Read actual URL values from a same-source page launch, without naming individual applications. */
+    static String uniqueSourcePageUrl(Intent intent, String source) {
+        if (intent == null || intent.getComponent() == null
+                || !source.equals(intent.getComponent().getPackageName())) return null;
+        try {
+            GenericScan scan = new GenericScan();
+            String data = intent.getDataString();
+            if (data != null) scan.add(data);
+            scan.visit(intent.getExtras(), 0);
+            return !scan.invalid && scan.urls.size() == 1 ? scan.urls.iterator().next() : null;
+        } catch (RuntimeException unreadable) { return null; }
+    }
+
+    private static final class GenericScan {
+        final Set<Bundle> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+        final Set<String> urls = new LinkedHashSet<>();
+        int nodes;
+        boolean invalid;
+        void add(String value) {
+            if (IntentObservation.validHttpUrl(value)) urls.add(value);
+            if (urls.size() > IntentObservation.MAX_URLS) invalid = true;
+        }
+        @SuppressWarnings("deprecation") void visit(Bundle bundle, int depth) {
+            if (bundle == null || !seen.add(bundle)) return;
+            if (depth > IntentObservation.MAX_DEPTH) { invalid = true; return; }
+            for (String key : bundle.keySet()) {
+                if (++nodes > IntentObservation.MAX_NODES) { invalid = true; return; }
+                String lower = key == null ? "" : key.toLowerCase(java.util.Locale.ROOT);
+                if (lower.contains("thumb") || lower.contains("icon") || lower.contains("image")
+                        || lower.contains("cover") || lower.contains("avatar")) continue;
+                Object value = bundle.get(key);
+                if (value instanceof String text && (Intent.EXTRA_TEXT.equals(key)
+                        || Set.of("url","rawurl","weburl","link","href","landingpage","destination","targeturl","uri")
+                        .contains(lower.replace("_","").replace("-","")))) add(text);
+                else if (value instanceof Bundle nested) visit(nested, depth + 1);
+            }
+        }
+    }
+
     @SuppressWarnings("deprecation")
     private static void scan(Bundle bundle, int depth, Scan scan) {
         if (bundle == null || scan.incomplete || !scan.visited.add(bundle)) return;

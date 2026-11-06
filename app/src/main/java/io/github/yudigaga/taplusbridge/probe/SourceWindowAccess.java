@@ -56,16 +56,18 @@ public final class SourceWindowAccess {
 
     /** Where a card tap may go. A covering menu is dismissed somewhere else first; the card point is not clicked while covered. */
     public static final class CardPlan {
-        private final boolean dismiss;
+        private final boolean dismiss, popupCovered;
         private final float dismissX, dismissY;
-        private CardPlan(boolean dismiss, float dismissX, float dismissY) {
-            this.dismiss = dismiss; this.dismissX = dismissX; this.dismissY = dismissY;
+        private CardPlan(boolean dismiss, boolean popupCovered, float dismissX, float dismissY) {
+            this.dismiss = dismiss; this.popupCovered = popupCovered;
+            this.dismissX = dismissX; this.dismissY = dismissY;
         }
         public boolean dismiss() { return dismiss; }
+        public boolean popupCovered() { return popupCovered; }
         public float dismissX() { return dismissX; }
         public float dismissY() { return dismissY; }
-        static CardPlan tap() { return new CardPlan(false, 0, 0); }
-        static CardPlan dismiss(float x, float y) { return new CardPlan(true, x, y); }
+        static CardPlan tap() { return new CardPlan(false, false, 0, 0); }
+        static CardPlan dismiss(float x, float y, boolean popupCovered) { return new CardPlan(true, popupCovered, x, y); }
     }
 
     public CardPlan planCardTap(Object atms, String source, String activity, int uid, int user,
@@ -82,14 +84,12 @@ public final class SourceWindowAccess {
                     && (window == focus || sourceMain(window, source, activity, uid, user, x, y))))
                 return CardPlan.tap();
             if (coveringMenu(window, focus, source, activity, uid, user, x, y)) {
-                float[] outside = outsideMenu(window, x, y);
-                if (outside == null) throw new Rejected();
-                return CardPlan.dismiss(outside[0], outside[1]);
+                return CardPlan.dismiss(x, y, true);
             }
         }
         ProbeClickPlan.Window kind = inspect(atms, source, activity, uid, user, display, x, y);
         if (kind == ProbeClickPlan.Window.MAIN) return CardPlan.tap();
-        if (kind == ProbeClickPlan.Window.OUTSIDE_POPUP) return CardPlan.dismiss(x, y);
+        if (kind == ProbeClickPlan.Window.OUTSIDE_POPUP) return CardPlan.dismiss(x, y, false);
         throw new Rejected();
     }
 
@@ -141,26 +141,6 @@ public final class SourceWindowAccess {
                 && (parent == main || parent == null) && popupBounds != null && mainBounds != null
                 && popupBounds.contains((int) x, (int) y) && mainBounds.contains((int) x, (int) y)
                 && Boolean.TRUE.equals(visible.invoke(window)) && Boolean.TRUE.equals(visible.invoke(main));
-    }
-
-    private float[] outsideMenu(Object popup, float avoidX, float avoidY) throws ReflectiveOperationException {
-        Object record = activityRecord.get(popup);
-        Object main = record == null ? null : mainWindow.invoke(record, false);
-        Rect menu = (Rect) frame.invoke(popup);
-        Rect bounds = main == null ? null : (Rect) frame.invoke(main);
-        if (menu == null || bounds == null) return null;
-        float[][] candidates = {
-                {bounds.right - 3f, bounds.top + 2f}, {bounds.left + 2f, bounds.bottom - 3f},
-                {bounds.right - 3f, bounds.bottom - 3f}, {bounds.left + 2f, bounds.top + 2f}
-        };
-        for (float[] point : candidates) {
-            if (point[0] < bounds.left || point[0] >= bounds.right || point[1] < bounds.top || point[1] >= bounds.bottom)
-                continue;
-            if (menu.contains((int) point[0], (int) point[1])) continue;
-            if (Math.hypot(point[0] - avoidX, point[1] - avoidY) < 48f) continue;
-            return point;
-        }
-        return null;
     }
 
     public ProbeClickPlan.Window inspect(Object atms, String source, String activity, int uid, int user,

@@ -4,6 +4,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.graphics.Bitmap;
 import android.os.Bundle;
+import io.github.yudigaga.taplusbridge.config.RecognitionChannels.Channel;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
@@ -147,12 +148,17 @@ public final class HostDragHooks {
                 .intercept(chain -> {
                     Object outcome = chain.proceed();
                     if (chain.getThisObject() instanceof Context context && chain.getArg(0) instanceof Intent intent
-                            && ACTION.equals(intent.getAction())) {
+                            && (ACTION.equals(intent.getAction())
+                            || io.github.yudigaga.taplusbridge.drag.SystemLongPressDrag.ACTION_PREPARE.equals(intent.getAction()))) {
                         String token = intent.getStringExtra("drag_token");
                         if (token != null && token.matches("[A-Za-z0-9_-]{43}")) {
-                            long epoch = generation.incrementAndGet(); pending = null;
                             Object target = chain.getThisObject();
-                            worker.execute(() -> take(context, target, token, epoch));
+                            if (io.github.yudigaga.taplusbridge.drag.SystemLongPressDrag.ACTION_PREPARE.equals(intent.getAction()))
+                                longPress.prepare(context, target, token);
+                            else {
+                                long epoch = generation.incrementAndGet(); pending = null;
+                                worker.execute(() -> take(context, target, token, epoch));
+                            }
                         }
                     }
                     return outcome;
@@ -205,20 +211,20 @@ public final class HostDragHooks {
             var info = context.getPackageManager().getPackageInfo(source, 0);
             var metrics = context.getResources().getDisplayMetrics();
             Bundle nativeData = new Bundle(data);
-            if (recognitionMode && image != null) { nativeData.putString("text", ""); nativeData.remove("links"); }
-            Object result = nativeResult == null ? payloads.create(nativeData, token, (int) info.getLongVersionCode(),
+            Object acceptedNative = RecognitionPolicy.current(context).disabled(Channel.NATIVE) ? null : nativeResult;
+            Object result = acceptedNative == null ? payloads.create(nativeData, token, (int) info.getLongVersionCode(),
                     metrics.widthPixels, metrics.heightPixels, image) : null;
             Bitmap ready = image;
             main.post(() -> {
                 if (epoch != generation.get()) { if (ready != null) ready.recycle(); return; }
                 try {
-                    boolean preserveNative = nativeResult != null;
+                    boolean preserveNative = acceptedNative != null;
                     Object target = result;
                     boolean reuse = false;
                     if (preserveNative) {
                         Object root = mainView.get(service);
                         boolean attached = root != null && attachedView.get(root) instanceof View view && view.isAttachedToWindow();
-                        boolean taskFinished = finished.getBoolean(null), sameResult = catcherResult.get(null) == nativeResult;
+                        boolean taskFinished = finished.getBoolean(null), sameResult = catcherResult.get(null) == acceptedNative;
                         int mode = nativeTarget(taskFinished, sameResult, attached);
                         module.log(4, "TaplusBridge", "drag delivery stage=native_target action=" + action
                                 + " mode=" + mode + " finished=" + taskFinished + " same_result=" + sameResult
@@ -229,7 +235,7 @@ public final class HostDragHooks {
                         }
                         reuse = mode == 1;
                         // The authorized result also owns metadata and extra jobs needed for hidden card links.
-                        target = nativeResult;
+                        target = acceptedNative;
                         if (!reuse && ready != null) ready.recycle();
                     } else cancel.invoke(service);
                     Object selected = target;
@@ -282,6 +288,24 @@ public final class HostDragHooks {
                 if (next.recognition) {
                     switchMode.invoke(card, true);
                     if (next.image && !Boolean.TRUE.equals(hasRefreshed.invoke(card))) refreshImageRecognition.invoke(card);
+                    RecognitionPolicy.State policy = RecognitionPolicy.current(context);
+                    if (policy.disabled(Channel.SEGMENT)) {
+                        boolean ocrComplete = recognitionHooks != null
+                                && recognitionHooks.ocrComplete(service, next.result, next.recognitionEpoch);
+                        if (shouldCompleteWithoutSegments(next.image, false, !policy.disabled(Channel.OCR), ocrComplete)) {
+                            RecognitionHooks.DragSnapshot captured = dragSnapshot(service, next);
+                            if (recognitionHooks != null && captured == null && next.recognitionEpoch >= 0) {
+                                pending = null; return;
+                            }
+                            if (recognitionHooks != null && (captured == null || captured.waiting())) {
+                                main.postDelayed(() -> perform(context, service, next), 100); return;
+                            }
+                            if (next.image && !policy.disabled(Channel.OCR) && recognitionHooks != null)
+                                next.recognizedText = recognitionHooks.ocrText(service, next.result, next.recognitionEpoch);
+                            completeRecognition(context, service, next, next.recognizedText); return;
+                        }
+                        main.postDelayed(() -> perform(context, service, next), 100); return;
+                    }
                     Object textCard = getItem.invoke(adapter.get(card), 0);
                     int count = (Integer) segmentCount.invoke(textCard);
                     if (!Boolean.TRUE.equals(isLoading.invoke(textCard))
@@ -336,8 +360,15 @@ public final class HostDragHooks {
                 && selectAll.get(textCard) instanceof View button && button.isEnabled()) button.performClick();
     }
 
+    static boolean shouldCompleteWithoutSegments(boolean image, boolean segmentEnabled, boolean ocrEnabled, boolean ocrComplete) {
+        return !segmentEnabled && (!image || !ocrEnabled || ocrComplete);
+    }
+
     private void completeRecognition(Context context, Object service, Pending next, String text) {
         if (pending != next || generation.get() != next.generation) return;
+        final String acceptedText;
+        try { acceptedText = RecognitionPolicy.recognizedText(next.result, next.image, text, RecognitionPolicy.read(context)); }
+        catch (ReflectiveOperationException | RuntimeException unavailable) { fail(context, next, unavailable); return; }
         RecognitionHooks.DragSnapshot captured = dragSnapshot(service, next);
         if (recognitionHooks != null && captured == null && next.recognitionEpoch >= 0) {
             pending = null; return;
@@ -348,7 +379,7 @@ public final class HostDragHooks {
         worker.execute(() -> {
             if (generation.get() != next.generation) return;
             try {
-                Bundle request = new Bundle(); request.putString("token", next.token); request.putString("text", text);
+                Bundle request = new Bundle(); request.putString("token", next.token); request.putString("text", acceptedText);
                 request.putStringArrayList("links", new ArrayList<>(links));
                 Bundle completed = BridgeTransport.call(context, "drag_complete", request);
                 if (completed == null || completed.getString("token") == null) throw new IllegalStateException("drag_expired");

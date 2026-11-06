@@ -4,6 +4,7 @@ import android.content.Context;
 import io.github.yudigaga.taplusbridge.BuildConfig;
 import io.github.yudigaga.taplusbridge.config.ConfigStore;
 import io.github.yudigaga.taplusbridge.config.DragSettings;
+import io.github.yudigaga.taplusbridge.config.RecognitionChannels;
 import io.github.yudigaga.taplusbridge.config.SourceScopePolicy;
 import io.github.yudigaga.taplusbridge.rules.LinkRuleEntry;
 import io.github.yudigaga.taplusbridge.rules.RuleRepository;
@@ -17,21 +18,22 @@ import org.json.JSONObject;
 /** One framework-owned preference value: no URLs, tickets or chat data. */
 public final class RuntimeSnapshot {
     public static final String GROUP="taplus-runtime-v1", KEY="owner_configuration";
-    public static final int SCHEMA=5, MAX_BYTES=364_000;
+    public static final int SCHEMA=6, MAX_BYTES=364_000;
     public final int user,build;
     public final boolean enabled,recognition,capture,nativeLinks,independent,scopeCapture,scopeLinkProbe;
     public final List<LinkRuleEntry> rules;
     public final SourceScopePolicy sourceScope;
     public final DragSettings drag;
+    public final RecognitionChannels channels;
     public final String identity;
     private final String raw;
     private RuntimeSnapshot(String raw,int user,int build,boolean enabled,boolean recognition,boolean capture,
                             boolean nativeLinks,boolean independent,List<LinkRuleEntry> rules,SourceScopePolicy sourceScope,
-                            boolean scopeCapture,boolean scopeLinkProbe,DragSettings drag) {
+                            boolean scopeCapture,boolean scopeLinkProbe,DragSettings drag,RecognitionChannels channels) {
         this.raw=raw;this.user=user;this.build=build;this.enabled=enabled;this.recognition=recognition;
         this.capture=capture;this.nativeLinks=nativeLinks;this.independent=independent;this.rules=rules;
         this.sourceScope=sourceScope;this.scopeCapture=scopeCapture;this.scopeLinkProbe=scopeLinkProbe;
-        this.drag=drag;
+        this.drag=drag;this.channels=channels;
         this.identity=digest(raw);
     }
     public static String from(Context context) {
@@ -46,6 +48,7 @@ public final class RuntimeSnapshot {
             data.put(ConfigStore.SCOPE_CAPTURE_KEY,config.scopeCaptureEnabled());
             data.put(ConfigStore.SCOPE_LINK_PROBE_KEY,config.scopeLinkProbeEnabled());
             data.put(DragSettings.KEY,new JSONObject(config.getDragSettings().toJson()));
+            data.put(RecognitionChannels.KEY,new JSONObject(config.recognitionChannels().toJson()));
             JSONArray array=new JSONArray();for(String rule:ScopedRuleResolver.encode(new RuleRepository(context).effectiveRules()))array.put(rule);
             data.put("rules",array);String raw=data.toString();parse(raw);return raw;
         }catch(org.json.JSONException failure){throw new IllegalStateException("configuration_invalid");}
@@ -61,7 +64,8 @@ public final class RuntimeSnapshot {
                     || (schema==1 && data.has(SourceScopePolicy.KEY))
                     || (schema<3 && data.has(ConfigStore.SCOPE_CAPTURE_KEY))
                     || (schema<4 && data.has(ConfigStore.SCOPE_LINK_PROBE_KEY))
-                    || (schema<5 && data.has(DragSettings.KEY)))throw new IllegalArgumentException();
+                    || (schema<5 && data.has(DragSettings.KEY))
+                    || (schema<6 && data.has(RecognitionChannels.KEY)))throw new IllegalArgumentException();
             int user=data.getInt("user"),build=data.getInt("build");
             if(user!=0 || build<=0)throw new IllegalArgumentException();
             if(!java.util.Set.of("ROOT","SHIZUKU").contains(data.getString("mode")))throw new IllegalArgumentException();
@@ -77,7 +81,8 @@ public final class RuntimeSnapshot {
                     bool(data,"native"),bool(data,"independent"),ScopedRuleResolver.decode(wire),sourceScope,
                     schema>=3 && bool(data,ConfigStore.SCOPE_CAPTURE_KEY),
                     schema>=4 && bool(data,ConfigStore.SCOPE_LINK_PROBE_KEY),
-                    schema>=5 ? DragSettings.parse(data.getJSONObject(DragSettings.KEY).toString()) : DragSettings.defaults());
+                    schema>=5 ? DragSettings.parse(data.getJSONObject(DragSettings.KEY).toString()) : DragSettings.defaults(),
+                    schema>=6 ? RecognitionChannels.parse(data.getJSONObject(RecognitionChannels.KEY).toString()) : RecognitionChannels.defaults());
         }catch(org.json.JSONException|RuntimeException invalid){throw new IllegalArgumentException("configuration_invalid");}
     }
     private static boolean bool(JSONObject data,String key)throws org.json.JSONException {

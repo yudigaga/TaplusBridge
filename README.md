@@ -1,5 +1,9 @@
 # taplusbridge
 
+当前正式版：**0.15.34 / 66**。
+
+设置已整理为「概览、识别、应用、规则」四页，支持点选和横向滑动。识别通道及补点等开关即时保存并同步；应用名单与手势草稿分别显式保存，系统生效状态以「系统已确认配置」为准。详细变化见 [0.15.34 更新说明](docs/release-notes-0.15.34.md)。
+
 面向传送门 4.1.3 / 40013 和 5.1.5 / 50015 的 libxposed API 102 模块。按链接规则把识别到的网址交给指定应用打开，支持冻结目标的 Root 或 Shizuku 解冻。
 
 5.1.5 的反编译结果、适配依据和本地验证见 [适配报告](docs/2026-11-01_apk-taplus-5.1.5-report.md)。
@@ -98,7 +102,7 @@
 
 需要 JDK 21、Android SDK 37 和 Gradle Wrapper。Release 构建需要本机 `keystore.properties`，其中设置 `storeFile`、`storePassword`、`keyAlias` 和 `keyPassword`。签名文件和属性不提交到仓库。
 
-0.15.26／58 的 Release 继续启用 R8 代码裁剪、优化和混淆，使用 Android 默认优化规则及 `app/proguard-rules.pro` 的外部入口保留规则。每次交付应一并归档本次构建的 `mapping.txt`，用于还原崩溃堆栈。
+0.15.34／66 的 Release 继续启用 R8 代码裁剪、优化和混淆，使用 Android 默认优化规则及 `app/proguard-rules.pro` 的外部入口保留规则。每次交付应一并归档本次构建的 `mapping.txt`，用于还原崩溃堆栈。
 
 ```powershell
 .\gradlew.bat :app:lintRelease :app:assembleRelease

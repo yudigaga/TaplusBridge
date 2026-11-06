@@ -19,6 +19,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalWindowInfo
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.toggleableState
+import androidx.compose.ui.state.ToggleableState
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -39,6 +42,7 @@ import java.nio.charset.CodingErrorAction
     controller: SettingsController,
     apps: List<SettingsController.AppEntry>,
     revision: Int,
+    nativeEnabled: Boolean,
     bottomBar: @Composable () -> Unit,
     onChanged: () -> Unit,
 ) {
@@ -185,8 +189,10 @@ import java.nio.charset.CodingErrorAction
                 }
                 item {
                     SettingsCard {
-                        ArrowPreference(title = "在线规则", summary = "本地缓存 r${online.revision} · ${online.ruleCount} 条" + if (online.sourceName.isNullOrBlank()) "" else " · ${online.sourceName}",
-                            onClick = { dialog = "online" }, modifier = Modifier.testTag("rules.online"), endActions = { Tag(if (updating) "同步中" else "管理") })
+                        ArrowPreference(title = "打开行为", summary = "原生目标兜底${if (nativeEnabled) "已开启" else "已关闭"} · 域名规则优先",
+                            onClick = { dialog = "behavior" }, modifier = Modifier.testTag("rules.behavior"))
+                        ArrowPreference(title = "规则管理", summary = "在线规则、手动规则导入导出与清空",
+                            onClick = { dialog = "manage" }, modifier = Modifier.testTag("rules.manage"))
                     }
                 }
                 if (groups.isEmpty()) item {
@@ -224,50 +230,71 @@ import java.nio.charset.CodingErrorAction
                             Modifier.padding(start = 68.dp, end = 16.dp, bottom = 16.dp))
                     }
                 }
-                item { SectionLabel("规则工具") }
-                item {
-                    SettingsCard {
-                        ArrowPreference(title = "导入手动规则", summary = "兼容 IceBridge JSON 规则文件", onClick = { importer.launch(arrayOf("application/json", "text/plain", "application/octet-stream")) }, modifier = Modifier.testTag("rules.import"))
-                        ArrowPreference(title = "导出手动规则", summary = "保存来源、网站、目标与备注", onClick = {
-                            try { pendingExport = controller.exportRules(); exporter.launch("TaplusBridge-rules.json") }
-                            catch (error: RuntimeException) { message = error.message ?: "导出失败"; dialog = "message" }
-                        }, modifier = Modifier.testTag("rules.export"))
-                        ArrowPreference(title = "清空手动规则", summary = "保留已校验的在线规则", onClick = { dialog = "clear" }, modifier = Modifier.testTag("rules.clear"))
-                    }
-                }
                 item { QuietText("同一域名有多个可用目标时不会猜测。停用不使用的应用，或添加更明确的手动规则。", Modifier.padding(8.dp)) }
             }
         }
     }
-    if (picker != null) ApplicationPicker(apps, picker == "source", {
-        if (picker == "source") draftSource = it else draftTarget = it
-        picker = null
-    }) { picker = null }
-    when (dialog) {
+    if (picker != null) {
+        ApplicationPicker(apps, picker == "source", {
+            if (picker == "source") draftSource = it else draftTarget = it
+            picker = null
+        }) { picker = null }
+    } else key(dialog) { when (dialog) {
         "message" -> MessageDialog("规则操作", message) { dialog = null }
         "delete" -> ConfirmDialog("删除规则", "只删除这条手动规则，在线规则仍保留。", { dialog = null }) {
             changeRules { controller.deleteIceRule(manualIndex); editor = false; dialog = null }
         }
-        "clear" -> ConfirmDialog("清空手动规则", "已保存的手动规则将被删除，在线缓存不会改变。", { dialog = null }) {
-            changeRules { controller.clearManualRules(); dialog = null }
+        "clear" -> ConfirmDialog("清空手动规则", "已保存的手动规则将被删除，在线缓存不会改变。", { dialog = "manage" }) {
+            changeRules { controller.clearManualRules(); dialog = "manage" }
         }
         "preview" -> RulePreview(controller) { dialog = null }
-        "online" -> OverlayDialog(show = true, title = "在线规则", onDismissRequest = { dialog = null }) {
-            Column(Modifier.heightIn(max = LocalWindowInfo.current.containerDpSize.height * .60f).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                QuietText("使用 IceBridge 自有规则源，完整快照校验后替换，手动规则不受刷新影响。")
-                SwitchPreference(online.enabled, { value -> changeRules { controller.setOnlineUpdatesEnabled(value) } }, title = "允许在线更新", summary = "关闭后仍使用已校验的缓存", modifier = Modifier.testTag("online.enabled"))
-                QuietText("缓存修订：r${online.revision}\n缓存规则：${online.ruleCount} 条\n来源：${online.sourceName}\n状态：${online.status}", Modifier.testTag("online.cache"))
-                QuietText("关闭更新仍使用已有缓存，重新打开页面不会清空规则。")
-                TextButton(if (updating) "正在同步…" else "立即同步", {
-                    if (!updating) {
-                        updating = true
-                        controller.refreshOnlineRules { result -> updating = false; onChanged(); toast(result.message) }
-                    }
-                }, Modifier.fillMaxWidth().testTag("online.refresh"), enabled = online.enabled && !updating, colors = ButtonDefaults.textButtonColorsPrimary())
-                TextButton("关闭", { dialog = null }, Modifier.fillMaxWidth().testTag("online.close"))
+        "behavior" -> OverlayDialog(show = true, title = "打开行为", onDismissRequest = { dialog = null }) {
+            Column(Modifier.heightIn(max = LocalWindowInfo.current.containerDpSize.height * .60f), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Column(Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState())) {
+                    SwitchPreference(nativeEnabled, { value -> changeRules { controller.setNativeEnabled(value) } },
+                        title = "原生目标兜底", summary = "无匹配规则时，接管传送门提供的原生目标；规则命中不受影响。切换立即保存。",
+                        modifier = Modifier.testTag("toggle.native")
+                            .semantics { toggleableState = if (nativeEnabled) ToggleableState.On else ToggleableState.Off })
+                }
+                TextButton("完成", { dialog = null }, Modifier.fillMaxWidth().testTag("rules.behavior.close"),
+                    colors = ButtonDefaults.textButtonColorsPrimary())
             }
         }
-    }
+        "manage" -> OverlayDialog(show = true, title = "规则管理", onDismissRequest = { dialog = null }) {
+            Column(Modifier.heightIn(max = LocalWindowInfo.current.containerDpSize.height * .60f), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Column(Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState())) {
+                    ArrowPreference(title = "在线规则", summary = "本地缓存 r${online.revision} · ${online.ruleCount} 条" + if (online.sourceName.isNullOrBlank()) "" else " · ${online.sourceName}",
+                        onClick = { dialog = "online" }, modifier = Modifier.testTag("rules.online"), endActions = { Tag(if (updating) "同步中" else "管理") })
+                    ArrowPreference(title = "导入手动规则", summary = "兼容 IceBridge JSON 规则文件",
+                        onClick = { importer.launch(arrayOf("application/json", "text/plain", "application/octet-stream")) }, modifier = Modifier.testTag("rules.import"))
+                    ArrowPreference(title = "导出手动规则", summary = "保存来源、网站、目标与备注", onClick = {
+                        try { pendingExport = controller.exportRules(); exporter.launch("TaplusBridge-rules.json") }
+                        catch (error: RuntimeException) { message = error.message ?: "导出失败"; dialog = "message" }
+                    }, modifier = Modifier.testTag("rules.export"))
+                    ArrowPreference(title = "清空手动规则", summary = "保留已校验的在线规则", onClick = { dialog = "clear" }, modifier = Modifier.testTag("rules.clear"))
+                }
+                TextButton("完成", { dialog = null }, Modifier.fillMaxWidth().testTag("rules.manage.close"),
+                    colors = ButtonDefaults.textButtonColorsPrimary())
+            }
+        }
+        "online" -> OverlayDialog(show = true, title = "在线规则", onDismissRequest = { dialog = "manage" }) {
+            Column(Modifier.heightIn(max = LocalWindowInfo.current.containerDpSize.height * .60f), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Column(Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    QuietText("使用 IceBridge 自有规则源，完整快照校验后替换，手动规则不受刷新影响。")
+                    SwitchPreference(online.enabled, { value -> changeRules { controller.setOnlineUpdatesEnabled(value) } }, title = "允许在线更新", summary = "关闭后仍使用已校验的缓存", modifier = Modifier.testTag("online.enabled"))
+                    QuietText("缓存修订：r${online.revision}\n缓存规则：${online.ruleCount} 条\n来源：${online.sourceName}\n状态：${online.status}", Modifier.testTag("online.cache"))
+                    QuietText("关闭更新仍使用已有缓存，重新打开页面不会清空规则。")
+                    TextButton(if (updating) "正在同步…" else "立即同步", {
+                        if (!updating) {
+                            updating = true
+                            controller.refreshOnlineRules { result -> updating = false; onChanged(); toast(result.message) }
+                        }
+                    }, Modifier.fillMaxWidth().testTag("online.refresh"), enabled = online.enabled && !updating, colors = ButtonDefaults.textButtonColorsPrimary())
+                }
+                TextButton("返回规则管理", { dialog = "manage" }, Modifier.fillMaxWidth().testTag("online.close"))
+            }
+        }
+    } }
 }
 
 @Composable private fun ApplicationPicker(apps: List<SettingsController.AppEntry>, source: Boolean,

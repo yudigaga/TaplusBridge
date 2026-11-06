@@ -14,6 +14,8 @@ import android.text.Html;
 import io.github.yudigaga.taplusbridge.hook.HostPolicy;
 import io.github.yudigaga.taplusbridge.capture.IntentObservation;
 import io.github.yudigaga.taplusbridge.recognition.LinkExtractor;
+import io.github.yudigaga.taplusbridge.config.ConfigStore;
+import io.github.yudigaga.taplusbridge.config.RecognitionChannels;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
@@ -85,10 +87,19 @@ public final class DragPayload implements AutoCloseable {
                 else if (supplied == null && html == null) throw new IOException("仅支持可读取的本地图片或网页链接");
             }
         }
+        boolean nativeEnabled = new ConfigStore(context).recognitionChannels().enabled(RecognitionChannels.Channel.NATIVE);
+        if (!nativeEnabled) {
+            text.setLength(0); links.setLength(0);
+            if (image == null) throw new IOException("原生文字与卡片识别已关闭，本次拖入内容没有可用图片");
+        }
         if (text.toString().isBlank() && image == null) throw new IOException("拖拽内容没有可用的文字或图片");
         String value = text.toString();
-        if (image == null) return new DragPayload(value, source, null, "text/plain", 0, 0, links.toString());
-        return copyImage(context, image, value, source, links.toString(), cancelled);
+        DragPayload payload = image == null ? new DragPayload(value, source, null, "text/plain", 0, 0, links.toString())
+                : copyImage(context, image, value, source, links.toString(), cancelled);
+        int found = payload.links().size();
+        if (nativeEnabled && found > 0) android.util.Log.i("TaplusBridge", "recognition source stage=links channel=native found="
+                +found+" added="+found+" total="+found);
+        return payload;
     }
 
     private static void append(StringBuilder into, CharSequence value) throws IOException {

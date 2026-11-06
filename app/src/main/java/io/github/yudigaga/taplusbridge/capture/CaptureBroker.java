@@ -21,7 +21,14 @@ public final class CaptureBroker {
     private CaptureBroker() { }
 
     public static Bundle arm(Context context, String source) {
+        return arm(context, source, false);
+    }
+    public static Bundle armProbe(Context context, String source) {
+        return arm(context, source, true);
+    }
+    private static Bundle arm(Context context, String source, boolean probe) {
         if (!new ConfigStore(context).enabled() || !new ConfigStore(context).captureEnabled()
+                || (probe && (!new ConfigStore(context).recognitionEnabled() || !new ConfigStore(context).scopeLinkProbeEnabled()))
                 || !CaptureLease.allowedSource(source)) return failure("unavailable");
         int user = Process.myUid() / 100000;
         try {
@@ -33,6 +40,7 @@ public final class CaptureBroker {
             synchronized (LOCK) {
                 if (!prefs(context).edit().clear().putString("nonce", nonce).putString("source", source)
                         .putInt("source_uid", info.uid).putInt("user", user).putString("state", "pending")
+                        .putBoolean("probe", probe)
                         .putLong("issued", SystemClock.elapsedRealtime()).putLong("created_wall", System.currentTimeMillis()).commit())
                     return failure("storage_failed");
             }
@@ -47,13 +55,29 @@ public final class CaptureBroker {
             long age = SystemClock.elapsedRealtime() - p.getLong("issued", -10000);
             if (!validNonce(nonce) || !nonce.equals(p.getString("nonce", ""))
                     || !"pending".equals(p.getString("state", "")) || age < 0 || age >= 2500
+                    || (p.getBoolean("probe", false) && (!new ConfigStore(context).scopeLinkProbeEnabled()
+                            || !new ConfigStore(context).recognitionEnabled()))
                     || !new ConfigStore(context).captureEnabled() || !new ConfigStore(context).enabled()) return Bundle.EMPTY;
             int user = p.getInt("user", -1), uid = p.getInt("source_uid", -1);
             String source = p.getString("source", "");
             if (user != Process.myUid() / 100000 || uid < 0 || uid / 100000 != user || !CaptureLease.allowedSource(source)) return Bundle.EMPTY;
             if (!p.edit().putString("state", "armed").putLong("armed", SystemClock.elapsedRealtime()).commit()) return Bundle.EMPTY;
             Bundle result = new Bundle(); result.putString("source", source); result.putInt("source_uid", uid);
-            result.putInt("user", user); return result;
+            result.putInt("user", user); result.putBoolean("probe", p.getBoolean("probe", false)); return result;
+        }
+    }
+
+    /** Synthetic input rechecks the live choice and the same armed capability before each step. */
+    public static boolean probeValid(Context context, String nonce, int user) {
+        ConfigStore config = new ConfigStore(context);
+        if (!config.enabled() || !config.captureEnabled() || !config.recognitionEnabled() || !config.scopeLinkProbeEnabled()) return false;
+        synchronized (LOCK) {
+            SharedPreferences p = prefs(context);
+            long armed = p.getLong("armed", -1), now = SystemClock.elapsedRealtime();
+            return validNonce(nonce) && nonce.equals(p.getString("nonce", "")) && p.getBoolean("probe", false)
+                    && "armed".equals(p.getString("state", "")) && user == Process.myUid() / 100000
+                    && user == p.getInt("user", -1) && armed >= 0 && now >= armed
+                    && now - armed < CaptureLease.TTL_MILLIS;
         }
     }
 
@@ -102,6 +126,11 @@ public final class CaptureBroker {
         }
     }
     public static void cancelCurrent(Context context) { cancel(context, prefs(context).getString("nonce", null)); }
+    public static void cancelProbe(Context context) {
+        synchronized (LOCK) {
+            if (prefs(context).getBoolean("probe", false)) cancelCurrent(context);
+        }
+    }
     /** Diagnostics are fixed enums and bound to the current nonce; no source text or URL is stored. */
     public static boolean recordProbeStatus(Context context, Bundle data) {
         if (data == null) return false;

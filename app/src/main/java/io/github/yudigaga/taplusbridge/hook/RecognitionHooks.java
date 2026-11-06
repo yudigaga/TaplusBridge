@@ -17,6 +17,8 @@ import android.widget.ImageView;
 import io.github.libxposed.api.XposedInterface;
 import io.github.libxposed.api.XposedModule;
 import io.github.yudigaga.taplusbridge.bridge.BridgeContract;
+import io.github.yudigaga.taplusbridge.config.RecognitionChannels;
+import io.github.yudigaga.taplusbridge.config.RecognitionChannels.Channel;
 import java.lang.reflect.Method;
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
@@ -50,6 +52,7 @@ public final class RecognitionHooks {
     private final RecognitionEpochs origins=new RecognitionEpochs();
     private Field recommendationTask,segmentTask,segmenting,ocrDisposable;
     private Method requestRecommendation, requestSegments, recognizeImage, imageBitmap, recommendationUrl, publishSegments;
+    private Method cloudOcrWords;
     private String scopeLinkUrl, scopeText;
     private boolean mixedImage, mixedPrepared;
     private final ProbeRecommendations scopeRecommendations = new ProbeRecommendations();
@@ -59,6 +62,9 @@ public final class RecognitionHooks {
     private volatile boolean probeGeometry;
     private boolean keepRecognitionVisible;
     private long recognitionOnlyEpoch = -1;
+    private long recommendationGeneration = -1;
+    private boolean ocrFinished;
+    private String ocrText = "";
     private ArrayList<?> lastServer = new ArrayList<>();
 
     record DragPick(long epoch, Object service, Object result, long pickedAt) {
@@ -76,12 +82,13 @@ public final class RecognitionHooks {
 
     /** Read only the exact live pick; a completed or replaced pick cannot supply another drag's links. */
     DragSnapshot dragSnapshot(Object service, Object result, long expectedEpoch) {
+        boolean serverEnabled = RecognitionPolicy.read(hostContext()).enabled(Channel.SERVER);
         synchronized (sessionLock) {
             if (!active || dragPick == null || !dragPick.matches(service, result, expectedEpoch)) return null;
             boolean waiting = false;
             try {
                 Object task = recommendationTask == null ? null : recommendationTask.get(null);
-                waiting = pendingRecommendation(task, origins.owner(task), epoch);
+                waiting = serverEnabled && pendingRecommendation(task, origins.owner(task), epoch);
             } catch (ReflectiveOperationException | RuntimeException failure) { report(failure); }
             return new DragSnapshot(epoch, waiting, enhancer.capturedLinks());
         }
@@ -90,6 +97,24 @@ public final class RecognitionHooks {
     boolean nativeUrlAvailable(Object service, Object result) {
         synchronized (sessionLock) {
             return dragPick != null && dragPick.matches(service, result, -1) && !enhancer.capturedLinks().isEmpty();
+        }
+    }
+
+    boolean ocrComplete(Object service, Object result, long expectedEpoch) {
+        synchronized (sessionLock) {
+            return active && dragPick != null && dragPick.matches(service, result, expectedEpoch) && ocrFinished;
+        }
+    }
+
+    String ocrText(Object service, Object result, long expectedEpoch) {
+        synchronized (sessionLock) {
+            return active && ocrFinished && dragPick != null && dragPick.matches(service, result, expectedEpoch) ? ocrText : "";
+        }
+    }
+
+    private void rememberOcrText(String text) {
+        synchronized (sessionLock) {
+            if (active && origins.scopeCurrent(epoch)) ocrText = RecognitionPolicy.boundedText(text);
         }
     }
 
@@ -143,8 +168,11 @@ public final class RecognitionHooks {
                         if (contextSupported(chain.getThisObject()) && chain.getArg(0) instanceof Intent intent
                                 && intent.hasExtra("clipboard_data")) {
                             resetSession();
+                            RecognitionPolicy.State policy = RecognitionPolicy.current((Context) chain.getThisObject());
+                            if (policy.disabled(Channel.CLIPBOARD))
+                                return android.app.Service.START_NOT_STICKY;
                             String text = intent.getStringExtra("clipboard_data");
-                            enhancer.captureText(text);
+                            if (policy.channels().enabled(Channel.CLIPBOARD)) enhancer.captureText(text, "clipboard");
                             enhancer.diagnostic("capture_clipboard", "captured", null,
                                     text == null ? 0 : text.length(), enhancer.capturedLinks().size(), null, null);
                             // Clipboard has its own NER/card path. It cannot reuse an old long-press view.
@@ -157,21 +185,40 @@ public final class RecognitionHooks {
             requireResult(pick, void.class);
             module.hook(pick).setId("taplusbridge:recognition-" + name)
                     .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).intercept(chain -> {
+                        boolean emptyNativeText = false;
                         try {
                             if (contextSupported(chain.getThisObject())) {
+                                RecognitionPolicy.State policy = RecognitionPolicy.current((Context) chain.getThisObject());
+                                RecognitionChannels channels = policy.channels();
+                                if ("onPickText".equals(name) && policy.disabled(Channel.NATIVE)
+                                        && !RecognitionPolicy.marked(chain.getArg(0), "taplus_drag")) {
+                                    try {
+                                        RecognitionPolicy.filterText(chain.getArg(0), policy);
+                                        String accepted = RecognitionPolicy.nativeText(chain.getArg(0), channels);
+                                        emptyNativeText = accepted == null || accepted.isBlank();
+                                    } catch (ReflectiveOperationException | RuntimeException unavailable) {
+                                        report(unavailable); return null;
+                                    }
+                                }
                                 synchronized (sessionLock) {
                                     pickService = chain.getThisObject();
                                     dragPick = new DragPick(epoch, pickService, chain.getArg(0), SystemClock.elapsedRealtime());
                                     fallbackDeadlinePick = null; fallbackRecognitionDeadline = 0;
                                 }
-                                captureScopeContent(chain.getArg(0), "onPickImage".equals(name));
+                                captureScopeContent(chain.getArg(0), "onPickImage".equals(name), channels);
                                 rememberProbePick(chain.getArg(0), "onPickImage".equals(name));
-                                enhancer.capture(chain.getArg(0));
+                                enhancer.capture(chain.getArg(0), channels);
                                 enhancer.diagnostic("onPickImage".equals(name) ? "capture_image" : "capture_catcher",
                                         "captured", null, 0, enhancer.capturedLinks().size(), null, null);
                             }
                         } catch (RuntimeException failure) { report(failure); }
-                        return chain.proceed();
+                        Object outcome = chain.proceed();
+                        if (emptyNativeText) {
+                            // The stock text consumer returns before task creation for an empty filtered pick.
+                            synchronized (sessionLock) { active = true; autoProbe.segmentComplete(epoch); }
+                            recordStatus(hostContext()); schedulePublish(); scheduleAutoProbe();
+                        }
+                        return outcome;
                     });
         }
         for (String name : new String[]{"startPickTextTask", "startPickImageTask"}) {
@@ -187,6 +234,9 @@ public final class RecognitionHooks {
                                 ?origins.scoped(origin,chain::proceed):chain.proceed();
                         if (supported) {
                             if ("startPickImageTask".equals(name)) prepareMixedImage(origin);
+                            RecognitionPolicy.State policy = RecognitionPolicy.current(hostContext());
+                            if (policy.disabled(Channel.SEGMENT) || "startPickImageTask".equals(name) && policy.disabled(Channel.OCR))
+                                completeDisabled(Channel.SEGMENT);
                             recordStatus(hostContext());
                             schedulePublish();
                         }
@@ -213,6 +263,10 @@ public final class RecognitionHooks {
         if(!Modifier.isStatic(segmenting.getModifiers()) || segmenting.getType()!=boolean.class)
             throw new NoSuchFieldException("segment state contract");
         segmenting.setAccessible(true);
+        try {
+            cloudOcrWords = method(recommendations, "parseWordListFormServer", true, String.class);
+            if (!List.class.isAssignableFrom(cloudOcrWords.getReturnType())) throw new NoSuchMethodException("OCR words contract");
+        } catch (ReflectiveOperationException unavailable) { cloudOcrWords = null; }
         installAsyncCallbacks(loader);
         hookTextCapture(method(recommendations, "getTextSegmentResponse", true,
                 Context.class, String.class, boolean.class), 1);
@@ -227,16 +281,25 @@ public final class RecognitionHooks {
                     ArrayList<?> replacement = null;
                     try {
                         Context context = hostContext();
-                        if (supported(context) && input != null && isActive() && (synthetic.get() || currentOrigin())) {
-                            if (!synthetic.get()) synchronized (sessionLock) {
-                                enhancer.captureRecommendationLinks(input);
-                                input = scopeLinkUrl == null ? input : scopeRecommendations.merge(input, enhancer::isProbeRecommendation);
-                                lastServer = new ArrayList<>(input);
+                        if (supported(context) && input != null) {
+                            RecognitionPolicy.State policy = RecognitionPolicy.current(context);
+                            boolean server = policy.channels().enabled(Channel.SERVER);
+                            if (policy.disabled(Channel.SERVER)) {
+                                input = new ArrayList<>();
+                                replacement = input;
+                                synchronized (sessionLock) { lastServer = new ArrayList<>(); }
                             }
-                            replacement = synthetic.get() || recognitionReadyForCurrentPick()
-                                    ? enhancer.merge(context, input, safeSource()) : new ArrayList<>(input);
-                            enhancer.diagnostic(synthetic.get() ? "publish_local" : "publish_server", "published",
-                                    null, input.size(), replacement.size(), null, null);
+                            if (isActive() && (synthetic.get() || currentOrigin())) {
+                                if (!synthetic.get() && server) synchronized (sessionLock) {
+                                    enhancer.captureRecommendationLinks(input);
+                                    input = scopeLinkUrl == null ? input : scopeRecommendations.merge(input, enhancer::isProbeRecommendation);
+                                    lastServer = new ArrayList<>(input);
+                                }
+                                replacement = synthetic.get() || recognitionReadyForCurrentPick()
+                                        ? enhancer.merge(context, input, safeSource()) : new ArrayList<>(input);
+                                enhancer.diagnostic(synthetic.get() ? "publish_local" : "publish_server", "published",
+                                        null, input.size(), replacement.size(), null, null);
+                            }
                         }
                     } catch (RuntimeException failure) { report(failure); }
                     // The original is called once, outside recovery catches, so a host error is never replayed.
@@ -248,8 +311,9 @@ public final class RecognitionHooks {
         requireResult(segment, void.class);
         module.hook(segment).setId("taplusbridge:recognition-segments")
                 .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).intercept(chain -> {
-                    Object result = chain.proceed();
                     Context context = hostContext();
+                    boolean enabled = !supported(context) || !RecognitionPolicy.current(context).disabled(Channel.SEGMENT);
+                    Object result = enabled ? chain.proceed() : chain.proceed(new Object[]{new ArrayList<>(), true});
                     if (supported(context) && isActive() && currentOrigin()) {
                         synchronized(sessionLock) { autoProbe.segmentComplete(epoch); }
                         recordStatus(context);
@@ -259,6 +323,7 @@ public final class RecognitionHooks {
                     return result;
                 });
         installBindings(loader);
+        installClipboardCommerce(loader);
         module.log(4, TAG, "Host-only local recognition and destination card hooks installed");
     }
 
@@ -297,8 +362,12 @@ public final class RecognitionHooks {
         Method recognize=method(image,"doImageRecognize",true,Bitmap.class);requireResult(recognize,void.class);
         module.hook(recognize).setId("taplusbridge:recognition-ocr-origin")
                 .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).intercept(chain -> {
+                    Context context = hostContext();
+                    if (supported(context) && RecognitionPolicy.current(context).disabled(Channel.OCR)) {
+                        completeDisabled(Channel.OCR); return null;
+                    }
                     if(!isActive() || Looper.myLooper()!=Looper.getMainLooper())return chain.proceed();
-                    long origin; synchronized(sessionLock) { origin=epoch; }
+                    long origin; synchronized(sessionLock) { origin=epoch; ocrFinished=false; ocrText=""; }
                     Object before=ocrDisposable.get(null);
                     Object result=origins.scoped(origin,chain::proceed);
                     Object after=ocrDisposable.get(null);
@@ -306,15 +375,103 @@ public final class RecognitionHooks {
                     if(after!=null && after!=before)origins.bind(after,origin);
                     return result;
                 });
+        try {
+            Class<?> splash = loader.loadClass(ROOT + "text.floatview.TaplusSplashFloatView");
+            Method talkBack = method(splash, "talkBackForImageIfNeed", false);
+            requireResult(talkBack, void.class);
+            Field context = HostRecognitionEnhancer.findField(splash, "mContext");
+            module.hook(talkBack).setId("taplusbridge:recognition-ocr-talkback")
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).intercept(chain -> {
+                        Object raw = context.get(chain.getThisObject());
+                        if (raw instanceof Context owner && supported(owner)
+                                && RecognitionPolicy.current(owner).disabled(Channel.OCR)) return null;
+                        return chain.proceed();
+                    });
+        } catch (ReflectiveOperationException | RuntimeException unavailable) {
+            module.log(4, TAG, "Optional OCR talkback boundary unavailable: " + unavailable.getClass().getSimpleName());
+        }
     }
 
     private void installCallback(Method callback,String name) throws NoSuchMethodException {
         requireResult(callback,void.class);
         module.hook(callback).setId("taplusbridge:recognition-origin-"+name)
                 .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).intercept(chain -> {
+                    Channel channel = name.startsWith("ocr-") ? Channel.OCR
+                            : "segment-result".equals(name) ? Channel.SEGMENT : Channel.SERVER;
+                    Context context = hostContext();
+                    RecognitionPolicy.State policy = supported(context) ? RecognitionPolicy.current(context) : null;
+                    if (policy != null && policy.disabled(channel)) {
+                        completeDisabled(channel); return null;
+                    }
                     if(isActive() && Looper.myLooper()!=Looper.getMainLooper())return null;
-                    return origins.callback(chain.getThisObject(),this::isActive,chain::proceed);
+                    return origins.callback(chain.getThisObject(),this::isActive,() -> {
+                        if (isActive() && "ocr-result".equals(name) && policy != null
+                                && policy.channels().enabled(Channel.OCR)) captureCloudOcr(chain.getArg(0));
+                        Object result = chain.proceed();
+                        if (channel == Channel.OCR && isActive()) {
+                            synchronized (sessionLock) {
+                                ocrFinished = true;
+                                if ("ocr-error".equals(name)) autoProbe.localOcrComplete(epoch, null);
+                            }
+                            schedulePublish(); scheduleAutoProbe();
+                        }
+                        return result;
+                    });
                 });
+    }
+
+    private void captureCloudOcr(Object pair) {
+        if (pair == null || cloudOcrWords == null) return;
+        try {
+            if (!Boolean.FALSE.equals(pair.getClass().getMethod("getFirst").invoke(pair))) return;
+            Object body = pair.getClass().getMethod("getSecond").invoke(pair);
+            if (!(body instanceof String json) || json.length() > ScopeCapturePayload.MAX_CONTENT_LENGTH) return;
+            Object raw = cloudOcrWords.invoke(null, json);
+            if (!(raw instanceof List<?> words)) return;
+            StringBuilder text = new StringBuilder();
+            for (int i = 0; i < Math.min(words.size(), 4096); i++) {
+                Object word = words.get(i);
+                if (word == null) continue;
+                Object value = word.getClass().getMethod("getWord").invoke(word);
+                if (!(value instanceof String part) || text.length() + part.length() + 1 > ScopeCapturePayload.MAX_CONTENT_LENGTH) break;
+                if (text.length() > 0) text.append(' ');
+                text.append(part);
+            }
+            String recognized = text.toString();
+            rememberOcrText(recognized);
+            enhancer.captureText(recognized, "ocr");
+        } catch (ReflectiveOperationException | RuntimeException unavailable) { report(unavailable); }
+    }
+
+    private void installClipboardCommerce(ClassLoader loader) {
+        try {
+            Method request = method(loader.loadClass(ROOT + "clipboard.utils.ClipboardCardUtils"),
+                    "getCommerceRecommendWithAsyncTask", true, Context.class, String.class, String.class);
+            Method ready = method(loader.loadClass(ROOT + "clipboard.ClipboardMonitor"),
+                    "onCopyRecommendReady", true, List.class);
+            requireResult(request, void.class); requireResult(ready, void.class);
+            module.hook(request).setId("taplusbridge:recognition-clipboard-commerce-request")
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).intercept(chain -> {
+                        if (chain.getArg(0) instanceof Context context && supported(context)
+                                && RecognitionPolicy.current(context).commerceDisabled()) {
+                            ready.invoke(null, new ArrayList<>()); return null;
+                        }
+                        return chain.proceed();
+                    });
+            module.hook(ready).setId("taplusbridge:recognition-clipboard-commerce-result")
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).intercept(chain -> {
+                        Context context = hostContext();
+                        if (supported(context)) {
+                            RecognitionPolicy.State policy = RecognitionPolicy.current(context);
+                            if (policy.commerceDisabled()) return chain.proceed(new Object[]{new ArrayList<>()});
+                            if (policy.channels().enabled(Channel.SERVER) && policy.channels().enabled(Channel.CLIPBOARD)
+                                    && chain.getArg(0) instanceof List<?> cards) enhancer.captureRecommendationLinks(cards);
+                        }
+                        return chain.proceed();
+                    });
+        } catch (ReflectiveOperationException | RuntimeException unavailable) {
+            module.log(4, TAG, "Optional clipboard commerce boundary unavailable: " + unavailable.getClass().getSimpleName());
+        }
     }
 
     private boolean currentOrigin() {
@@ -325,6 +482,13 @@ public final class RecognitionHooks {
         requireResult(capture, void.class);
         module.hook(capture).setId("taplusbridge:recognition-text-" + capture.getName())
                 .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).intercept(chain -> {
+                    Channel channel = "processOcrResult".equals(capture.getName()) ? Channel.OCR
+                            : "getTextSegmentResponse".equals(capture.getName()) ? Channel.SEGMENT : Channel.SERVER;
+                    RecognitionPolicy.State policy = chain.getArg(0) instanceof Context owner && supported(owner)
+                            ? RecognitionPolicy.current(owner) : null;
+                    if (policy != null && policy.disabled(channel)) {
+                        completeDisabled(channel); return null;
+                    }
                     long capturedEpoch=-1, recommendation=-1;
                     String ocrText=null;
                     boolean emptyOcr=false;
@@ -334,7 +498,10 @@ public final class RecognitionHooks {
                                 && Looper.myLooper()==Looper.getMainLooper()) {
                             Object raw=chain.getArg(textIndex);
                             String text=raw instanceof String value?value:null;
-                            enhancer.captureText(text);
+                            if (channel == Channel.OCR && policy != null && policy.channels().enabled(Channel.OCR)) {
+                                rememberOcrText(text);
+                                enhancer.captureText(text, "ocr");
+                            }
                             String stage = "processOcrResult".equals(capture.getName()) ? "capture_ocr"
                                     : "getTextSegmentResponse".equals(capture.getName())
                                     ? "capture_segment" : "capture_recommendation";
@@ -343,7 +510,7 @@ public final class RecognitionHooks {
                             synchronized(sessionLock) {
                                 capturedEpoch=epoch;
                                 if("tryToGetRecommendation".equals(capture.getName()) && text!=null && !text.isEmpty())
-                                    recommendation=autoProbe.recommendationStarted(epoch);
+                                    recommendation=recommendationGeneration=autoProbe.recommendationStarted(epoch);
                             }
                             if("tryToGetRecommendation".equals(capture.getName()))taskField=recommendationTask;
                             else if("getTextSegmentResponse".equals(capture.getName()))taskField=segmentTask;
@@ -384,6 +551,9 @@ public final class RecognitionHooks {
                     if(emptyOcr) {
                         autoProbe.localOcrComplete(capturedEpoch,ocrText);
                         scheduleAutoProbe();
+                    }
+                    if (channel == Channel.OCR && capturedEpoch >= 0) synchronized (sessionLock) {
+                        if (epoch == capturedEpoch) ocrFinished = true;
                     }
                     return result;
                 });
@@ -450,6 +620,9 @@ public final class RecognitionHooks {
             active = false;
             scheduledEpoch = -1;
             lastServer = new ArrayList<>();
+            recommendationGeneration = -1;
+            ocrFinished = false;
+            ocrText = "";
             enhancer.clear();
             scopeLinkUrl = scopeText = null; mixedImage = mixedPrepared = false;
             scopeRecommendations.clear();
@@ -464,21 +637,46 @@ public final class RecognitionHooks {
 
     private boolean isActive() { synchronized (sessionLock) { return active; } }
 
-    private void captureScopeContent(Object result, boolean image) {
+    private void captureScopeContent(Object result, boolean image, RecognitionChannels channels) {
         try {
             Object raw = result.getClass().getMethod("getPropertyMap").invoke(result);
             if (!(raw instanceof Map<?, ?> map)) return;
             String url = map.get("taplus_scope_link_url") instanceof String value
                     && ScopeCapturePayload.validTextUrl(value) ? value : null;
-            String text = map.get("taplus_scope_text") instanceof String value ? value : null;
+            String text = RecognitionPolicy.nativeText(result, channels);
             if (text != null && text.length() > 131072) text = text.substring(0, 131072);
             synchronized (sessionLock) {
                 scopeLinkUrl = url; scopeText = text;
                 mixedImage = image && Boolean.TRUE.equals(map.get("taplus_scope_mixed"));
                 mixedPrepared = false;
             }
-            if (url != null) enhancer.captureProbeUrl(url);
         } catch (ReflectiveOperationException | RuntimeException failure) { report(failure); }
+    }
+
+    /** Disabled stages still release the host's splash/selection barrier without starting source work. */
+    private void completeDisabled(Channel channel) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            main.post(() -> completeDisabled(channel)); return;
+        }
+        long origin;
+        synchronized (sessionLock) {
+            if (!active) return;
+            origin = epoch;
+            if (channel == Channel.SERVER) {
+                autoProbe.recommendationFinished(origin, recommendationGeneration);
+                recommendationGeneration = -1;
+                lastServer = new ArrayList<>();
+            } else {
+                if (channel == Channel.OCR) ocrFinished = true;
+                autoProbe.segmentComplete(origin);
+            }
+        }
+        if (channel != Channel.SERVER && segmenting != null) try { segmenting.setBoolean(null, false); }
+        catch (ReflectiveOperationException | RuntimeException failure) { report(failure); }
+        if (channel != Channel.SERVER && publishSegments != null) try {
+            origins.scoped(origin, () -> { publishSegments.invoke(null, new ArrayList<>(), true); return null; });
+        } catch (Throwable failure) { report(failure); }
+        schedulePublish(); scheduleAutoProbe();
     }
 
     /** The native image, text segmentation, OCR and URL cards share one task and one pair of views. */
@@ -555,7 +753,8 @@ public final class RecognitionHooks {
                     .invoke(result, image ? "image_pick" : "text_pick");
             Object payload = params instanceof Map<?, ?> map ? map.get(image ? "image_pick_mode" : "pick_mode") : null;
             // A window screenshot is not proof of a card rectangle; never synthesize a source click from it.
-            if (payload instanceof Bundle captured && captured.getBoolean("taplus_scope_capture")) return;
+            if (payload instanceof Bundle captured && (captured.getBoolean("taplus_scope_capture")
+                    || captured.getBoolean("taplus_drag"))) return;
             if (payload instanceof Bundle bundle && bundle.getParcelable("view_rect") instanceof Rect rect && !rect.isEmpty()) {
                 probeGeometry = true; lastPickAt = SystemClock.elapsedRealtime();
             }
@@ -687,6 +886,8 @@ public final class RecognitionHooks {
 
     private long recognitionDeadline(DragPick selected) {
         if (selected == null) return 0;
+        long providedAt = providedRecognitionAt(selected.result(), selected.pickedAt());
+        if (providedAt > 0) return providedAt;
         long cachedFallback;
         synchronized (sessionLock) {
             if (!active || dragPick != selected) return 0;
@@ -712,6 +913,20 @@ public final class RecognitionHooks {
             }
             return fallback;
         } catch (RuntimeException failure) { report(failure); return 0; }
+    }
+
+    /** Framework-owned scope/drag delivery has already passed the physical recognition deadline. */
+    static long providedRecognitionAt(Object result, long pickedAt) {
+        if (result == null || pickedAt <= 0) return 0;
+        try {
+            for (String job : new String[]{"text_pick", "image_pick"}) {
+                Object raw = result.getClass().getMethod("getParams", String.class).invoke(result, job);
+                Object content = raw instanceof Map<?, ?> map ? map.get("image_pick".equals(job) ? "image_pick_mode" : "pick_mode") : null;
+                if (content instanceof Bundle data && (data.getBoolean("taplus_scope_capture") || data.getBoolean("taplus_drag")))
+                    return pickedAt;
+            }
+        } catch (ReflectiveOperationException | RuntimeException unavailable) { }
+        return 0;
     }
 
     private Context hostContext() {

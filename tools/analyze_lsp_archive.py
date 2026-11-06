@@ -83,7 +83,8 @@ COMPONENTS = frozenset((
 CAPTURE_OUTCOMES = frozenset(("URL_FOUND", "NO_URL", "UNREADABLE_PAYLOAD", "UNSUPPORTED_COMPONENT"))
 CAPTURE_ORIGINS = frozenset(("DATA", "RAW_URL", "URL", "TEXT", "NESTED", "NONE"))
 PROBE_STAGES = frozenset(("ready", "input_sent", "failed", "blocked", "late_blocked", "waiting_release",
-                          "auto_failed", "physical_state", "physical_read", "recognition_wait", "geometry_failed"))
+                          "auto_failed", "physical_state", "physical_read", "recognition_wait", "geometry_failed",
+                          "point_confirmed", "point_mismatch"))
 PROBE_REASONS = frozenset((
     "protocol", "snapshot", "source_changed", "window_unavailable", "window_occluded",
     "input_unavailable", "ready_timeout", "capture_timeout", "busy", "cooldown",
@@ -133,6 +134,29 @@ SCOPE_CAPTURE_REASONS = EXCEPTIONS | frozenset((
 SCOPE_CAPTURE_MESSAGE = re.compile(r"^[sS]cope capture stage=([a-z_]+)(?=\s|$)")
 MODULE_SCOPE_CAPTURE = re.compile(re.escape(MODULE_TAG) + r"[^\]\r\n]+\]\s+([sS]cope capture stage=.*)$")
 HOST_SCOPE_CAPTURE = re.compile(HOST_LOGCAT_PREFIX + r"([sS]cope capture stage=.*)$")
+ASSIST_CAPTURE_STAGES = frozenset((
+    "requested", "received", "empty", "unavailable", "timeout", "identity_changed", "window_changed", "reader_busy",
+))
+ASSIST_CAPTURE_MESSAGE = re.compile(r"^assist capture stage=([a-z_]+)(?=\s|$)")
+MODULE_ASSIST_CAPTURE = re.compile(re.escape(MODULE_TAG) + r"[^\]\r\n]+\]\s+(assist capture stage=.*)$")
+HOST_ASSIST_CAPTURE = re.compile(HOST_LOGCAT_PREFIX + r"(assist capture stage=.*)$")
+RUNTIME_CONFIG_MESSAGE = re.compile(
+    r"^runtime config stage=(stored|loaded|confirmed) build=([0-9]{1,10}) supplemental_tap=(on|off)(?=\s|$)")
+MODULE_RUNTIME_CONFIG = re.compile(
+    r"^(?:\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?\s+"
+    r"|\[\s*\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?\s+"
+    r"\d+:\s*\d+:\s*\d+\s+[VDIWEF]/LSPosedFramework\s*\]\s*(?:\([A-Za-z0-9_.:-]+\))?)"
+    + re.escape(MODULE_TAG) + r"[^\]\r\n]+\]\s+(runtime config stage=.*)$")
+HOST_RUNTIME_CONFIG = re.compile(HOST_LOGCAT_PREFIX + r"(runtime config stage=.*)$")
+RECOGNITION_SOURCE_MESSAGE = re.compile(
+    r"recognition source stage=links channel=(native|assist|ocr|server|clipboard|probe)"
+    r" found=([0-8]) added=([0-8]) total=([0-8])")
+MODULE_RECOGNITION_SOURCE = re.compile(
+    r"^(?:\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?\s+"
+    r"|\[\s*\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?\s+"
+    r"\d+:\s*\d+:\s*\d+\s+[VDIWEF]/LSPosedFramework\s*\]\s*(?:\([A-Za-z0-9_.:-]+\))?)"
+    + re.escape(MODULE_TAG) + r"[^\]\r\n]+\]\s+(recognition source stage=.*)$")
+HOST_RECOGNITION_SOURCE = re.compile(HOST_LOGCAT_PREFIX + r"(recognition source stage=.*)$")
 HOST_PRIVACY_THREAD_GUARD = re.compile(HOST_LOGCAT_PREFIX.replace("TaplusBridge", "Privacy_PrivacyManager")
     + r"can not request privacy update in main thread!(?=\s|$)")
 SCOPE_LINK_STAGES = frozenset(("rejected", "armed", "blocked", "tapped", "finished", "captured", "observed"))
@@ -155,6 +179,9 @@ DRAG_GESTURE_STAGES = frozenset((
     "overlay_hidden_for_link_probe",
     "ready_haptic_requested", "ready_haptic_unavailable", "source_changed", "lease_invalid",
     "takeover_cancelled", "card_link", "card_link_failed", "card_click_unhooked",
+    "prepare_requested", "prepare_metadata", "prepare_image", "prepare_image_unavailable",
+    "prepare_capture_unavailable", "prepare_service_unavailable", "prepare_unavailable",
+    "prepared", "prepare_failed", "expired",
 ))
 DRAG_GESTURE_REASONS = frozenset((
     "drag_transfer_request", "capture_snapshot", "capture_display", "capture_host_identity",
@@ -262,6 +289,26 @@ def scope_link_metadata(message):
             "source_kind": source.group(1) if source and source.group(1) in SOURCE_SCOPE_KINDS else "unknown"}
 
 
+def assist_capture_metadata(message):
+    match = ASSIST_CAPTURE_MESSAGE.match(message)
+    return {"stage": match.group(1)} if match and match.group(1) in ASSIST_CAPTURE_STAGES else None
+
+
+def runtime_config_metadata(message):
+    match = RUNTIME_CONFIG_MESSAGE.match(message)
+    if not match or not 1 <= int(match.group(2)) <= 2_147_483_647:
+        return None
+    return {"stage": match.group(1), "build": int(match.group(2)), "supplemental_tap": match.group(3)}
+
+
+def recognition_source_metadata(message):
+    match = RECOGNITION_SOURCE_MESSAGE.fullmatch(message)
+    if not match:
+        return None
+    return {"stage": "links", "channel": match.group(1),
+            "found": int(match.group(2)), "added": int(match.group(3)), "total": int(match.group(4))}
+
+
 def drag_gesture_metadata(message):
     match = DRAG_GESTURE_MESSAGE_SAFE.search(message)
     if not match or match.group(1) not in DRAG_GESTURE_STAGES:
@@ -311,6 +358,9 @@ def analyze(path, after=None, date=None):
         runtime_launch_events = []
         source_scope_events = []
         scope_capture_events = []
+        assist_capture_events = []
+        runtime_config_events = []
+        recognition_source_events = []
         scope_link_events = []
         drag_gesture_events = []
         earlier_system = {}
@@ -324,6 +374,18 @@ def analyze(path, after=None, date=None):
             if after and (not at or at.split("T", 1)[1][:8] < after):
                 continue
             provenance = {"source": name, "line": number, "at": at}
+            runtime_config = MODULE_RUNTIME_CONFIG.match(line)
+            runtime_metadata = runtime_config_metadata(runtime_config.group(1)) if runtime_config else None
+            if runtime_metadata:
+                runtime_config_events.append({**provenance, **runtime_metadata})
+            recognition_source = MODULE_RECOGNITION_SOURCE.match(line)
+            source_metadata = recognition_source_metadata(recognition_source.group(1)) if recognition_source else None
+            if source_metadata:
+                recognition_source_events.append({**provenance, **source_metadata})
+            assist_capture = MODULE_ASSIST_CAPTURE.search(line)
+            assist_metadata = assist_capture_metadata(assist_capture.group(1)) if assist_capture else None
+            if assist_metadata:
+                assist_capture_events.append({**provenance, **assist_metadata})
             scope_link = MODULE_SCOPE_LINK.search(line)
             link_metadata = scope_link_metadata(scope_link.group(1)) if scope_link else None
             if link_metadata:
@@ -387,7 +449,7 @@ def analyze(path, after=None, date=None):
                         if re.search(r"\b" + key + "=", line):
                             fields[output_key] = exception_field(line) if key == "exception" else enum_field(line, key, allowed) or "OTHER"
                     diagnostic_events.append({**provenance, "stage": stage, **fields})
-            elif "capture stage=" in line:
+            elif "capture stage=" in line and "assist capture stage=" not in line:
                 stage = enum_field(line, "stage", {"armed", "observed", "command_rejected"})
                 if not stage:
                     continue
@@ -421,6 +483,18 @@ def analyze(path, after=None, date=None):
                 r"/(?:product|system|system_ext)/[A-Za-z0-9_./-]{0,220}/ContentCatcher[A-Za-z0-9_.-]*\.apk\b", line))
             stamped = re.match(r"\d\d-\d\d \d\d:\d\d:\d\d(?:\.\d+)?", line)
             in_window = stamped and (not selected_date or line[:5] == selected_date[5:]) and (not after or line[6:14] >= after)
+            runtime_config = HOST_RUNTIME_CONFIG.match(line) if in_window else None
+            runtime_metadata = runtime_config_metadata(runtime_config.group(1)) if runtime_config else None
+            if runtime_metadata:
+                runtime_config_events.append({"source": "full.log", "line": number, "at": stamped.group(), **runtime_metadata})
+            recognition_source = HOST_RECOGNITION_SOURCE.match(line) if in_window else None
+            source_metadata = recognition_source_metadata(recognition_source.group(1)) if recognition_source else None
+            if source_metadata:
+                recognition_source_events.append({"source": "full.log", "line": number, "at": stamped.group(), **source_metadata})
+            assist_capture = HOST_ASSIST_CAPTURE.match(line) if in_window else None
+            assist_metadata = assist_capture_metadata(assist_capture.group(1)) if assist_capture else None
+            if assist_metadata:
+                assist_capture_events.append({"source": "full.log", "line": number, "at": stamped.group(), **assist_metadata})
             scope_link = HOST_SCOPE_LINK.match(line) if in_window else None
             link_metadata = scope_link_metadata(scope_link.group(1)) if scope_link else None
             if link_metadata:
@@ -506,12 +580,18 @@ def analyze(path, after=None, date=None):
             "runtime_launch_events": runtime_launch_events,
             "source_scope_events": source_scope_events,
             "scope_capture_events": scope_capture_events,
+            "assist_capture_events": assist_capture_events,
+            "runtime_config_events": runtime_config_events,
+            "recognition_source_events": recognition_source_events,
             "scope_link_events": scope_link_events,
             "drag_gesture_events": drag_gesture_events,
             "observed_stages": sorted({event["stage"] for event in diagnostic_events}),
             "observed_capture_stages": sorted({event["stage"] for event in capture_events}),
             "observed_probe_stages": sorted({event["stage"] for event in probe_events}),
             "observed_scope_capture_stages": sorted({event["stage"] for event in scope_capture_events}),
+            "observed_assist_capture_stages": sorted({event["stage"] for event in assist_capture_events}),
+            "observed_recognition_sources": sorted({event["channel"] for event in recognition_source_events}),
+            "observed_runtime_config_stages": sorted({event["stage"] for event in runtime_config_events}),
             "observed_scope_link_stages": sorted({event["stage"] for event in scope_link_events}),
             "observed_drag_gesture_stages": sorted({event["stage"] for event in drag_gesture_events}),
             "system_capture_apks": sorted(component_paths), "text_events": text_events, "image_events": image_events,

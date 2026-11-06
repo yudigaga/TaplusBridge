@@ -58,6 +58,8 @@ internal object SettingsIcons {
     saveTag: String,
     onDiscard: () -> Unit,
     onSave: () -> Unit,
+    discardText: String = "放弃",
+    saveText: String = "保存",
 ) {
     Column {
         TopAppBar(title = title, subtitle = subtitle)
@@ -66,8 +68,8 @@ internal object SettingsIcons {
             horizontalArrangement = Arrangement.End,
             verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
         ) {
-            TextButton("放弃", onDiscard, Modifier.testTag(discardTag))
-            TextButton("保存", onSave, Modifier.testTag(saveTag))
+            TextButton(discardText, onDiscard, Modifier.testTag(discardTag))
+            TextButton(saveText, onSave, Modifier.testTag(saveTag))
         }
     }
 }

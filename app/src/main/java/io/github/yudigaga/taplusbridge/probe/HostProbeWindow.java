@@ -42,6 +42,29 @@ public final class HostProbeWindow implements AutoCloseable {
         this.width = width; this.height = height; this.windows = windows;
     }
 
+    /** System fallback owns its source point; this lease only releases the inspected host windows. */
+    public static AutoCloseable passthroughOwnedWindows(Object service) throws ReflectiveOperationException {
+        requireMain();
+        if (!(service instanceof Context context) || !BridgeContract.HOST_PACKAGE.equals(context.getPackageName()))
+            throw invalid("host_window_contract");
+        OwnedWindowLease lease = new OwnedWindowLease(service, readWindows(service, false));
+        try {
+            for (WindowState window : lease.windows) {
+                window.appliedFlags = (window.originalFlags & ~WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH)
+                        | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE;
+                window.appliedAlpha = 0f;
+                if (window.appliedFlags == window.originalFlags && window.appliedAlpha == window.originalAlpha) continue;
+                window.changed = true;
+                window.params.flags = window.appliedFlags; window.params.alpha = window.appliedAlpha;
+                window.manager.updateViewLayout(window.view, window.params);
+            }
+            return lease;
+        } catch (RuntimeException failure) {
+            try { lease.close(); } catch (RuntimeException restoreFailure) { failure.addSuppressed(restoreFailure); }
+            throw failure;
+        }
+    }
+
     /**
      * Only the inspected host contract is read. A stale point or obstructing opaque window fails
      * before any change; no alternate coordinate, display, or visibility workaround is guessed.
@@ -171,6 +194,8 @@ public final class HostProbeWindow implements AutoCloseable {
         if (!source.equals(value(service, "getInjectorPackage"))
                 || !activity.equals(value(service, "getInjectorActivity"))
                 || !content.equals(value(service, "getContentRect"))) throw invalid("source_changed");
+        PointF selected = selectedPoint(service, content);
+        if (Float.compare(x, selected.x) != 0 || Float.compare(y, selected.y) != 0) throw invalid("source_changed");
         List<WindowState> currentWindows = readWindows(service);
         if (currentWindows.size() != windows.size()) throw invalid("host_window_changed");
         for (int i = 0; i < windows.size(); i++) {
@@ -190,13 +215,18 @@ public final class HostProbeWindow implements AutoCloseable {
     }
 
     private static List<WindowState> readWindows(Object service) throws ReflectiveOperationException {
+        return readWindows(service, true);
+    }
+
+    private static List<WindowState> readWindows(Object service, boolean showingOnly) throws ReflectiveOperationException {
         List<WindowState> windows = new ArrayList<>();
         for (String name : WINDOW_FIELDS) {
             Object owner = field(service.getClass(), name).get(service);
             if (owner == null) continue;
             Object rawView = field(owner.getClass(), "mMainView").get(owner);
             Object showing = field(owner.getClass(), "mIsShowing").get(owner);
-            if (!(rawView instanceof View view) || !Boolean.TRUE.equals(showing) || !view.isAttachedToWindow()) continue;
+            if (!(rawView instanceof View view) || (showingOnly && !Boolean.TRUE.equals(showing))
+                    || !view.isAttachedToWindow()) continue;
             Object rawParams = field(owner.getClass(), "wmParams").get(owner);
             Object rawManager = field(owner.getClass(), "mWindowManager").get(owner);
             if (!(rawParams instanceof WindowManager.LayoutParams params) || !(rawManager instanceof WindowManager manager))
@@ -262,6 +292,37 @@ public final class HostProbeWindow implements AutoCloseable {
 
     private static IllegalStateException invalid(String reason) { return new IllegalStateException(reason); }
     private static IllegalStateException invalid(String reason, Throwable failure) { return new IllegalStateException(reason, failure); }
+
+    private static final class OwnedWindowLease implements AutoCloseable {
+        final Object service;
+        final List<WindowState> windows;
+        boolean closed;
+        OwnedWindowLease(Object service, List<WindowState> windows) { this.service = service; this.windows = windows; }
+        @Override public void close() {
+            requireMain();
+            if (closed) return;
+            closed = true;
+            RuntimeException firstFailure = null;
+            for (int i = windows.size() - 1; i >= 0; i--) {
+                WindowState window = windows.get(i);
+                if (!window.changed) continue;
+                try {
+                    if (field(service.getClass(), window.serviceField).get(service) != window.owner
+                            || field(window.owner.getClass(), "mMainView").get(window.owner) != window.view
+                            || field(window.owner.getClass(), "wmParams").get(window.owner) != window.params
+                            || field(window.owner.getClass(), "mWindowManager").get(window.owner) != window.manager
+                            || window.params.flags != window.appliedFlags || window.params.alpha != window.appliedAlpha) continue;
+                    window.params.flags = window.originalFlags; window.params.alpha = window.originalAlpha;
+                    if (window.view.isAttachedToWindow()) window.manager.updateViewLayout(window.view, window.params);
+                } catch (ReflectiveOperationException | RuntimeException failure) {
+                    RuntimeException restoreFailure = invalid("window_restore_failed", failure);
+                    if (firstFailure == null) firstFailure = restoreFailure;
+                    else firstFailure.addSuppressed(restoreFailure);
+                }
+            }
+            if (firstFailure != null) throw firstFailure;
+        }
+    }
 
     /** Fixed reason vocabulary only; never includes an arbitrary exception message or geometry. */
     public static String failureReason(Throwable failure) {

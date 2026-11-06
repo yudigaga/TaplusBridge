@@ -22,6 +22,7 @@ import io.github.yudigaga.taplusbridge.config.ConfigStore;
 import io.github.yudigaga.taplusbridge.capture.CaptureBroker;
 import io.github.yudigaga.taplusbridge.capture.CaptureLease;
 import io.github.yudigaga.taplusbridge.hook.HostPolicy;
+import io.github.yudigaga.taplusbridge.runtime.RuntimeSnapshot;
 
 public final class BridgeProvider extends ContentProvider {
     @Override public boolean onCreate() {
@@ -33,11 +34,15 @@ public final class BridgeProvider extends ContentProvider {
         if (context != null && "lens_config".equals(method) && Binder.getCallingUid() == Process.myUid()) {
             Bundle result = new Bundle(); result.putBoolean("enabled", new ConfigStore(context).lensEnabled()); return result;
         }
-        if (context != null && ("capture_take".equals(method) || "capture_report".equals(method)
+        if (context != null && ("capture_take".equals(method) || "capture_report".equals(method) || "probe_valid".equals(method)
                 || ("probe_status".equals(method) && Binder.getCallingUid() == 1000))) {
             if (Binder.getCallingUid() != 1000) return Bundle.EMPTY;
             long identity = Binder.clearCallingIdentity();
             try {
+                if ("probe_valid".equals(method)) {
+                    Bundle result = new Bundle(); result.putBoolean("enabled", extras != null
+                            && CaptureBroker.probeValid(context, extras.getString("nonce"), extras.getInt("user", -1))); return result;
+                }
                 if ("capture_take".equals(method)) return CaptureBroker.take(context, extras == null ? null : extras.getString("nonce"));
                 if ("probe_status".equals(method)) {
                     Bundle result = new Bundle(); result.putBoolean("saved", CaptureBroker.recordProbeStatus(context, extras)); return result;
@@ -50,6 +55,7 @@ public final class BridgeProvider extends ContentProvider {
                 && !"recognition_status".equals(method) && !"capture_available".equals(method)
                 && !"capture_arm".equals(method) && !"probe_arm".equals(method) && !"probe_status".equals(method) && !"capture_cancel".equals(method)
                 && !"source_scope".equals(method) && !"lens_config".equals(method)
+                && !"recognition_channels".equals(method)
                 && !"drag_take".equals(method) && !"drag_complete".equals(method) && !"drag_import".equals(method))) return Bundle.EMPTY;
         int uid = Binder.getCallingUid();
         if (uid / 100000 != Process.myUid() / 100000) return Bundle.EMPTY;
@@ -92,6 +98,12 @@ public final class BridgeProvider extends ContentProvider {
             if ("source_scope".equals(method)) {
                 Bundle result = new Bundle(); result.putString("policy", new ConfigStore(context).sourceScope().encode()); return result;
             }
+            if ("recognition_channels".equals(method)) {
+                RuntimeSnapshot config = RuntimeSnapshot.parse(RuntimeSnapshot.from(context));
+                Bundle result = new Bundle(); result.putString("channels", config.channels.toJson());
+                result.putString("identity", config.identity);
+                result.putBoolean("active", config.enabled && config.recognition); return result;
+            }
             if ("probe_status".equals(method)) {
                 Bundle result = new Bundle(); result.putBoolean("saved", CaptureBroker.recordProbeStatus(context, extras)); return result;
             }
@@ -99,12 +111,19 @@ public final class BridgeProvider extends ContentProvider {
                 ConfigStore config = new ConfigStore(context);
                 Bundle result = new Bundle(); result.putBoolean("enabled", android.os.Build.VERSION.SDK_INT >= 33
                         && config.enabled() && config.captureEnabled() && config.recognitionEnabled()
+                        && config.scopeLinkProbeEnabled()
                         && extras != null && CaptureLease.allowedSource(extras.getString("source")));
                 result.putInt("recognition_delay", config.getDragSettings().recognitionDelayMillis);
                 return result;
             }
-            if ("probe_arm".equals(method) && !new ConfigStore(context).recognitionEnabled()) return declined("recognition_disabled");
-            if ("capture_arm".equals(method) || "probe_arm".equals(method)) return android.os.Build.VERSION.SDK_INT >= 33
+            if ("probe_arm".equals(method)) {
+                ConfigStore config = new ConfigStore(context);
+                if (!config.recognitionEnabled()) return declined("recognition_disabled");
+                if (!config.scopeLinkProbeEnabled()) return declined("disabled");
+                return android.os.Build.VERSION.SDK_INT >= 33
+                        ? CaptureBroker.armProbe(context, extras == null ? null : extras.getString("source")) : declined("unsupported_system");
+            }
+            if ("capture_arm".equals(method)) return android.os.Build.VERSION.SDK_INT >= 33
                     ? CaptureBroker.arm(context, extras == null ? null : extras.getString("source")) : declined("unsupported_system");
             if ("capture_cancel".equals(method)) {
                 Bundle result = new Bundle(); result.putBoolean("cancelled", CaptureBroker.cancel(context, extras == null ? null : extras.getString("nonce"))); return result;

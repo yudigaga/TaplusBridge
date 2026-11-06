@@ -54,6 +54,7 @@ public final class HostProbeAction {
             try {
                 if(recognitionAt<=0) { finish(null,"stale_session");return; }
                 if(!current.getAsBoolean()) { finish(null,"stale_session");return; }
+                if(!probeEnabled()) { finish(null,"cancelled");return; }
                 Bundle request=new Bundle();request.putString("source",source);
                 Bundle ticket=io.github.yudigaga.taplusbridge.runtime.BridgeTransport.call(context,"probe_arm",request);
                 nonce=ticket==null?null:ticket.getString("nonce");
@@ -80,6 +81,13 @@ public final class HostProbeAction {
             Bundle data=new Bundle();data.putInt("protocol",ProbeContract.VERSION);
             data.putString("mode",ProbeContract.MODE);data.putString("nonce",nonce);data.putInt("user",user);return data;
         }
+        boolean probeEnabled() {
+            try {
+                Bundle request=new Bundle();request.putString("source",source);
+                Bundle available=io.github.yudigaga.taplusbridge.runtime.BridgeTransport.call(context,"capture_available",request);
+                return available!=null && available.getBoolean("enabled");
+            } catch(RuntimeException unavailable) { return false; }
+        }
         boolean authentic(Bundle data) {
             return data!=null && nonce!=null && nonce.equals(data.getString("nonce"))
                     && data.getInt("user",-2)==user && data.getInt("protocol",-1)==ProbeContract.VERSION
@@ -89,6 +97,7 @@ public final class HostProbeAction {
             if(finished)return;
             try {
                 if(!current.getAsBoolean()) { finish(null,"stale_session");return; }
+                if(!probeEnabled()) { finish(null,"cancelled");return; }
                 if(!authentic(data)) { finish(null,"protocol");return; }
                 if(code==ProbeContract.READY) {
                     if(ready)return;
@@ -107,6 +116,7 @@ public final class HostProbeAction {
                     main.postDelayed(() -> {
                         if(finished || tapSent)return;
                         if(!current.getAsBoolean()) { finish(null,"stale_session");return; }
+                        if(!probeEnabled()) { finish(null,"cancelled");return; }
                         try {
                             window.snapshot();tapSent=true;
                             context.sendBroadcast(new Intent(ProbeContract.TAP).setPackage("android").putExtras(envelope()));

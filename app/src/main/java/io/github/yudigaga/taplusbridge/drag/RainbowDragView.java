@@ -3,7 +3,6 @@ package io.github.yudigaga.taplusbridge.drag;
 import android.content.Context;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
-import android.graphics.Color;
 import android.graphics.LinearGradient;
 import android.graphics.Paint;
 import android.graphics.Path;
@@ -14,16 +13,17 @@ import android.view.HapticFeedbackConstants;
 import android.view.View;
 import java.util.Map;
 
-/** Four inward-moving rainbow targets and a content preview that follows the active finger. */
+/** Four inward-moving glass targets and a content preview that follows the active finger. */
 @android.annotation.SuppressLint("ViewConstructor") // Built only for an authorized drag, never inflated from XML.
 public final class RainbowDragView extends View {
     private static final String[] SIDES = {"up", "down", "left", "right"};
-    private static final int[] RAINBOW = {0xff35e4db, 0xff528bff, 0xffa374ff, 0xffef76ce, 0xffffa76b, 0xffffdf7b, 0xff6be8b0};
     private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final TextPaint text = new TextPaint(Paint.ANTI_ALIAS_FLAG);
     private final Path path = new Path();
     private final RectF rect = new RectF();
     private final float density, width, height, originX, originY;
+    private final float fontScale;
+    private final DragGlassPalette palette;
     private final Map<String, String> actions;
     private final DragContactFeedback feedback = new DragContactFeedback();
     private String caption;
@@ -37,6 +37,8 @@ public final class RainbowDragView extends View {
                            Map<String, String> actions, String caption, Bitmap image) {
         super(context);
         this.width = width; this.height = height; this.density = density;
+        this.fontScale = context.getResources().getConfiguration().fontScale;
+        this.palette = DragGlassPalette.from(context);
         this.originX = this.fingerX = originX; this.originY = this.fingerY = originY;
         this.actions = Map.copyOf(actions);
         this.caption = caption == null || caption.isBlank() ? image == null ? "已识别内容" : "图片" : caption.substring(0, Math.min(100, caption.length()));
@@ -46,8 +48,9 @@ public final class RainbowDragView extends View {
                     Math.max(1, Math.round(image.getHeight() * scale)), true);
             thumbnail = resized == image ? image.copy(Bitmap.Config.ARGB_8888, false) : resized;
         }
-        horizontal = new LinearGradient(0, 0, width, 0, RAINBOW, null, Shader.TileMode.CLAMP);
-        vertical = new LinearGradient(0, 0, height, 0, RAINBOW, null, Shader.TileMode.CLAMP);
+        int[] tint = {palette.getAccentSoft(), palette.getAccent(), palette.getAccentSoft()};
+        horizontal = new LinearGradient(0, 0, width, 0, tint, null, Shader.TileMode.CLAMP);
+        vertical = new LinearGradient(0, 0, height, 0, tint, null, Shader.TileMode.CLAMP);
         setClickable(true); setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_NO);
         contact = EdgeDragTarget.at(originX, originY, originX, originY, width, height, density);
     }
@@ -72,15 +75,22 @@ public final class RainbowDragView extends View {
         super.onDraw(canvas);
         float sx = getWidth() / width, sy = getHeight() / height;
         int save = canvas.save(); canvas.scale(sx, sy);
-        canvas.drawColor(0x22080d19);
+        canvas.drawColor(palette.getScrim());
         for (String side : SIDES) drawEdge(canvas, side);
         if (showPreview) drawPreview(canvas);
         String side = contact.touching();
-        String message = side != null && !"none".equals(actions.get(side)) ? "松手" + label(actions.get(side)) : "拖向彩虹区域 · 接触后松手";
-        text.setColor(Color.WHITE); text.setTextSize(13 * density); text.setTextAlign(Paint.Align.CENTER);
-        text.setShadowLayer(3 * density, 0, density, 0x99000000);
-        canvas.drawText(message, width / 2, Math.min(height - 80 * density, height * .72f), text);
-        text.clearShadowLayer(); canvas.restoreToCount(save);
+        String message = side != null && !"none".equals(actions.get(side)) ? "松手" + label(actions.get(side)) : "拖向操作区域 · 接触后松手";
+        text.setTextSize(13 * density * fontScale); text.setTextAlign(Paint.Align.CENTER);
+        message = android.text.TextUtils.ellipsize(message, text, Math.max(0, width - 64 * density),
+                android.text.TextUtils.TruncateAt.END).toString();
+        float hintY = Math.min(height - 80 * density, height * .72f);
+        float hintWidth = Math.min(width - 32 * density, text.measureText(message) + 32 * density);
+        float hintHeight = Math.max(40 * density, text.getFontSpacing() + 20 * density);
+        rect.set((width - hintWidth) / 2, hintY - hintHeight / 2, (width + hintWidth) / 2, hintY + hintHeight / 2);
+        drawGlass(canvas, rect, hintHeight / 2, side != null && !"none".equals(actions.get(side)));
+        text.setColor(palette.getForeground());
+        canvas.drawText(message, width / 2, hintY - (text.ascent() + text.descent()) / 2, text);
+        canvas.restoreToCount(save);
     }
 
     private void drawEdge(Canvas canvas, String side) {
@@ -103,8 +113,8 @@ public final class RainbowDragView extends View {
         paint.setStyle(Paint.Style.STROKE); paint.setShader(horizontalSide ? horizontal : vertical);
         paint.setStrokeCap(Paint.Cap.ROUND);
         for (int layer = 3; layer >= 0; layer--) {
-            paint.setStrokeWidth((touching && enabled ? 14 : 9) * density + layer * 12 * density);
-            paint.setAlpha(enabled ? (layer == 0 ? 240 : 20 + layer * 5) : 45);
+            paint.setStrokeWidth((touching && enabled ? 9 : 4) * density + layer * 8 * density);
+            paint.setAlpha(enabled ? (layer == 0 ? 205 : 10 + layer * 4) : 28);
             canvas.drawPath(path, paint);
         }
         paint.setShader(null); paint.setAlpha(255); canvas.restore();
@@ -121,24 +131,34 @@ public final class RainbowDragView extends View {
                     ? previewX + 108 * density : previewX - 108 * density;
             else cy = previewY - 70 * density > 28 * density ? previewY - 70 * density : previewY + 70 * density;
         }
-        paint.setStyle(Paint.Style.FILL); paint.setColor(touching && enabled ? 0xf2f8f7ff : 0xc9222838);
-        canvas.drawCircle(cx, cy, 23 * density, paint);
-        paint.setColor(touching && enabled ? 0xff393752 : enabled ? Color.WHITE : 0xff8b91a1);
+        rect.set(cx - 24 * density, cy - 24 * density, cx + 24 * density, cy + 24 * density);
+        drawGlass(canvas, rect, 24 * density, touching && enabled);
+        paint.setColor(enabled ? palette.getAccent() : palette.getSecondary());
         icon(canvas, action, cx, cy);
-        text.setTextSize(11 * density); text.setColor(enabled ? Color.WHITE : 0xffb0b3bf); text.setTextAlign(Paint.Align.CENTER);
-        float labelY = cy + 38 * density;
-        if (labelY > height - 8 * density) labelY = cy - 31 * density;
-        if (!touching) canvas.drawText(label(action), cx, labelY, text);
+        text.setTextSize(12 * density * fontScale); text.setColor(enabled ? palette.getForeground() : palette.getSecondary()); text.setTextAlign(Paint.Align.CENTER);
+        if (!touching) {
+            String title = android.text.TextUtils.ellipsize(label(action), text, Math.max(0, width - 48 * density),
+                    android.text.TextUtils.TruncateAt.END).toString();
+            float labelWidth = text.measureText(title) + 18 * density;
+            float labelHeight = Math.max(28 * density, text.getFontSpacing() + 10 * density);
+            float labelX = Math.max(labelWidth / 2 + 4 * density,
+                    Math.min(width - labelWidth / 2 - 4 * density, cx));
+            float labelY = cy + 24 * density + labelHeight / 2 + 4 * density;
+            if (labelY + labelHeight / 2 > height - 8 * density)
+                labelY = cy - 24 * density - labelHeight / 2 - 4 * density;
+            rect.set(labelX - labelWidth / 2, labelY - labelHeight / 2,
+                    labelX + labelWidth / 2, labelY + labelHeight / 2);
+            drawGlass(canvas, rect, labelHeight / 2, false);
+            canvas.drawText(title, labelX, labelY - (text.ascent() + text.descent()) / 2, text);
+        }
     }
 
     private void drawPreview(Canvas canvas) {
-        float halfWidth = 72 * density, halfHeight = 36 * density;
+        float halfWidth = 72 * density, halfHeight = Math.max(36, 18 + 14 * fontScale) * density;
         float cx = Math.max(halfWidth, Math.min(width - halfWidth, fingerX));
         float cy = Math.max(halfHeight, Math.min(height - halfHeight, fingerY));
         rect.set(cx - halfWidth, cy - halfHeight, cx + halfWidth, cy + halfHeight);
-        paint.setStyle(Paint.Style.FILL); paint.setColor(0xeaf8f8ff);
-        paint.setShadowLayer(12 * density, 0, 4 * density, 0x55000000);
-        canvas.drawRoundRect(rect, 14 * density, 14 * density, paint); paint.clearShadowLayer();
+        drawGlass(canvas, rect, 20 * density, false);
         float left = rect.left + 12 * density;
         if (thumbnail != null && !thumbnail.isRecycled()) {
             RectF thumb = new RectF(left, rect.top + 12 * density, left + 48 * density, rect.bottom - 12 * density);
@@ -146,7 +166,7 @@ public final class RainbowDragView extends View {
             canvas.clipPath(path); paint.setAlpha(235); canvas.drawBitmap(thumbnail, null, thumb, paint);
             paint.setAlpha(255); canvas.restoreToCount(save); left += 56 * density;
         }
-        text.setTextAlign(Paint.Align.LEFT); text.setTextSize(12 * density); text.setColor(0xff313445);
+        text.setTextAlign(Paint.Align.LEFT); text.setTextSize(12 * density * fontScale); text.setColor(palette.getForeground());
         String value = caption.replace('\n', ' ').replace('\r', ' ');
         float available = rect.right - 10 * density - left;
         for (int row = 0; row < 2 && !value.isEmpty(); row++) {
@@ -155,8 +175,22 @@ public final class RainbowDragView extends View {
             String line = value.substring(0, count); value = value.substring(count);
             if (row == 1 && !value.isEmpty()) line = android.text.TextUtils.ellipsize(line + "…", text, available,
                     android.text.TextUtils.TruncateAt.END).toString();
-            canvas.drawText(line, left, rect.top + (row == 0 ? 29 : 47) * density, text);
+            canvas.drawText(line, left, rect.top + 12 * density - text.ascent() + row * text.getFontSpacing(), text);
         }
+    }
+
+    private void drawGlass(Canvas canvas, RectF bounds, float radius, boolean selected) {
+        paint.setStyle(Paint.Style.FILL); paint.setShader(null); paint.setAlpha(255);
+        paint.setColor(selected ? palette.getSelected() : palette.getSurface());
+        if (!selected) paint.setShader(new LinearGradient(bounds.left, bounds.top, bounds.left, bounds.bottom,
+                palette.getSurface(), palette.getSurfaceBottom(), Shader.TileMode.CLAMP));
+        paint.setShadowLayer(12 * density, 0, 4 * density, palette.getShadow());
+        canvas.drawRoundRect(bounds, radius, radius, paint);
+        paint.clearShadowLayer(); paint.setShader(null);
+        paint.setStyle(Paint.Style.STROKE); paint.setStrokeWidth(density);
+        paint.setColor(selected ? palette.getAccent() : palette.getOutline());
+        canvas.drawRoundRect(bounds, radius, radius, paint);
+        paint.setStyle(Paint.Style.FILL);
     }
 
     private void icon(Canvas canvas, String action, float cx, float cy) {

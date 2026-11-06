@@ -4,6 +4,16 @@ from tools.analyze_lsp_archive import drag_gesture_metadata
 
 
 class DragGestureMetadataTest(unittest.TestCase):
+    def test_generic_drag_preparation_stages_retain_only_fixed_metadata(self):
+        for stage in ("prepare_requested", "prepare_metadata", "prepare_image", "prepare_image_unavailable",
+                      "prepare_capture_unavailable", "prepare_service_unavailable", "prepare_unavailable",
+                      "prepared", "prepare_failed", "expired"):
+            with self.subTest(stage=stage):
+                self.assertEqual(
+                    {"stage": stage, "reason": "unknown"},
+                    drag_gesture_metadata(f"drag gesture stage={stage} url=https://private.example/secret"),
+                )
+
     def test_system_transfer_rejection_reason_is_preserved(self):
         self.assertEqual(
             {"stage": "takeover_failed", "reason": "input_transfer_rejected"},

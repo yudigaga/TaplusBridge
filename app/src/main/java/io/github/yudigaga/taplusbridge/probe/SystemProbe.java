@@ -54,6 +54,7 @@ public final class SystemProbe {
     private final Object lock = new Object();
     private final ProbeGate gate = new ProbeGate();
     private final PhysicalTouchState physical = new PhysicalTouchState();
+    private final ProbePointEcho pointEcho = new ProbePointEcho();
     private final AtomicBoolean physicalFailureReported = new AtomicBoolean();
     private final AtomicBoolean physicalReadFailureReported = new AtomicBoolean();
     private volatile Session session;
@@ -62,6 +63,7 @@ public final class SystemProbe {
     private volatile io.github.yudigaga.taplusbridge.drag.SystemLongPressDrag longPressDrag;
     private volatile io.github.yudigaga.taplusbridge.runtime.RuntimeServer runtime;
     private SystemScopeCapture scopeCapture;
+    private SystemAssistContent assistContent;
     private volatile Object atmsInstance;
     private Class<?> activityTaskManagerType;
     private SourceWindowAccess windows;
@@ -131,10 +133,15 @@ public final class SystemProbe {
                                 && PhysicalTouchState.isTouchPointer(motion.getSource(), motion.getActionMasked())) {
                             readDevice = motion.getDeviceId();
                             int display = (Integer) getDisplay.invoke(motion);
+                            if(physical.isInjected(display,readDevice,motion.getDownTime(),SystemClock.uptimeMillis())){
+                                String echoed=pointEcho.observe(display,motion.getDownTime(),motion.getActionMasked(),motion.getRawX(),motion.getRawY());
+                                if(!"unrelated".equals(echoed))module.log(4,TAG,"probe stage=point_"+echoed);
+                            }
                             boolean realMainInput = display == 0 && !physical.isInjected(display, readDevice,
                                     motion.getDownTime(), SystemClock.uptimeMillis());
-                            if (realMainInput && motion.getActionMasked() == MotionEvent.ACTION_DOWN)
+                            if (realMainInput && motion.getActionMasked() == MotionEvent.ACTION_DOWN) {
                                 DragGestureGate.physicalDown(display, readDevice, motion.getDownTime());
+                            }
                             if (realMainInput && motion.getActionMasked() == MotionEvent.ACTION_UP)
                                 DragGestureGate.physicalUp(display, readDevice, motion.getDownTime());
                             var directional = longPressDrag;
@@ -145,6 +152,11 @@ public final class SystemProbe {
                                         motion.getEventTime(), motion.getActionMasked(), SystemClock.uptimeMillis(),
                                         SystemClock.elapsedRealtime());
                                 return chain.proceed();
+                            }
+                            if (realMainInput && motion.getActionMasked() == MotionEvent.ACTION_DOWN) {
+                                if (assistContent != null) assistContent.cancel();
+                                Session previous = session;
+                                if (previous != null) worker.post(() -> fail(previous, "source_changed"));
                             }
                             boolean soleBefore = physical.soleStream(display, readDevice, motion.getDownTime());
                             physical.event(display, readDevice, motion.getDownTime(), motion.getEventTime(),
@@ -191,7 +203,7 @@ public final class SystemProbe {
         activityTaskManagerType = atms;
         try {
             longPressDrag = new io.github.yudigaga.taplusbridge.drag.SystemLongPressDrag(module, worker,
-                    () -> system, () -> atmsInstance, () -> runtime, atms);
+                    () -> system, () -> atmsInstance, () -> runtime, atms, physical);
             longPressDrag.setOnDirectedRelease(() -> {
                 if (android.os.Looper.myLooper() == worker.getLooper()) releaseWaitingProbe();
                 else worker.postAtFrontOfQueue(this::releaseWaitingProbe);
@@ -207,6 +219,15 @@ public final class SystemProbe {
             module.log(5, TAG, "Scope capture system unavailable: " + unavailable.getClass().getSimpleName());
         }
         windows = new SourceWindowAccess(atms);
+        try {
+            assistContent = new SystemAssistContent(worker, () -> system, () -> atmsInstance,
+                    () -> runtime == null ? null : runtime.sourceContentConfiguration(), new ScopeCaptureWindow(atms),
+                    message -> module.log(4, TAG, message), physical);
+            if (scopeCapture != null) scopeCapture.setAssistContent(assistContent);
+            if (longPressDrag != null) longPressDrag.setAssistContent(assistContent);
+        } catch (ReflectiveOperationException | RuntimeException unavailable) {
+            module.log(5, TAG, "assist capture stage=unavailable");
+        }
         linkLaunchReady = ScopeLinkLaunchHooks.install(module, atms,
                 () -> scopeCapture == null ? null : scopeCapture.linkProbe(), this::interceptHostLaunch) > 0;
         Method entry = null;
@@ -323,7 +344,7 @@ public final class SystemProbe {
             }catch(ReflectiveOperationException|RuntimeException unavailable){
                 module.log(5,TAG,"Frozen runtime unavailable: "+unavailable.getClass().getSimpleName());
             }
-            InputAdapter adapter = new InputAdapter(context, physical);
+            InputAdapter adapter = new InputAdapter(context, physical, pointEcho);
             if (scopeCapture != null && linkLaunchReady && scopeCapture.linkProbe() == null) {
                 scopeCapture.setLinkProbe(new ScopeLinkProbe(worker, physical,
                         () -> runtime == null ? null : runtime.sourceCaptureConfiguration(),
@@ -337,6 +358,7 @@ public final class SystemProbe {
                                 SourceWindowAccess.CardPlan planned = cardPlan;
                                 cardPlan = null;
                                 if (planned != null && planned.dismiss()) {
+                                    if (planned.popupCovered()) throw new IllegalStateException("popup_requires_source_bridge");
                                     long dismissAt = SystemClock.uptimeMillis();
                                     boolean sent = false;
                                     try {
@@ -358,8 +380,19 @@ public final class SystemProbe {
                             return adapter.injectTarget(target.uid, target.display, target.x, target.y, action, downAt);
                         },
                         message -> module.log(4, TAG, message)));
-                if (longPressDrag != null) longPressDrag.setCardLinks((target, config, url) ->
-                        scopeCapture.linkProbe().confirm(target, config, url));
+                if (longPressDrag != null) longPressDrag.setCardLinks(new io.github.yudigaga.taplusbridge.drag.SystemLongPressDrag.CardLinks() {
+                    @Override public void capture(ScopeCaptureWindow.Snapshot target,
+                                                  io.github.yudigaga.taplusbridge.runtime.RuntimeSnapshot config,
+                                                  java.util.function.Consumer<String> url) {
+                        scopeCapture.captureDragLink(target, config, 0, 0, physical.releasedElapsedAt(), url);
+                    }
+                    @Override public void captureFromGesture(ScopeCaptureWindow.Snapshot target,
+                                                             io.github.yudigaga.taplusbridge.runtime.RuntimeSnapshot config,
+                                                             long downUptime, long recognitionAt, long releasedAt,
+                                                             java.util.function.Consumer<String> url) {
+                        scopeCapture.captureDragLink(target, config, downUptime, recognitionAt, releasedAt, url);
+                    }
+                });
             }
             if (!armRegistered) {
                 registerAll(context, new BroadcastReceiver() {
@@ -420,10 +453,13 @@ public final class SystemProbe {
             Bundle ticket = call(user, "capture_take", request);
             String source = ticket == null ? null : ticket.getString("source");
             int uid = ticket == null ? -1 : ticket.getInt("source_uid", -1);
-            if (ticket == null || ticket.getInt("user", -1) != user || !CaptureLease.allowedSource(source)
+            if (ticket == null || !ticket.getBoolean("probe") || ticket.getInt("user", -1) != user || !CaptureLease.allowedSource(source)
                     || uid < 0 || uid / 100000 != user) throw new Rejected("protocol");
             if (!snapshot.valid(source, SystemClock.elapsedRealtime())) throw new Rejected("snapshot");
             validateForeground(source, user, snapshot);
+            if ((longPressDrag != null && !longPressDrag.sourcePointStable(source, snapshot.capturedAt()))
+                    || (scopeCapture != null && !scopeCapture.sourcePointStable(source, snapshot.capturedAt())))
+                throw new Rejected("source_changed");
             if (scopeCapture != null && !scopeCapture.tryYieldLinkToHost(source, uid, user, snapshot.capturedAt()))
                 throw new Rejected("busy");
             Session accepted;
@@ -455,7 +491,7 @@ public final class SystemProbe {
         }
         boolean dragUp = longPressDrag != null && longPressDrag.fingerReleasedForLink();
         if (DragGestureGate.suppressLongPress() && !dragUp) { fail(owner, "dragging"); return; }
-        if(owner.autonomous() && (runtime==null || !runtime.captureValid(owner.ticket().nonce(),owner.ticket().user()))) {
+        if(!probeValid(owner)) {
             fail(owner,"cancelled");return;
         }
         if(session==owner && physical.unavailable()) { fail(owner,"touch_unknown");return; }
@@ -586,11 +622,14 @@ public final class SystemProbe {
         windows.available(atmsInstance);
     }
     private ProbeClickPlan.Window inspectInputWindow(Session owner) throws ReflectiveOperationException {
-        if(owner.autonomous() && (runtime==null || !runtime.captureValid(owner.ticket().nonce(),owner.ticket().user())))throw new Rejected("cancelled");
+        if(!probeValid(owner))throw new Rejected("cancelled");
         if(physical.unavailable())throw new Rejected("touch_unknown");
         if (!physical.released() && (longPressDrag == null || !longPressDrag.fingerReleasedForLink()))
             throw new Rejected("touch_active");
         ProbeGate.Ticket ticket = owner.ticket(); Snapshot snapshot = owner.snapshot();
+        if ((longPressDrag != null && !longPressDrag.sourcePointStable(ticket.source(), snapshot.capturedAt()))
+                || (scopeCapture != null && !scopeCapture.sourcePointStable(ticket.source(), snapshot.capturedAt())))
+            throw new Rejected("source_changed");
         validateForeground(ticket.source(), ticket.user(), snapshot);
         return windows.inspect(atmsInstance, ticket.source(), snapshot.activity(), ticket.uid(), ticket.user(),
                 snapshot.display(), snapshot.x(), snapshot.y());
@@ -616,8 +655,19 @@ public final class SystemProbe {
             return hex.toString();
         } catch (java.security.NoSuchAlgorithmException impossible) { return null; }
     }
+    private boolean probeValid(Session owner) {
+        if(owner.autonomous())return runtime!=null && runtime.captureValid(owner.ticket().nonce(),owner.ticket().user());
+        try {
+            Bundle request=new Bundle();request.putString("nonce",owner.ticket().nonce());request.putInt("user",owner.ticket().user());
+            Bundle response=providerCall(owner.ticket().user(),"probe_valid",request);
+            return response!=null && response.getBoolean("enabled");
+        } catch(ReflectiveOperationException|RuntimeException unavailable) { return false; }
+    }
     private Bundle call(int user, String method, Bundle data) throws ReflectiveOperationException {
         if(runtime!=null){Bundle local=runtime.systemCall(user,method,data);if(local!=null)return local;}
+        return providerCall(user,method,data);
+    }
+    private Bundle providerCall(int user, String method, Bundle data) throws ReflectiveOperationException {
         Context context = userContext(system, user);
         if(io.github.yudigaga.taplusbridge.runtime.BridgeTransport.moduleUnavailable(context))return Bundle.EMPTY;
         long identity = Binder.clearCallingIdentity();
@@ -669,11 +719,13 @@ public final class SystemProbe {
         final Object manager;
         final Method inject, setDisplay;
         final PhysicalTouchState physical;
+        final ProbePointEcho pointEcho;
         // Only constructed by the system_server receiver setup. App-target hidden API restrictions do
         // not apply here; an unavailable display-targeting method rejects READY instead of falling back.
         @android.annotation.SuppressLint("BlockedPrivateApi")
-        InputAdapter(Context context, PhysicalTouchState physical) throws ReflectiveOperationException {
+        InputAdapter(Context context, PhysicalTouchState physical, ProbePointEcho pointEcho) throws ReflectiveOperationException {
             this.physical = physical;
+            this.pointEcho = pointEcho;
             manager = context.getSystemService(Context.INPUT_SERVICE);
             if (manager == null) throw new IllegalStateException("No input service");
             inject = manager.getClass().getMethod("injectInputEvent", InputEvent.class, int.class, int.class);
@@ -685,6 +737,7 @@ public final class SystemProbe {
             return injectTarget(session.ticket().uid(), point.display(), point.x(), point.y(), action, downAt);
         }
         boolean injectTarget(int uid, int display, float x, float y, int action, long downAt) throws ReflectiveOperationException {
+            if(action==MotionEvent.ACTION_UP && !pointEcho.valid(display,downAt))throw new Rejected("point_mismatch");
             if (action == MotionEvent.ACTION_DOWN) {
                 if (!physical.released()) throw new Rejected("touch_active");
                 physical.injected(display, 0, downAt, SystemClock.uptimeMillis());
@@ -694,6 +747,7 @@ public final class SystemProbe {
                         downAt, SystemClock.uptimeMillis());
             }
             MotionEvent event = MotionEvent.obtain(downAt, SystemClock.uptimeMillis(), action, x, y, 0);
+            pointEcho.expect(display,downAt,action,x,y);
             try {
                 event.setSource(InputDevice.SOURCE_TOUCHSCREEN); setDisplay.invoke(event, display);
                 // WAIT_FOR_FINISHED=2: the popup must process outside DOWN/CANCEL before WMS is

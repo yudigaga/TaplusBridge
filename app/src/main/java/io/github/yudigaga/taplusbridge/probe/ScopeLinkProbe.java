@@ -168,12 +168,40 @@ public final class ScopeLinkProbe {
     /** The fallback tap cannot run before recognition is ready for the same physical gesture. */
     public void confirm(ScopeCaptureWindow.Snapshot snapshot, RuntimeSnapshot config, long recognitionAt,
                         long releasedAt, Consumer<String> complete) {
+        confirm(snapshot, config, recognitionAt, releasedAt, complete, null, false);
+    }
+
+    /** A drag keeps the scope observer's URL only when both observers saw this exact DOWN and target. */
+    public void confirmDrag(ScopeCaptureWindow.Snapshot snapshot, RuntimeSnapshot config, long downUptime,
+                            long recognitionAt, long releasedAt, Consumer<String> complete) {
+        Objects.requireNonNull(complete);
+        Run run; ScopeCaptureWindow.Snapshot target = snapshot;
+        synchronized (lock) {
+            run = active;
+            if (retired.contains(snapshot) || (run != null && (run.downAt != downUptime || config == null
+                    || !run.config.identity.equals(config.identity) || !run.snapshot.sameTarget(snapshot)))) {
+                worker.post(() -> complete.accept(null)); return;
+            }
+            if (run != null) {
+                target = run.snapshot;
+                if (target != snapshot) {
+                    retired.add(snapshot);
+                    if (retired.size() > 8) retired.remove(0);
+                }
+            }
+        }
+        confirm(target, config, recognitionAt, releasedAt, complete, run, true);
+    }
+
+    private void confirm(ScopeCaptureWindow.Snapshot snapshot, RuntimeSnapshot config, long recognitionAt,
+                         long releasedAt, Consumer<String> complete, Run expected, boolean exactRun) {
         Objects.requireNonNull(complete);
         long nowElapsed = SystemClock.elapsedRealtime();
         Run run;
         synchronized (lock) {
             if (retired.contains(snapshot)) { worker.post(() -> complete.accept(null)); return; }
             run = active;
+            if (exactRun && run != expected) { worker.post(() -> complete.accept(null)); return; }
         }
         if (!valid(config, snapshot) || !sameConfig(config, snapshot) || !physical.released()) {
             if (run != null) finish(run, null, "configuration_changed");
@@ -382,6 +410,8 @@ public final class ScopeLinkProbe {
             if (component != null && CaptureLease.expectedDestination(source,
                     component.getPackageName(), component.getClassName()))
                 return ProbePayload.uniqueHttpUrl(intent);
+            if (component != null && source.equals(component.getPackageName()))
+                return ProbePayload.uniqueSourcePageUrl(intent, source);
             if (Intent.ACTION_CHOOSER.equals(intent.getAction())) {
                 if (intent.getData() != null || intent.hasExtra(Intent.EXTRA_INITIAL_INTENTS)
                         || intent.hasExtra("android.intent.extra.ALTERNATE_INTENTS")

@@ -36,7 +36,21 @@ public final class ConfigStore {
     public boolean recognitionEnabled() { return prefs.getBoolean("recognition", true); }
     public void setRecognitionEnabled(boolean value) { prefs.edit().putBoolean("recognition", value).commit(); }
     public boolean lensEnabled() { return prefs.getBoolean("google_lens", true); }
-    public void setLensEnabled(boolean value) { prefs.edit().putBoolean("google_lens", value).commit(); }
+    public void setLensEnabled(boolean value) {
+        if (!prefs.edit().putBoolean("google_lens", value).commit())
+            throw new IllegalStateException("识图设置保存失败，请重试");
+    }
+    public RecognitionChannels recognitionChannels() {
+        if (!prefs.contains(RecognitionChannels.KEY)) return RecognitionChannels.defaults();
+        try { return RecognitionChannels.parse(prefs.getString(RecognitionChannels.KEY, null)); }
+        catch (RuntimeException malformed) { return RecognitionChannels.disabled(); }
+    }
+    public void setRecognitionChannel(RecognitionChannels.Channel channel, boolean enabled) {
+        RecognitionChannels changed = recognitionChannels().with(channel, enabled);
+        if (!prefs.edit().putString(RecognitionChannels.KEY, changed.toJson()).commit())
+            throw new IllegalStateException("识别来源设置保存失败，请重试");
+        context.sendBroadcast(new Intent(SOURCE_SCOPE_CHANGED).setPackage(HostPolicy.HOST_PACKAGE));
+    }
     public DragSettings getDragSettings() {
         try {
             String raw = prefs.getString(DragSettings.KEY, null);
@@ -48,6 +62,13 @@ public final class ConfigStore {
         if (!prefs.edit().putString(DragSettings.KEY, value.toJson()).commit())
             throw new IllegalStateException("拖拽设置保存失败，请重试");
     }
+    public void setDragSettings(DragSettings value, boolean linkProbe) {
+        if (value == null) throw new IllegalArgumentException("拖拽配置无效，请重新设置");
+        if (!prefs.edit().putString(DragSettings.KEY, value.toJson())
+                .putBoolean(SCOPE_LINK_PROBE_KEY, linkProbe).commit())
+            throw new IllegalStateException("拖拽设置保存失败，请重试");
+        context.sendBroadcast(new Intent(SOURCE_SCOPE_CHANGED).setPackage(HostPolicy.HOST_PACKAGE));
+    }
     public boolean captureEnabled() { return prefs.getBoolean("capture", true); }
     public void setCaptureEnabled(boolean value) { prefs.edit().putBoolean("capture", value).commit(); }
     public boolean independentEnabled(){return prefs.getBoolean("independent_runtime",true);}
@@ -56,9 +77,19 @@ public final class ConfigStore {
         try { return prefs.getBoolean(SCOPE_CAPTURE_KEY, false); }
         catch (RuntimeException malformed) { return false; }
     }
+    public void setScopeCaptureEnabled(boolean value) {
+        if (!prefs.edit().putBoolean(SCOPE_CAPTURE_KEY, value).commit())
+            throw new IllegalStateException("截图兜底设置保存失败，请重试");
+        context.sendBroadcast(new Intent(SOURCE_SCOPE_CHANGED).setPackage(HostPolicy.HOST_PACKAGE));
+    }
     public boolean scopeLinkProbeEnabled() {
         try { return prefs.getBoolean(SCOPE_LINK_PROBE_KEY, false); }
         catch (RuntimeException malformed) { return false; }
+    }
+    public void setScopeLinkProbeEnabled(boolean value) {
+        if (!prefs.edit().putBoolean(SCOPE_LINK_PROBE_KEY, value).commit())
+            throw new IllegalStateException("补点设置保存失败，请重试");
+        context.sendBroadcast(new Intent(SOURCE_SCOPE_CHANGED).setPackage(HostPolicy.HOST_PACKAGE));
     }
     public SourceScopePolicy sourceScope() {
         if (!prefs.contains(SourceScopePolicy.KEY)) return SourceScopePolicy.unmanaged();

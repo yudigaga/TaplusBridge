@@ -48,6 +48,16 @@ public final class ScopeCaptureWindow {
             this.bounds = new Rect(bounds); expectedBounds = new Rect(bounds);
             this.window = window; this.record = record; this.surface = surface;
         }
+
+        /** Separate observers may lease the same original point in the same physical gesture. */
+        public boolean sameTarget(Snapshot other) {
+            return other != null && source.equals(other.source) && activity.equals(other.activity)
+                    && uid == other.uid && user == other.user && display == other.display
+                    && Float.compare(x, other.x) == 0 && Float.compare(y, other.y) == 0
+                    && expectedBounds.equals(other.expectedBounds) && bounds.equals(expectedBounds)
+                    && other.bounds.equals(other.expectedBounds) && window == other.window && record == other.record
+                    && sameSurface(surface, other.surface);
+        }
     }
 
     /** Backend seam exercises WMS checks without claiming a local JVM performed a real capture. */
@@ -126,8 +136,18 @@ public final class ScopeCaptureWindow {
 
     /** Only the captured main layer is read, with popup layers excluded and the source UID enforced. */
     public Bitmap capture(Object atms, Snapshot original) throws ReflectiveOperationException {
+        return capture(atms, original, -1);
+    }
+
+    /** The same source-only capture may proceed behind the authenticated native host's overlay. */
+    public Bitmap captureBehindHost(Object atms, Snapshot original, int hostUid) throws ReflectiveOperationException {
+        if (hostUid < 10000 || hostUid >= 100000) throw rejected("capture_host_identity");
+        return capture(atms, original, hostUid);
+    }
+
+    private Bitmap capture(Object atms, Snapshot original, int hostUid) throws ReflectiveOperationException {
         if (original == null) throw rejected("capture_snapshot");
-        Object[] excluded = validateWindows(atms, original);
+        Object[] excluded = validateWindows(atms, original, hostUid);
         int width = original.expectedBounds.width(), height = original.expectedBounds.height();
         float scale = (float) Math.min(1d, Math.min((double) MAX_EDGE / Math.max(width, height),
                 Math.sqrt((double) MAX_PIXELS / ((double) width * height))));
@@ -137,7 +157,7 @@ public final class ScopeCaptureWindow {
                     || result.getWidth() > MAX_EDGE || result.getHeight() > MAX_EDGE
                     || (long) result.getWidth() * result.getHeight() > MAX_PIXELS)
                 throw rejected("capture_buffer");
-            Object[] after = validateWindows(atms, original);
+            Object[] after = validateWindows(atms, original, hostUid);
             if (excluded.length != after.length) throw rejected("capture_window_changed");
             for (int i = 0; i < excluded.length; i++)
                 if (excluded[i] != after[i]) throw rejected("capture_window_changed");
@@ -157,6 +177,14 @@ public final class ScopeCaptureWindow {
     public void validateBehindHost(Object atms, Snapshot original, int hostUid) throws ReflectiveOperationException {
         if (hostUid < 10000 || hostUid >= 100000) throw rejected("capture_host_identity");
         validateWindows(atms, original, hostUid);
+    }
+
+    /** Token of the already validated source Activity; never accepts a token supplied by an app. */
+    public android.os.IBinder assistActivityToken(Snapshot original) throws ReflectiveOperationException {
+        if (original == null) throw rejected("capture_snapshot");
+        Object token = field(original.record.getClass(), "token").get(original.record);
+        if (!(token instanceof android.os.IBinder binder)) throw rejected("capture_activity_token");
+        return binder;
     }
 
     /** Transfers only this still-active source gesture to the registered, touchable host mask. */

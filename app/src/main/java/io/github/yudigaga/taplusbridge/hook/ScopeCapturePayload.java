@@ -19,6 +19,7 @@ import java.util.regex.Pattern;
 public final class ScopeCapturePayload {
     public static final int MAX_BYTES = 8 * 1024 * 1024, MAX_EDGE = 2000, MAX_PIXELS = 3_000_000;
     public static final int MAX_URL_LENGTH = 16 * 1024;
+    public static final int MAX_CONTENT_LENGTH = 128 * 1024;
     public static final long MAX_AGE_MILLIS = 10_000;
     public static final String LINK_URL_KEY = "taplus_scope_link_url";
     private static final Pattern ACTIVITY = Pattern.compile("[A-Za-z_$][A-Za-z0-9_$]*(?:\\.[A-Za-z_$][A-Za-z0-9_$]*)+");
@@ -34,9 +35,12 @@ public final class ScopeCapturePayload {
         if (response == null) throw invalid();
         String source = string(response, "source"), activity = string(response, "activity");
         String kind = response.containsKey("kind") ? string(response, "kind") : "image";
-        if (!"image".equals(kind) && !"text".equals(kind) && !"resume".equals(kind)) throw invalid();
+        if (!"image".equals(kind) && !"text".equals(kind) && !"resume".equals(kind) && !"content".equals(kind)) throw invalid();
         boolean text = "text".equals(kind);
+        boolean content = "content".equals(kind);
         boolean resume = "resume".equals(kind);
+        if ((content && !validContent(response.get("text")))
+                || (response.containsKey("text") && (!validContent(response.get("text")) || resume))) throw invalid();
         if (resume ? response.containsKey("url") || response.containsKey("fd")
                 : response.containsKey("url") && !validTextUrl(string(response, "url"))) throw invalid();
         int uid = integer(response, "uid"), user = integer(response, "user"), display = integer(response, "display");
@@ -50,7 +54,8 @@ public final class ScopeCapturePayload {
                 || activity.length() > 512 || !ACTIVITY.matcher(activity).matches()
                 || uid < 10000 || uid >= 100000 || user != 0 || display != 0
                 || width <= 0 || height <= 0 || width > 16384 || height > 16384
-                || (resume ? bytes != 0 : text ? bytes != 0 || response.containsKey("fd") || !validTextUrl(string(response, "url"))
+                || (resume ? bytes != 0 : content ? bytes != 0 || response.containsKey("fd")
+                    : text ? bytes != 0 || response.containsKey("fd") || !validTextUrl(string(response, "url"))
                     : bytes <= 0 || bytes > MAX_BYTES) || left < 0 || top < 0
                 || right <= left || bottom <= top || right > width || bottom > height
                 || !Float.isFinite(x) || !Float.isFinite(y) || x < left || x >= right || y < top || y >= bottom
@@ -59,6 +64,11 @@ public final class ScopeCapturePayload {
                     || captured - started > MAX_AGE_MILLIS))) throw invalid();
         return new Metadata(source, activity, uid, user, display, x, y, left, top, right, bottom,
                 captured, width, height, bytes, kind);
+    }
+
+    public static boolean validContent(Object value) {
+        return value instanceof String text && !text.isBlank() && text.length() <= MAX_CONTENT_LENGTH
+                && text.indexOf('\0') < 0;
     }
 
     /** A complete single HTTP(S) URI, not a title or substring containing one. */
@@ -162,6 +172,16 @@ public final class ScopeCapturePayload {
             Object result = result(metadata, versionCode, identity);
             Bundle text = geometry(metadata, 1); text.putString("viewContent", url);
             addContent.invoke(result, "text_pick", "pick_mode", text);
+            return enrich(result, url);
+        }
+
+        public Object createContent(Metadata metadata, String text, String url, int versionCode, String identity)
+                throws ReflectiveOperationException {
+            if (!"content".equals(metadata.kind()) || !validContent(text)
+                    || (url != null && !validTextUrl(url))) throw invalid();
+            Object result = result(metadata, versionCode, identity);
+            Bundle content = geometry(metadata, 1); content.putString("viewContent", text);
+            addContent.invoke(result, "text_pick", "pick_mode", content);
             return enrich(result, url);
         }
 
