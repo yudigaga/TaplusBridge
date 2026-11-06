@@ -21,6 +21,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Set;
 import java.util.regex.Pattern;
+import io.github.yudigaga.taplusbridge.recognition.RouteLink;
 
 /** Versioned, declarative online format. No executable expressions or intent payloads are accepted. */
 final class OnlineRuleBundle {
@@ -82,7 +83,7 @@ final class OnlineRuleBundle {
             String source = string(rule, "sourcePackage");
             require("*".equals(source) || validPackage(source), "rule-source");
             String host = string(rule, "host");
-            require(host.length() <= 128 && HOST.matcher(host).matches(), "rule-host");
+            require(host.length() <= 128 && (HOST.matcher(host).matches() || RouteLink.protocolRule(host)), "rule-host");
             String target = string(rule, "package");
             require(validPackage(target), "rule-package");
             String conversion = string(rule, "conversion");

@@ -8,6 +8,9 @@ import android.util.Base64;
 import java.security.SecureRandom;
 import java.util.Map;
 import org.json.JSONObject;
+import org.json.JSONArray;
+import java.util.ArrayList;
+import io.github.yudigaga.taplusbridge.recognition.BatchLinks;
 
 final class TicketStore {
     private static final Object LOCK = new Object();
@@ -26,6 +29,10 @@ final class TicketStore {
             String token = Base64.encodeToString(bytes, Base64.NO_WRAP | Base64.URL_SAFE | Base64.NO_PADDING);
             try {
                 JSONObject item = new JSONObject(); item.put("issued", now);
+                if (request.containsKey(BatchLinks.LINKS_KEY)) {
+                    if (request.containsKey("url") || request.containsKey("candidate")) return null;
+                    item.put(BatchLinks.LINKS_KEY, new JSONArray(BatchLinks.normalize(request.get(BatchLinks.LINKS_KEY))));
+                }
                 Intent original = request.getParcelable("original");
                 Intent candidate = request.getParcelable("candidate");
                 if (original != null) item.put("original", original.toUri(0));
@@ -53,6 +60,14 @@ final class TicketStore {
             if (item.has("candidate")) request.putParcelable("candidate", Intent.parseUri(item.getString("candidate"), 0));
             if (item.has("url")) request.putString("url", item.getString("url"));
             if (item.has("source")) request.putString("source", item.getString("source"));
+            if (item.has(BatchLinks.LINKS_KEY)) {
+                if (item.has("url") || item.has("candidate")) return null;
+                JSONArray array = item.getJSONArray(BatchLinks.LINKS_KEY);
+                if (array.length() == 0 || array.length() > BatchLinks.MAX_LINKS) return null;
+                ArrayList<Object> supplied = new ArrayList<>();
+                for (int i = 0; i < array.length(); i++) supplied.add(array.get(i));
+                request.putStringArrayList(BatchLinks.LINKS_KEY, new ArrayList<>(BatchLinks.normalize(supplied)));
+            }
             return request;
         } catch (Exception e) { return null; }
     }

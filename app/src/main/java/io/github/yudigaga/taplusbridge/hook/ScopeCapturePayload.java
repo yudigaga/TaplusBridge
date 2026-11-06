@@ -71,8 +71,10 @@ public final class ScopeCapturePayload {
                 && text.indexOf('\0') < 0;
     }
 
-    /** A complete single HTTP(S) URI, not a title or substring containing one. */
+    /** A complete single supported link, not a title or substring containing one. */
     public static boolean validTextUrl(String value) {
+        if (io.github.yudigaga.taplusbridge.recognition.RouteLink.valid(value, MAX_URL_LENGTH)
+                && !io.github.yudigaga.taplusbridge.recognition.RouteLink.validHttp(value, MAX_URL_LENGTH)) return true;
         if (value == null || value.isEmpty() || value.length() > MAX_URL_LENGTH) return false;
         for (int i = 0; i < value.length(); i++) {
             char c = value.charAt(i);

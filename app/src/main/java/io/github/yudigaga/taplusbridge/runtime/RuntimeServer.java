@@ -335,11 +335,14 @@ public final class RuntimeServer {
     }
     private Bundle route(int owner,String method,Bundle request,RuntimeSnapshot config){
         if(request.containsKey("explicit_target"))return declined("invalid_request");
-        if("resolve".equals(method) && request.getBoolean("local_recognition") && !config.recognition)return declined("recognition_disabled");
+        if(request.getBoolean("local_recognition") && !config.recognition)return declined("recognition_disabled");
+        if(request.getBoolean("clipboard") && (request.getString("source")!=null || !config.channels.enabled(
+                io.github.yudigaga.taplusbridge.config.RecognitionChannels.Channel.CLIPBOARD)))return declined("recognition_disabled");
         boolean ephemeral=request.getBoolean("ephemeral");
         if(ephemeral){request.remove("original");request.remove("candidate");}
         long planningStarted=SystemClock.elapsedRealtimeNanos();
-        LaunchPlanner.PlanningResult result=LaunchPlanner.planWithRules(context,request,config.enabled,config.nativeLinks,config.rules);
+        LaunchPlanner.PlanningResult result=LaunchPlanner.planWithRules(context,request,config.enabled,config.nativeLinks,
+                config.cloudLinkHandoff,config.rules);
         perf("route_plan",planningStarted,result.plan()==null?"no_match":"resolved");
         if(result.plan()==null)return declined(result.reason());
         var plan=result.plan();

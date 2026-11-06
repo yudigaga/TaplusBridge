@@ -17,6 +17,7 @@ public final class ConfigStore {
     public static final String SOURCE_SCOPE_CHANGED = "io.github.yudigaga.taplusbridge.SOURCE_SCOPE_CHANGED";
     public static final String SCOPE_CAPTURE_KEY = "scope_capture_fallback";
     public static final String SCOPE_LINK_PROBE_KEY = "scope_link_probe";
+    public static final String CLOUD_LINK_HANDOFF_KEY = "cloud_link_handoff";
     private final SharedPreferences prefs;
     private final Context context;
     public ConfigStore(Context context) {
@@ -33,6 +34,15 @@ public final class ConfigStore {
     public void setEnabled(boolean value) { prefs.edit().putBoolean("enabled", value).commit(); }
     public boolean nativeEnabled() { return prefs.getBoolean("native", true); }
     public void setNativeEnabled(boolean value) { prefs.edit().putBoolean("native", value).commit(); }
+    public boolean cloudLinkHandoffEnabled() {
+        try { return prefs.getBoolean(CLOUD_LINK_HANDOFF_KEY, true); }
+        catch (RuntimeException malformed) { return false; }
+    }
+    public void setCloudLinkHandoffEnabled(boolean value) {
+        if (!prefs.edit().putBoolean(CLOUD_LINK_HANDOFF_KEY, value).commit())
+            throw new IllegalStateException("网盘链接适配设置保存失败，请重试");
+        context.sendBroadcast(new Intent(SOURCE_SCOPE_CHANGED).setPackage(HostPolicy.HOST_PACKAGE));
+    }
     public boolean recognitionEnabled() { return prefs.getBoolean("recognition", true); }
     public void setRecognitionEnabled(boolean value) { prefs.edit().putBoolean("recognition", value).commit(); }
     public boolean lensEnabled() { return prefs.getBoolean("google_lens", true); }

@@ -363,7 +363,7 @@ public final class SystemLongPressDrag implements RuntimeServer.DragGestures {
                 || run == null || !token.equals(run.token) || !valid(run, config) || !config.scopeLinkProbe
                 || !run.gesture.released() || run.direction() == null || run.linkRequested || cardLinks == null
                 || run.sourceMovedBeforeTransfer
-                || run.nativeUrlAvailable || IntentObservation.validHttpUrl(run.cardLink)
+                || run.nativeUrlAvailable || io.github.yudigaga.taplusbridge.recognition.RouteLink.valid(run.cardLink)
                 || physical == null || !physical.released()
                 || physical.releasedAt() < run.gesture.downAt()
                 || physical.releasedElapsedAt() < run.stages.recognitionAt()
@@ -406,7 +406,7 @@ public final class SystemLongPressDrag implements RuntimeServer.DragGestures {
         if (!valid(run, config)) { cancelRun(run, "lease_invalid"); return cancelled(); }
         if (run.gesture.released()) {
             long sinceRelease = SystemClock.elapsedRealtime() - run.releasedAt;
-            if (!keepForCardLink(run.direction() != null, IntentObservation.validHttpUrl(run.cardLink), sinceRelease)) {
+            if (!keepForCardLink(run.direction() != null, io.github.yudigaga.taplusbridge.recognition.RouteLink.valid(run.cardLink), sinceRelease)) {
                 try { validateAfterPick(run); }
                 catch (ReflectiveOperationException | RuntimeException changed) {
                     cancelRun(run, "source_changed"); return cancelled();
@@ -553,7 +553,7 @@ public final class SystemLongPressDrag implements RuntimeServer.DragGestures {
         String direction = run.direction();
         if (direction != null) { result.putString("direction", direction); result.putString("action", run.config.drag.action(direction)); }
         if (run.gesture.direction() != null) result.putBoolean("dragging", true);
-        if (IntentObservation.validHttpUrl(run.cardLink)) result.putString("card_link", run.cardLink);
+        if (io.github.yudigaga.taplusbridge.recognition.RouteLink.valid(run.cardLink)) result.putString("card_link", run.cardLink);
         result.putLong("native_at", run.stages.nativeAt());
         result.putLong("recognition_at", run.stages.recognitionAt());
         result.putLong("drag_at", run.stages.dragAt());
@@ -564,7 +564,7 @@ public final class SystemLongPressDrag implements RuntimeServer.DragGestures {
     public synchronized boolean fingerReleasedForLink() {
         Run run = current;
         return run != null && !run.sourceMovedBeforeTransfer && linkFallbackReady(run.gesture.released(), run.nativeUrlAvailable
-                || IntentObservation.validHttpUrl(run.cardLink), SystemClock.elapsedRealtime(),
+                || io.github.yudigaga.taplusbridge.recognition.RouteLink.valid(run.cardLink), SystemClock.elapsedRealtime(),
                 run.stages.recognitionAt(), run.releasedAt);
     }
 
@@ -608,7 +608,7 @@ public final class SystemLongPressDrag implements RuntimeServer.DragGestures {
 
     public synchronized void offerCardLink(String url) {
         Run run = current;
-        if (run == null || !run.gesture.released() || run.direction() == null || !IntentObservation.validHttpUrl(url)) return;
+        if (run == null || !run.gesture.released() || run.direction() == null || !io.github.yudigaga.taplusbridge.recognition.RouteLink.valid(url)) return;
         if (!cardLinkWithinGrace(run.releasedAt, SystemClock.elapsedRealtime())) return;
         run.cardLink = url;
         log("card_link");
@@ -630,7 +630,7 @@ public final class SystemLongPressDrag implements RuntimeServer.DragGestures {
         try {
             links.captureFromGesture(run.target, run.config, run.gesture.downAt(), run.stages.recognitionAt(), run.releasedAt, url -> {
                 synchronized (SystemLongPressDrag.this) {
-                    if (current != run || !IntentObservation.validHttpUrl(url)) return;
+                    if (current != run || !io.github.yudigaga.taplusbridge.recognition.RouteLink.valid(url)) return;
                     run.cardLink = url;
                     log("card_link");
                 }

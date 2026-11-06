@@ -341,7 +341,7 @@ final class HostLongPressDrag {
         LinkedHashSet<String> existing = new LinkedHashSet<>(LinkExtractor.extract(value));
         StringBuilder result = new StringBuilder(value);
         for (String link : links) {
-            if (!IntentObservation.validHttpUrl(link) || !existing.add(link)
+            if (!io.github.yudigaga.taplusbridge.recognition.RouteLink.valid(link) || !existing.add(link)
                     || result.length() + link.length() + 1 > LinkExtractor.MAX_INPUT_LENGTH) continue;
             if (result.length() > 0) result.append('\n');
             result.append(link);
@@ -355,7 +355,7 @@ final class HostLongPressDrag {
                 || (held.nativePick != result && held.result != result) || links == null) return;
         LinkedHashSet<String> checked = new LinkedHashSet<>();
         for (String link : links) {
-            if (IntentObservation.validHttpUrl(link)) checked.add(link);
+            if (io.github.yudigaga.taplusbridge.recognition.RouteLink.valid(link)) checked.add(link);
             if (checked.size() == LinkExtractor.MAX_RESULTS) break;
         }
         if (checked.isEmpty()) return;

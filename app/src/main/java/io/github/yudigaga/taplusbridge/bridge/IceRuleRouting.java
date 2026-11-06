@@ -10,12 +10,11 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Handler;
 import android.os.SystemClock;
-import io.github.yudigaga.taplusbridge.capture.IntentObservation;
+import io.github.yudigaga.taplusbridge.recognition.RouteLink;
 import io.github.yudigaga.taplusbridge.rules.LinkRuleEntry;
 import io.github.yudigaga.taplusbridge.rules.RuleRepository;
 import io.github.yudigaga.taplusbridge.rules.ScopedRuleResolver;
 import java.util.Collections;
-import java.net.URI;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -35,9 +34,9 @@ public final class IceRuleRouting {
         return decide(context,url,source,new RuleRepository(context).effectiveRules());
     }
     public static Decision decide(Context context,String url,String source,List<LinkRuleEntry> effective) {
-        if (!IntentObservation.validHttpUrl(url)) return new Decision(null, "invalid_request");
+        String host = RouteLink.ruleKey(url);
+        if (host == null) return new Decision(null, "invalid_request");
         registerPackageInvalidationReceiver(context, null);
-        String host = URI.create(url).getHost();
         PackageManager pm = context.getPackageManager();
         return decideForHost(effective, source, host, target -> installed(pm, target));
     }

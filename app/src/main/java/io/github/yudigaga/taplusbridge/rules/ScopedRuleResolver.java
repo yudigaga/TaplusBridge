@@ -10,6 +10,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Set;
 import java.util.regex.Pattern;
+import io.github.yudigaga.taplusbridge.recognition.RouteLink;
 
 /** Pure routing and wire format shared by the app, preview, and system_server. */
 public final class ScopedRuleResolver {
@@ -41,7 +42,8 @@ public final class ScopedRuleResolver {
         String normalizedHost = host.toLowerCase(Locale.ROOT);
         List<LinkRuleEntry> matches = new ArrayList<>();
         for (LinkRuleEntry rule : rulesForSource(rules, sourcePackage)) {
-            if (normalizedHost.equals(rule.host) || normalizedHost.endsWith("." + rule.host)) {
+            if (normalizedHost.equals(rule.host) || (!RouteLink.protocolRule(rule.host)
+                    && normalizedHost.endsWith("." + rule.host))) {
                 matches.add(rule);
             }
         }
@@ -142,7 +144,8 @@ public final class ScopedRuleResolver {
     private static void check(LinkRuleEntry rule) {
         if (rule == null || rule.sourcePackage.length() > 255
                 || (!"*".equals(rule.sourcePackage) && !PACKAGE.matcher(rule.sourcePackage).matches())
-                || rule.host == null || rule.host.length() > 128 || !HOST.matcher(rule.host).matches()
+                || rule.host == null || rule.host.length() > 128
+                || (!HOST.matcher(rule.host).matches() && !RouteLink.protocolRule(rule.host))
                 || rule.targetPackage == null || rule.targetPackage.length() > 255
                 || !PACKAGE.matcher(rule.targetPackage).matches()
                 || !(LinkRuleEntry.SOURCE_MANUAL.equals(rule.source) || LinkRuleEntry.SOURCE_ONLINE.equals(rule.source)

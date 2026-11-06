@@ -21,6 +21,7 @@ import java.lang.reflect.Modifier;
 import java.lang.ref.WeakReference;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.function.BooleanSupplier;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -107,6 +108,7 @@ public final class HostScopeCaptureHooks {
             module.hook(pick).setId("taplusbridge:scope-capture-native-" + name)
                     .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).intercept(chain -> {
                         NativeImage observed = null;
+                        PendingNative.Held observedPick = null;
                         if (chain.getThisObject() instanceof Context context && supported(context)) {
                             try {
                                 String source = (String) sourcePackage.invoke(null);
@@ -119,6 +121,7 @@ public final class HostScopeCaptureHooks {
                                         if (identity != null) {
                                             PendingNative.Held held = pendingNative.hold("onPickImage".equals(name),
                                                     source, at, identity, chain.getArg(0));
+                                            observedPick = held;
                                             WeakReference<PendingNative.Held> reference = new WeakReference<>(held);
                                             timeout.schedule(() -> {
                                                 PendingNative.Held current = reference.get();
@@ -140,7 +143,11 @@ public final class HostScopeCaptureHooks {
                         NativeImage previous = nativeImage.get();
                         if (observed == null) nativeImage.remove(); else nativeImage.set(observed);
                         try { return chain.proceed(); }
-                        finally { if (previous == null) nativeImage.remove(); else nativeImage.set(previous); }
+                        finally {
+                            if (observedPick != null) pendingNative.bindEpoch(observedPick,
+                                    RecognitionHooks.scopeEpoch(chain.getThisObject(), chain.getArg(0)));
+                            if (previous == null) nativeImage.remove(); else nativeImage.set(previous);
+                        }
                     });
         }
         installResolvedImageObserver(service);
@@ -301,6 +308,18 @@ public final class HostScopeCaptureHooks {
             if (info.applicationInfo == null || info.applicationInfo.uid != metadata.uid()) throw new IllegalStateException("scope_capture_identity");
             PendingNative.Picks originals = pendingNative.take(metadata.source(), identity,
                     response.getLong("gesture_elapsed", metadata.capturedElapsed()), metadata.capturedElapsed(), SystemClock.elapsedRealtime());
+            if (linkMode && ScopeCapturePayload.validTextUrl(url) && originals.present()) {
+                bitmapHanded = main.post(() -> {
+                    boolean accepted = deliverProbeIfCurrent(true, url,
+                            () -> RecognitionHooks.supplementScopeLink(context, service, originals, metadata.source(), identity, url));
+                    if (accepted)
+                        module.log(4, "TaplusBridge", "scope capture stage=host_link_merged reason=same_pick");
+                    else
+                        module.log(4, "TaplusBridge", "scope capture stage=host_link_dropped reason=stale_pick");
+                    recycle(bitmap);
+                });
+                return;
+            }
             NativeContents contents = nativeContents(originals);
             String originalText = channels.enabled(Channel.NATIVE) ? contents.text() : null;
             String sourceText = channels.enabled(Channel.ASSIST) ? response.getString("text") : null;
@@ -338,6 +357,12 @@ public final class HostScopeCaptureHooks {
             report("deliver", failure);
         } finally { if (!bitmapHanded && bitmap != null && !bitmap.isRecycled()) bitmap.recycle(); }
     }
+
+    static boolean deliverProbeIfCurrent(boolean probeEnabled, String url, BooleanSupplier supplement) {
+        return probeEnabled && ScopeCapturePayload.validTextUrl(url) && supplement.getAsBoolean();
+    }
+
+    private static void recycle(Bitmap bitmap) { if (bitmap != null && !bitmap.isRecycled()) bitmap.recycle(); }
 
     private void reportNative(Context context, String source, long occurredAt, boolean hasValidUrl, int attempt) {
         Bundle request = new Bundle(); request.putString("source", source); request.putLong("native_elapsed", occurredAt);
@@ -417,8 +442,22 @@ public final class HostScopeCaptureHooks {
 
     /** At most one original text and image; stale or different-gesture content never joins a completion. */
     static final class PendingNative {
-        record Held(String source, long at, String identity, Object result) {}
-        record Picks(Object text, Object image) {}
+        static final class Held {
+            final String source, identity;
+            final long at;
+            final Object result;
+            long epoch = -1;
+            Held(String source, long at, String identity, Object result) {
+                this.source = source; this.at = at; this.identity = identity; this.result = result;
+            }
+        }
+        record Picks(Object text, Object image, long textEpoch, long imageEpoch) {
+            Picks(Object text, Object image) { this(text, image, -1, -1); }
+            boolean present() { return text != null || image != null; }
+            long epochFor(Object current) {
+                return current == null ? -1 : current == text && textEpoch >= 0 ? textEpoch : current == image ? imageEpoch : -1;
+            }
+        }
         private Held text, image;
         synchronized Held hold(boolean isImage, String source, long at, String identity, Object result) {
             Held previous = isImage ? text : image;
@@ -431,6 +470,9 @@ public final class HostScopeCaptureHooks {
             if (text == held) text = null;
             if (image == held) image = null;
         }
+        synchronized void bindEpoch(Held held, long epoch) {
+            if ((text == held || image == held) && held.epoch < 0 && epoch >= 0) held.epoch = epoch;
+        }
         synchronized Picks take(String source, String identity, long began, long captured, long now) {
             if (text != null && now - text.at >= 30_000) text = null;
             if (image != null && now - image.at >= 30_000) image = null;
@@ -438,7 +480,8 @@ public final class HostScopeCaptureHooks {
             Held pickedImage = matches(image, source, identity, began, captured) ? image : null;
             if (pickedText != null) text = null;
             if (pickedImage != null) image = null;
-            return new Picks(pickedText == null ? null : pickedText.result, pickedImage == null ? null : pickedImage.result);
+            return new Picks(pickedText == null ? null : pickedText.result, pickedImage == null ? null : pickedImage.result,
+                    pickedText == null ? -1 : pickedText.epoch, pickedImage == null ? -1 : pickedImage.epoch);
         }
         private boolean matches(Held value, String source, String identity, long began, long captured) {
             return value != null && value.source.equals(source) && value.identity.equals(identity)

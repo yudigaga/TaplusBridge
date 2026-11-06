@@ -4,6 +4,8 @@ import android.content.Intent;
 import android.net.Uri;
 import android.os.Bundle;
 import io.github.yudigaga.taplusbridge.capture.IntentObservation;
+import io.github.yudigaga.taplusbridge.recognition.RedirectLink;
+import io.github.yudigaga.taplusbridge.recognition.RouteLink;
 import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashSet;
@@ -17,6 +19,16 @@ public final class ProbePayload {
     };
 
     private ProbePayload() { }
+
+    static String normalizedLink(String value) {
+        return RouteLink.valid(value) && !RouteLink.validHttp(value) ? value : RedirectLink.normalize(value);
+    }
+
+    static boolean invalidLink(String value, String normalized) {
+        boolean download = value != null && (value.regionMatches(true, 0, "magnet:", 0, 7)
+                || value.regionMatches(true, 0, "ed2k:", 0, 5));
+        return (download || RedirectLink.validInput(value)) && !RouteLink.valid(normalized);
+    }
 
     /**
      * Only known webpage components and String leaves are considered. An incomplete or ambiguous
@@ -55,7 +67,9 @@ public final class ProbePayload {
         int nodes;
         boolean invalid;
         void add(String value) {
-            if (IntentObservation.validHttpUrl(value)) urls.add(value);
+            String target = normalizedLink(value);
+            if (invalidLink(value, target)) invalid = true;
+            if (RouteLink.valid(target)) urls.add(target);
             if (urls.size() > IntentObservation.MAX_URLS) invalid = true;
         }
         @SuppressWarnings("deprecation") void visit(Bundle bundle, int depth) {
@@ -110,12 +124,14 @@ public final class ProbePayload {
         }
 
         void add(String value) {
-            if (!IntentObservation.validHttpUrl(value)) return;
-            if (urls.size() >= IntentObservation.MAX_URLS && !urls.contains(value)) {
+            String target = normalizedLink(value);
+            if (invalidLink(value, target)) { incomplete = true; return; }
+            if (!RouteLink.valid(target)) return;
+            if (urls.size() >= IntentObservation.MAX_URLS && !urls.contains(target)) {
                 incomplete = true;
                 return;
             }
-            urls.add(value);
+            urls.add(target);
         }
     }
 }

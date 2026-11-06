@@ -124,7 +124,7 @@ public final class HostProbeAction {
                     },64);
                 } else if(code==ProbeContract.CAPTURED && ready && tapSent) {
                     String url=data.getString("url");
-                    if(!IntentObservation.validHttpUrl(url)) { finish(null,"no_unique_url");return; }
+                    if(!io.github.yudigaga.taplusbridge.recognition.RouteLink.valid(url)) { finish(null,"no_unique_url");return; }
                     android.util.Log.i("TaplusBridge","probe stage=host_result outcome=captured");
                     finish(url,null);
                 } else if(code==ProbeContract.FAILED) { finish(null,safeReason(data.getString("reason"))); }

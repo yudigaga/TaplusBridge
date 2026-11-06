@@ -52,7 +52,7 @@ import top.yukonga.miuix.kmp.preference.SwitchPreference
             item {
                 SettingsCard {
                     SwitchPreference(snapshot.enabled, { change { controller.setEnabled(it) } }, title = "应用流转",
-                        summary = "切换立即保存；控制模块打开、系统采集与拖动，宿主原有识别及 Lens 单独运行",
+                        summary = "切换立即保存；控制模块打开、采集、拖动与替换翻译，应用原有识别及 Lens 单独运行",
                         modifier = Modifier.testTag("toggle.enabled").semantics { toggleableState = if (snapshot.enabled) ToggleableState.On else ToggleableState.Off })
                     Row(Modifier.padding(start = 16.dp, end = 16.dp, bottom = 16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         Tag(if (snapshot.hostSupported) "传送门 ${snapshot.hostVersionName}" else if (snapshot.hostInstalled) "版本待适配" else "未检测到传送门", snapshot.hostSupported)

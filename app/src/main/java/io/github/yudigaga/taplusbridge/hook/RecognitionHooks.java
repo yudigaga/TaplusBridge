@@ -19,6 +19,7 @@ import io.github.libxposed.api.XposedModule;
 import io.github.yudigaga.taplusbridge.bridge.BridgeContract;
 import io.github.yudigaga.taplusbridge.config.RecognitionChannels;
 import io.github.yudigaga.taplusbridge.config.RecognitionChannels.Channel;
+import io.github.yudigaga.taplusbridge.runtime.RuntimeClient;
 import java.lang.reflect.Method;
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
@@ -33,6 +34,7 @@ import java.util.function.Supplier;
 public final class RecognitionHooks {
     private static final String TAG = "TaplusBridge";
     private static final String ROOT = "com.miui.contentextension.";
+    private static volatile RecognitionHooks installed;
     private final XposedModule module;
     private final Supplier<String> source;
     private final HostRecognitionEnhancer enhancer;
@@ -51,6 +53,7 @@ public final class RecognitionHooks {
     private final AutoProbeReadiness autoProbe;
     private final RecognitionEpochs origins=new RecognitionEpochs();
     private Field recommendationTask,segmentTask,segmenting,ocrDisposable;
+    private Field hostResult, hostFinished;
     private Method requestRecommendation, requestSegments, recognizeImage, imageBitmap, recommendationUrl, publishSegments;
     private Method cloudOcrWords;
     private String scopeLinkUrl, scopeText;
@@ -66,6 +69,7 @@ public final class RecognitionHooks {
     private boolean ocrFinished;
     private String ocrText = "";
     private ArrayList<?> lastServer = new ArrayList<>();
+    private HostClipboardLinks clipboardLinks;
 
     record DragPick(long epoch, Object service, Object result, long pickedAt) {
         boolean matches(Object expectedService, Object expectedResult, long expectedEpoch) {
@@ -74,7 +78,7 @@ public final class RecognitionHooks {
     }
     record DragSnapshot(long epoch, boolean waiting, List<String> links) {
         DragSnapshot {
-            links = List.copyOf(links.stream().filter(io.github.yudigaga.taplusbridge.capture.IntentObservation::validHttpUrl)
+            links = List.copyOf(links.stream().filter(io.github.yudigaga.taplusbridge.recognition.RouteLink::valid)
                     .limit(io.github.yudigaga.taplusbridge.recognition.LinkExtractor.MAX_RESULTS)
                     .collect(java.util.stream.Collectors.toList()));
         }
@@ -127,7 +131,7 @@ public final class RecognitionHooks {
         try {
             if (module.getApiVersion() != 102) return null;
             RecognitionHooks hooks = new RecognitionHooks(module, loader, source);
-            hooks.installHooks(loader); return hooks;
+            hooks.installHooks(loader); installed = hooks; return hooks;
         } catch (ReflectiveOperationException | RuntimeException failure) {
             module.log(5, TAG, "Recognition hooks unavailable: " + failure.getClass().getSimpleName());
             return null;
@@ -136,20 +140,32 @@ public final class RecognitionHooks {
 
     private RecognitionHooks(XposedModule module, ClassLoader loader, Supplier<String> source)
             throws ReflectiveOperationException {
+        this(module, source, new HostRecognitionEnhancer(loader),
+                method(loader.loadClass(ROOT + "App"), "getInstance", true),
+                method(loader.loadClass(ROOT + "text.RecommendationMonitor"), "onDetailReady", true, ArrayList.class));
+    }
+
+    RecognitionHooks(XposedModule module, Supplier<String> source, HostRecognitionEnhancer enhancer,
+                     Method appInstance, Method publish) throws NoSuchMethodException {
         this.module = module;
         this.source = source;
-        enhancer = new HostRecognitionEnhancer(loader);
+        this.enhancer = enhancer;
         autoProbe = new AutoProbeReadiness(() -> !enhancer.capturedLinks().isEmpty());
-        enhancer.setReporter(message -> module.log(4, TAG, message));
-        appInstance = method(loader.loadClass(ROOT + "App"), "getInstance", true);
-        publish = method(loader.loadClass(ROOT + "text.RecommendationMonitor"),
-                "onDetailReady", true, ArrayList.class);
+        if (module != null) enhancer.setReporter(message -> module.log(4, TAG, message));
+        this.appInstance = appInstance;
+        this.publish = publish;
         requireResult(publish, void.class);
     }
 
     private void installHooks(ClassLoader loader) throws ReflectiveOperationException {
         Class<?> service = loader.loadClass(ROOT + "services.TextContentExtensionService");
         Class<?> catcher = loader.loadClass("miui.contentcatcher.sdk.ClientCatcherResult");
+        hostResult = service.getDeclaredField("mCatcherResult");
+        hostFinished = service.getDeclaredField("sIsTaskFinished");
+        if (!Modifier.isStatic(hostResult.getModifiers()) || hostResult.getType() != catcher
+                || !Modifier.isStatic(hostFinished.getModifiers()) || hostFinished.getType() != boolean.class)
+            throw new NoSuchFieldException("scope_link_active_pick_contract");
+        hostResult.setAccessible(true); hostFinished.setAccessible(true);
         hookBoundary(method(service, "onStartPick", false), "pick");
         hookBoundary(method(service, "cancelTask", false), "cancel");
         hookBoundary(method(service, "onDestroy", false), "destroy");
@@ -167,18 +183,20 @@ public final class RecognitionHooks {
                     try {
                         if (contextSupported(chain.getThisObject()) && chain.getArg(0) instanceof Intent intent
                                 && intent.hasExtra("clipboard_data")) {
-                            resetSession();
                             RecognitionPolicy.State policy = RecognitionPolicy.current((Context) chain.getThisObject());
+                            String text = intent.getStringExtra("clipboard_data");
+                            if (clipboardLinks != null) clipboardLinks.begin(chain.getThisObject(), text);
                             if (policy.disabled(Channel.CLIPBOARD))
                                 return android.app.Service.START_NOT_STICKY;
-                            String text = intent.getStringExtra("clipboard_data");
-                            if (policy.channels().enabled(Channel.CLIPBOARD)) enhancer.captureText(text, "clipboard");
-                            enhancer.diagnostic("capture_clipboard", "captured", null,
-                                    text == null ? 0 : text.length(), enhancer.capturedLinks().size(), null, null);
                             // Clipboard has its own NER/card path. It cannot reuse an old long-press view.
                         }
                     } catch (RuntimeException failure) { report(failure); }
-                    return chain.proceed();
+                    Object outcome = chain.proceed();
+                    try {
+                        if (clipboardLinks != null && chain.getArg(0) instanceof Intent intent && intent.hasExtra("clipboard_data"))
+                            clipboardLinks.afterStart(chain.getThisObject());
+                    } catch (RuntimeException failure) { report(failure); }
+                    return outcome;
                 });
         for (String name : new String[]{"onPickText", "onPickImage"}) {
             Method pick = method(service, name, false, catcher);
@@ -445,30 +463,7 @@ public final class RecognitionHooks {
 
     private void installClipboardCommerce(ClassLoader loader) {
         try {
-            Method request = method(loader.loadClass(ROOT + "clipboard.utils.ClipboardCardUtils"),
-                    "getCommerceRecommendWithAsyncTask", true, Context.class, String.class, String.class);
-            Method ready = method(loader.loadClass(ROOT + "clipboard.ClipboardMonitor"),
-                    "onCopyRecommendReady", true, List.class);
-            requireResult(request, void.class); requireResult(ready, void.class);
-            module.hook(request).setId("taplusbridge:recognition-clipboard-commerce-request")
-                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).intercept(chain -> {
-                        if (chain.getArg(0) instanceof Context context && supported(context)
-                                && RecognitionPolicy.current(context).commerceDisabled()) {
-                            ready.invoke(null, new ArrayList<>()); return null;
-                        }
-                        return chain.proceed();
-                    });
-            module.hook(ready).setId("taplusbridge:recognition-clipboard-commerce-result")
-                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).intercept(chain -> {
-                        Context context = hostContext();
-                        if (supported(context)) {
-                            RecognitionPolicy.State policy = RecognitionPolicy.current(context);
-                            if (policy.commerceDisabled()) return chain.proceed(new Object[]{new ArrayList<>()});
-                            if (policy.channels().enabled(Channel.SERVER) && policy.channels().enabled(Channel.CLIPBOARD)
-                                    && chain.getArg(0) instanceof List<?> cards) enhancer.captureRecommendationLinks(cards);
-                        }
-                        return chain.proceed();
-                    });
+            clipboardLinks = HostClipboardLinks.install(module, loader, this::supported, this::report);
         } catch (ReflectiveOperationException | RuntimeException unavailable) {
             module.log(4, TAG, "Optional clipboard commerce boundary unavailable: " + unavailable.getClass().getSimpleName());
         }
@@ -770,6 +765,54 @@ public final class RecognitionHooks {
         if (!currentProbe(expectedEpoch, expectedSource)) return false;
         enhancer.captureProbeUrl(url); recordStatus(hostContext()); schedulePublish(); return true;
     }
+
+    static long scopeEpoch(Object service, Object result) {
+        RecognitionHooks hooks = installed;
+        if (hooks == null) return -1;
+        synchronized (hooks.sessionLock) {
+            return hooks.dragPick != null && hooks.dragPick.matches(service, result, hooks.epoch) ? hooks.epoch : -1;
+        }
+    }
+
+    static boolean supplementScopeLink(Context context, Object service, HostScopeCaptureHooks.PendingNative.Picks originals,
+                                       String source, String identity, String url) {
+        RecognitionHooks hooks = installed;
+        return hooks != null && hooks.acceptScopeLink(context, service, originals, source, identity, url);
+    }
+
+    private boolean currentScopeLinkPolicy(Context context, String identity) {
+        if (context == null || identity == null) return false;
+        Bundle policy = RuntimeClient.call(context, "source_scope", Bundle.EMPTY);
+        return policy != null && policy.getBoolean("scope_link_probe_enabled") && identity.equals(policy.getString("identity"));
+    }
+
+    private boolean sameScopePick(Object service, HostScopeCaptureHooks.PendingNative.Picks originals, String expectedSource)
+            throws IllegalAccessException {
+        return active && dragPick != null && dragPick.epoch() == epoch && pickService == service
+                && dragPick.matches(service, dragPick.result(), epoch) && expectedSource != null && expectedSource.equals(safeSource())
+                && hostResult != null && hostFinished != null && hostResult.get(null) == dragPick.result()
+                && originals != null && originals.epochFor(dragPick.result()) == epoch;
+    }
+
+    /** A busy host ignores another callback; enrich only its exact still-active original pick instead. */
+    boolean acceptScopeLink(Context context, Object service, HostScopeCaptureHooks.PendingNative.Picks originals,
+                            String expectedSource, String identity, String url) {
+        if (Looper.myLooper() != Looper.getMainLooper() || context == null || originals == null
+                || !ScopeCapturePayload.validTextUrl(url) || !HostPolicy.validPackage(expectedSource)) return false;
+        DragPick selected;
+        try {
+            if (!currentScopeLinkPolicy(context, identity)) return false;
+            synchronized (sessionLock) {
+                selected = dragPick;
+                if (!sameScopePick(service, originals, expectedSource) || hostFinished.getBoolean(null)) return false;
+                enhancer.captureProbeUrl(url);
+                scopeLinkUrl = url;
+            }
+        } catch (ReflectiveOperationException | RuntimeException unavailable) { return false; }
+        try { HostDragHooks.offerRecognizedLinks(service, selected.result(), enhancer.capturedLinks()); recordStatus(context); }
+        catch (RuntimeException unavailable) { report(unavailable); }
+        schedulePublish(); return true;
+    }
     public boolean isProbeRecommendation(Object info) { return enhancer.isProbeRecommendation(info); }
 
     void keepRecognitionVisibleForNextPick() {
@@ -968,7 +1011,7 @@ public final class RecognitionHooks {
     }
 
     private void report(Throwable failure) {
-        if (errorReported.compareAndSet(false, true))
+        if (module != null && errorReported.compareAndSet(false, true))
             module.log(5, TAG, "Recognition enhancement preserved host flow: " + failure.getClass().getSimpleName());
     }
 

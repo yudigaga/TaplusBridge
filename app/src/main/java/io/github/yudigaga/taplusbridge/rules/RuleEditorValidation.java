@@ -7,7 +7,7 @@ import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
-import java.net.URI;
+import io.github.yudigaga.taplusbridge.recognition.RouteLink;
 
 /** Reports rejected editor input before the repository's defensive sanitization can discard it. */
 public final class RuleEditorValidation {
@@ -35,16 +35,18 @@ public final class RuleEditorValidation {
                 && !LinkRuleEntry.CONVERSION_FIXED_DEEP_LINK.equals(conversion)) errors.add("URL 转换类型无效");
         if (note.length() > 160) errors.add("备注不能超过 160 个字符");
         Set<String> hosts = new LinkedHashSet<>();
-        if (text != null) for (String token : text.split("[,，;；\\n\\r]+")) {
+        String input = text == null ? "" : text.trim();
+        String[] tokens = RouteLink.valid(input) ? new String[]{input} : input.split("[,，;；\\n\\r]+");
+        for (String token : tokens) {
             if (token.trim().isEmpty()) continue;
             List<String> normalized;
             try { normalized = RuleSchema.normalizeUserHosts(token); }
-            catch (IllegalArgumentException invalid) { errors.add("域名或 HTTP(S) URL 无效：" + token.trim()); continue; }
-            if (normalized.isEmpty()) errors.add("域名或 HTTP(S) URL 无效：" + token.trim());
+            catch (IllegalArgumentException invalid) { errors.add("域名、网址或协议规则无效：" + token.trim()); continue; }
+            if (normalized.isEmpty()) errors.add("域名、网址或协议规则无效：" + token.trim());
             else if (normalized.get(0).length() > 128) errors.add("域名不能超过 128 个字符：" + token.trim());
             else hosts.addAll(normalized);
         }
-        if (hosts.isEmpty()) errors.add("至少填写一个有效域名或 HTTP(S) URL；不需要的行请删除");
+        if (hosts.isEmpty()) errors.add("至少填写一个域名、网址、magnet: 或 ed2k:；不需要的行请删除");
         if (hosts.size() > 20) errors.add("每行最多 20 个不同域名，请拆分为多条规则");
         if (errors.isEmpty()) for (String host : hosts) {
             entries.add(new LinkRuleEntry(source, host, target, LinkRuleEntry.SOURCE_MANUAL, conversion, note));
@@ -79,14 +81,13 @@ public final class RuleEditorValidation {
             throw new IllegalArgumentException("请选择发起应用、填写完整包名，或用 * 测试剪贴板来源");
         }
         try {
-            URI parsed = new URI(url == null ? "" : url.trim());
-            if (!("https".equalsIgnoreCase(parsed.getScheme()) || "http".equalsIgnoreCase(parsed.getScheme()))
-                    || parsed.getHost() == null) throw new IllegalArgumentException();
-            List<String> hosts = RuleSchema.normalizeUserHosts(parsed.getHost());
+            String key = RouteLink.ruleKey(url == null ? "" : url.trim());
+            if (key == null) throw new IllegalArgumentException();
+            List<String> hosts = RuleSchema.normalizeUserHosts(key);
             if (hosts.size() != 1) throw new IllegalArgumentException();
             return hosts.get(0);
         } catch (Exception invalid) {
-            throw new IllegalArgumentException("请输入完整的 HTTP(S) URL，例如 https://example.com/article");
+            throw new IllegalArgumentException("请输入完整的 HTTP(S)、磁力或 ed2k 链接");
         }
     }
 }

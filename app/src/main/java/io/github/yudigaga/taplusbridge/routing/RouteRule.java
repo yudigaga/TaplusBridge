@@ -2,6 +2,7 @@ package io.github.yudigaga.taplusbridge.routing;
 
 import java.util.Locale;
 import java.util.regex.Pattern;
+import io.github.yudigaga.taplusbridge.recognition.RouteLink;
 
 /** A domain route; subdomains and source wildcards must be enabled explicitly. */
 public record RouteRule(String host, String targetPackage, String sourcePackage,
@@ -25,6 +26,7 @@ public record RouteRule(String host, String targetPackage, String sourcePackage,
     }
 
     static boolean validHost(String value) {
+        if (RouteLink.protocolRule(value)) return true;
         if (value == null || value.length() > 253 || value.indexOf('.') < 0) return false;
         String[] labels = value.split("\\.", -1);
         for (String label : labels) if (!LABEL.matcher(label).matches()) return false;

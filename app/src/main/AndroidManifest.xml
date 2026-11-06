@@ -23,6 +23,12 @@
         <activity android:name=".drag.DragActivity" android:exported="false"
             android:theme="@style/DragTheme" android:excludeFromRecents="true"
             android:taskAffinity="${applicationId}.drag" />
+        <activity android:name=".translation.TranslationActivity" android:exported="true"
+            android:theme="@style/DragTheme" android:excludeFromRecents="true"
+            android:taskAffinity="${applicationId}.translation" />
+        <activity android:name=".links.LinkChoiceActivity" android:exported="true"
+            android:theme="@style/DragTheme" android:excludeFromRecents="true"
+            android:taskAffinity="${applicationId}.links" />
         <provider android:name=".drag.DragShareProvider" android:authorities="${applicationId}.drag.images"
             android:exported="false" android:grantUriPermissions="true" />
         <service android:name=".lens.LensService" android:exported="true" android:process=":lens" />

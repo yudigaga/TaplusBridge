@@ -4,12 +4,9 @@ import android.content.ComponentName;
 import android.content.Intent;
 import android.net.Uri;
 import android.os.Bundle;
-import java.net.URI;
-import java.net.URISyntaxException;
 import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashSet;
-import java.util.Locale;
 import java.util.Set;
 
 /** Read-only metadata for an explicitly armed browser-Activity observation. Never retains a URL. */
@@ -119,43 +116,7 @@ public final class IntentObservation {
 
     /** Validates an entire whitelisted field. No substring scanning or percent decoding. */
     public static boolean validHttpUrl(String value) {
-        if (value == null || value.isEmpty() || value.length() > MAX_URL_LENGTH) return false;
-        for (int i = 0; i < value.length(); i++) {
-            char c = value.charAt(i);
-            if (c <= 32 || Character.isISOControl(c)) return false;
-            if (c == '%' && i + 2 < value.length()) {
-                int high = Character.digit(value.charAt(i + 1), 16);
-                int low = Character.digit(value.charAt(i + 2), 16);
-                int decoded = high < 0 || low < 0 ? -1 : high * 16 + low;
-                if (decoded >= 0 && (decoded < 32 || decoded == 127)) return false;
-            }
-            if (Character.isHighSurrogate(c)) {
-                if (i + 1 >= value.length() || !Character.isLowSurrogate(value.charAt(++i))) return false;
-            } else if (Character.isLowSurrogate(c)) return false;
-        }
-        try {
-            URI uri = new URI(value);
-            String scheme = uri.getScheme();
-            if (!("http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme))
-                    || uri.isOpaque() || uri.getRawUserInfo() != null || uri.getHost() == null
-                    || uri.getRawAuthority() == null || uri.getRawAuthority().endsWith(":")
-                    || uri.getPort() == 0 || uri.getPort() > 65535) return false;
-            return validHost(uri.getHost());
-        } catch (URISyntaxException failure) { return false; }
-    }
-
-    private static boolean validHost(String value) {
-        String host = value.toLowerCase(Locale.ROOT);
-        if (host.startsWith("[") && host.endsWith("]")) {
-            // java.net.URI already validated an IPv6 literal; scoped zone IDs are not accepted.
-            return host.indexOf('%') < 0;
-        }
-        if (host.isEmpty() || host.length() > 253 || host.startsWith(".") || host.endsWith(".")) return false;
-        for (String label : host.split("\\.", -1)) {
-            if (label.isEmpty() || label.length() > 63
-                    || !label.matches("[a-z0-9](?:[a-z0-9-]*[a-z0-9])?")) return false;
-        }
-        return true;
+        return io.github.yudigaga.taplusbridge.recognition.RouteLink.validHttp(value, MAX_URL_LENGTH);
     }
 
     private static final class ScanState {

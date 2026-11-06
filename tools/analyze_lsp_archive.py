@@ -122,14 +122,15 @@ SOURCE_SCOPE_PACKAGES = {
     "com.android.chrome": "chrome",
 }
 SOURCE_SCOPE_KINDS = frozenset((*SOURCE_SCOPE_PACKAGES.values(), "other", "unknown"))
-SCOPE_CAPTURE_STAGES = frozenset(("gesture", "submitted", "rejected", "failed", "host_received", "host_submitted"))
+SCOPE_CAPTURE_STAGES = frozenset(("gesture", "submitted", "rejected", "failed", "host_received", "host_submitted",
+                                "host_link_merged", "host_link_dropped"))
 SCOPE_CAPTURE_HOST_ERRORS = frozenset(("request", "read", "deliver", "native"))
 SCOPE_CAPTURE_REASONS = EXCEPTIONS | frozenset((
     "none", "capture_focus", "capture_identity", "capture_main_window", "capture_secure", "capture_ime",
     "capture_bounds", "capture_window_changed", "capture_snapshot", "capture_window_unavailable",
     "capture_surface", "capture_buffer", "capture_secure_buffer", "capture_unavailable", "capture_attributes",
     "capture_display", "capture_popup_limit", "capture_hidden", "scope_image_large", "scope_image_encode",
-    "scope_image_missing", "scope_host_unavailable",
+    "scope_image_missing", "scope_host_unavailable", "same_pick", "stale_pick",
 ))
 SCOPE_CAPTURE_MESSAGE = re.compile(r"^[sS]cope capture stage=([a-z_]+)(?=\s|$)")
 MODULE_SCOPE_CAPTURE = re.compile(re.escape(MODULE_TAG) + r"[^\]\r\n]+\]\s+([sS]cope capture stage=.*)$")
@@ -162,7 +163,7 @@ HOST_PRIVACY_THREAD_GUARD = re.compile(HOST_LOGCAT_PREFIX.replace("TaplusBridge"
 SCOPE_LINK_STAGES = frozenset(("rejected", "armed", "blocked", "tapped", "finished", "captured", "observed"))
 SCOPE_LINK_REASONS = frozenset((
     "none", "candidate_invalid", "new_touch", "touch_changed", "short_press", "configuration_changed",
-    "window_changed", "unsupported_launch", "http", "candidate_changed", "input_or_window_changed",
+    "window_changed", "unsupported_launch", "http", "download_link", "candidate_changed", "input_or_window_changed",
     "cancelled", "native_won", "native_pick", "same_gesture_tail", "timeout", "captured", "window_or_configuration_changed",
     "released_before_recognition", "host_probe_owner", "unsafe_intent", "web_payload_invalid", "chooser_invalid",
     "http_data_invalid", "unsupported_action", "unreadable_payload",

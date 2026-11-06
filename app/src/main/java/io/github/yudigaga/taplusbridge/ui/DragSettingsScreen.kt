@@ -21,6 +21,8 @@ import androidx.compose.ui.unit.dp
 import io.github.yudigaga.taplusbridge.config.DragSettings
 import io.github.yudigaga.taplusbridge.config.RecognitionChannels
 import io.github.yudigaga.taplusbridge.runtime.RuntimePublisher
+import io.github.yudigaga.taplusbridge.translation.TranslationSettings
+import io.github.yudigaga.taplusbridge.translation.TranslationStore
 import top.yukonga.miuix.kmp.basic.*
 import top.yukonga.miuix.kmp.overlay.OverlayDialog
 import top.yukonga.miuix.kmp.preference.ArrowPreference
@@ -32,6 +34,7 @@ import top.yukonga.miuix.kmp.preference.SwitchPreference
     val initial = remember(controller) { controller.getDragSettings() }
     val context = LocalContext.current
     val initialState = remember(controller) { controller.snapshot() }
+    var translationMode by remember { mutableStateOf(TranslationStore(context).load().mode) }
     var enabled by rememberSaveable { mutableStateOf(initial.enabled) }
     var linkProbe by remember { mutableStateOf(controller.scopeLinkProbeEnabled()) }
     var channels by remember { mutableStateOf(controller.recognitionChannels()) }
@@ -147,6 +150,9 @@ import top.yukonga.miuix.kmp.preference.SwitchPreference
                         onClick = { dialog = "recognition" }, modifier = Modifier.testTag("drag.group.recognition"))
                     ArrowPreference(title = "图片与识图", summary = "截图${if (screenshot) "开启" else "关闭"} · Lens ${if (lens) "开启" else "关闭"}",
                         onClick = { dialog = "images" }, modifier = Modifier.testTag("drag.group.images"))
+                    ArrowPreference(title = "替换翻译", summary = when (translationMode) {
+                        TranslationSettings.Mode.APP -> "使用所选本机应用"; TranslationSettings.Mode.AI -> "使用配置的 AI 服务"; else -> "未替换 · 使用传送门原翻译"
+                    }, onClick = { dialog = "translation" }, modifier = Modifier.testTag("drag.group.translation"))
                     ArrowPreference(title = "补点取链", summary = if (linkProbe) "已允许不可见点击 · 会操作来源内容" else "已禁止不可见点击",
                         onClick = { dialog = "probe" }, modifier = Modifier.testTag("drag.group.probe"))
                     ArrowPreference(title = "长按与拖动", summary = if (enabled) "草稿已开启 · 计时、方向与分享" else "草稿已关闭 · 点击配置",
@@ -157,7 +163,9 @@ import top.yukonga.miuix.kmp.preference.SwitchPreference
             item { QuietText("识别、图片和补点开关切换即保存。长按与拖动中的修改先保留为草稿，点击“保存手势”后生效。", Modifier.padding(horizontal = 8.dp)) }
         }
     }
-    dialog?.let { section ->
+    if (dialog == "translation") TranslationSettingsDialog(
+        onDismiss = { dialog = null }, onSaved = { translationMode = TranslationStore(context).load().mode })
+    else dialog?.let { section ->
         val direction = choosingDirection
         val title = if (direction != null) "${directionLabel(direction)}操作" else when (section) {
             "recognition" -> "识别增强与来源"; "images" -> "图片与识图"; "probe" -> "补点取链"; "gesture" -> "长按与拖动"

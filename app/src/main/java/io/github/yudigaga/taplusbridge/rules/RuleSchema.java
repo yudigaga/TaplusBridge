@@ -11,6 +11,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.regex.Pattern;
+import io.github.yudigaga.taplusbridge.recognition.RouteLink;
 
 /** Pure IceBridge rule input normalization, detached from its Android preference repository. */
 public final class RuleSchema {
@@ -24,7 +25,10 @@ public final class RuleSchema {
     }
     public static List<String> normalizeUserHosts(String raw) {
         Set<String> hosts = new LinkedHashSet<>();
-        if (raw != null) for (String item : raw.split("[,，;；\\n\\r]+")) {
+        String value = raw == null ? "" : raw.trim();
+        // Download names and tracker parameters can contain the editor's list separators.
+        String[] items = RouteLink.valid(value) ? new String[]{value} : value.split("[,，;；\\n\\r]+");
+        for (String item : items) {
             if (item.trim().isEmpty()) continue;
             String host = normalizeHostOrUrl(item);
             if (host == null) throw new IllegalArgumentException("invalid-rule-host");
@@ -38,6 +42,11 @@ public final class RuleSchema {
         String candidate = value.trim().toLowerCase(Locale.ROOT);
         // A pasted share URL can have long query parameters; only the extracted host is stored.
         if (candidate.isEmpty() || candidate.length() > 8192) return null;
+        if (RouteLink.protocolRule(candidate)) return candidate;
+        if ("magnet://".equals(candidate)) return "magnet:";
+        if ("ed2k://".equals(candidate)) return "ed2k:";
+        if (candidate.startsWith("magnet:") || candidate.startsWith("ed2k:"))
+            return RouteLink.ruleKey(value.trim());
         if (candidate.startsWith("http://") || candidate.startsWith("https://")) {
             try { candidate = new URI(candidate).getHost(); } catch (Exception invalid) { return null; }
         } else {

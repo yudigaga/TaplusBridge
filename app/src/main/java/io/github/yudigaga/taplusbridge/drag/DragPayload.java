@@ -22,6 +22,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.util.LinkedHashSet;
 import java.util.List;
+import io.github.yudigaga.taplusbridge.recognition.RouteLink;
 
 /** Copies only supplied text or a granted local image; item intents are never interpreted. */
 public final class DragPayload implements AutoCloseable {
@@ -67,13 +68,13 @@ public final class DragPayload implements AutoCloseable {
             Intent embedded = item.getIntent();
             if (embedded != null) {
                 String actual = embedded.getDataString();
-                if (IntentObservation.validHttpUrl(actual)) {
+                if (RouteLink.valid(actual)) {
                     append(links, actual); if (supplied == null && html == null) append(text, actual);
                 }
                 Object extra = embedded.hasExtra(Intent.EXTRA_TEXT) ? embedded.getExtras().get(Intent.EXTRA_TEXT) : null;
                 if (extra instanceof String value && value.length() <= MAX_TEXT)
                     for (String link : LinkExtractor.extract(value)) {
-                        if (!IntentObservation.validHttpUrl(link)) continue;
+                        if (!RouteLink.valid(link)) continue;
                         append(links, link); if (supplied == null && html == null && text.length() == 0) append(text, link);
                     }
             }
@@ -83,8 +84,8 @@ public final class DragPayload implements AutoCloseable {
                 if ("content".equalsIgnoreCase(scheme) && data.getDescription().hasMimeType("image/*")) {
                     if (image != null) throw new IOException("一次仅支持拖入一张图片");
                     image = uri;
-                } else if ("http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme)) append(text, uri.toString());
-                else if (supplied == null && html == null) throw new IOException("仅支持可读取的本地图片或网页链接");
+                } else if (RouteLink.valid(uri.toString())) append(text, uri.toString());
+                else if (supplied == null && html == null) throw new IOException("仅支持可读取的本地图片、网页、磁力或 ed2k 链接");
             }
         }
         boolean nativeEnabled = new ConfigStore(context).recognitionChannels().enabled(RecognitionChannels.Channel.NATIVE);
@@ -177,9 +178,13 @@ public final class DragPayload implements AutoCloseable {
 
     public static boolean validRecognizedLinks(Object values) {
         if (!(values instanceof List<?> links) || links.size() > LinkExtractor.MAX_RESULTS) return false;
-        for (Object value : links)
+        long characters = 0;
+        for (Object value : links) {
             if (!(value instanceof String url) || url.length() > LinkExtractor.MAX_URL_LENGTH
-                    || !IntentObservation.validHttpUrl(url)) return false;
+                    || !RouteLink.valid(url)) return false;
+            characters += url.length() + (characters == 0 ? 0 : 1);
+            if (characters > MAX_TEXT) return false;
+        }
         return true;
     }
 
@@ -198,7 +203,7 @@ public final class DragPayload implements AutoCloseable {
         for (String value : texts) if (value != null && !value.isBlank() && distinct.add(value.trim())) append(chosen, value);
         LinkedHashSet<String> present = new LinkedHashSet<>(LinkExtractor.extract(chosen.toString()));
         for (String url : urls) {
-            if (!IntentObservation.validHttpUrl(url)) throw new IOException("所选内容不是有效的真实网址");
+            if (!RouteLink.valid(url)) throw new IOException("所选内容不是有效的网页、磁力或 ed2k 链接");
             if (present.add(url)) append(chosen, url);
         }
         if (chosen.length() == 0 && !includeImage) throw new IOException("请至少选择一项可用内容");

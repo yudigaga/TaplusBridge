@@ -88,6 +88,20 @@ class AssistCaptureMetadataTest(unittest.TestCase):
         self.assertIn("assist_capture_events", result)
         self.assertEqual([], result["assist_capture_events"])
 
+    def test_late_link_merge_and_drop_are_distinct_from_merely_submitting_a_callback(self):
+        private = "url=https://private.example/message text=SECRET_BODY nonce=PRIVATE_NONCE"
+        module = (
+            f"2026-11-05T16:00:00.000 {TAG}scope capture stage=host_submitted reason=none {private}\n"
+            f"2026-11-05T16:00:01.000 {TAG}scope capture stage=host_link_merged reason=same_pick {private}\n"
+            f"2026-11-05T16:00:02.000 {TAG}scope capture stage=host_link_dropped reason=stale_pick {private}\n"
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            result = analyze(self.archive(Path(temp), module))
+        self.assertEqual([("host_submitted", "none"), ("host_link_merged", "same_pick"), ("host_link_dropped", "stale_pick")],
+                         [(event["stage"], event["reason"]) for event in result["scope_capture_events"]])
+        for secret in ("private.example", "SECRET_BODY", "PRIVATE_NONCE"):
+            self.assertNotIn(secret, json.dumps(result))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -33,7 +33,7 @@ public final class DragHostPayload {
         String source = data.getString("source"), text = data.getString("text");
         var links = data.getStringArrayList("links");
         if (links != null) {
-            if (links.size() > 24) throw new IllegalArgumentException("drag_links");
+            if (links.size() > io.github.yudigaga.taplusbridge.recognition.LinkExtractor.MAX_RESULTS) throw new IllegalArgumentException("drag_links");
             StringBuilder combined = new StringBuilder(text == null ? "" : text);
             for (String link : links) {
                 if (!ScopeCapturePayload.validTextUrl(link)) throw new IllegalArgumentException("drag_link");

@@ -9,7 +9,13 @@ import android.os.Bundle;
 import io.github.yudigaga.taplusbridge.config.ConfigStore;
 import io.github.yudigaga.taplusbridge.rules.LinkRuleEntry;
 import io.github.yudigaga.taplusbridge.capture.IntentObservation;
+import io.github.yudigaga.taplusbridge.recognition.BatchLinks;
+import io.github.yudigaga.taplusbridge.recognition.RouteLink;
+import io.github.yudigaga.taplusbridge.rules.RuleRepository;
+import java.util.List;
+import java.util.LinkedHashSet;
 import java.util.Locale;
+import java.nio.charset.StandardCharsets;
 
 public final class LaunchPlanner {
     public record Plan(String targetPackage, Intent target, Intent original, String source, String kind) {}
@@ -22,11 +28,16 @@ public final class LaunchPlanner {
     @SuppressWarnings("deprecation")
     public static PlanningResult planWithReason(Context context, Bundle request) {
         ConfigStore config = new ConfigStore(context);
-        return planWithRules(context,request,config.enabled(),config.nativeEnabled(),null);
+        return planWithRules(context,request,config.enabled(),config.nativeEnabled(),config.cloudLinkHandoffEnabled(),null);
     }
     /** Framework-owned configuration path must never open the frozen module's private preferences. */
     public static PlanningResult planWithRules(Context context,Bundle request,boolean enabled,boolean nativeEnabled,
                     java.util.List<LinkRuleEntry> rules) {
+        return planWithRules(context,request,enabled,nativeEnabled,false,rules);
+    }
+    /** Framework callers supply the complete effective switch state without opening private preferences. */
+    public static PlanningResult planWithRules(Context context,Bundle request,boolean enabled,boolean nativeEnabled,
+                    boolean cloudLinkHandoff,java.util.List<LinkRuleEntry> rules) {
         if (request == null) return new PlanningResult(null, "invalid_request");
         if (!enabled) return new PlanningResult(null, "disabled");
         Intent original = request.getParcelable("original");
@@ -40,23 +51,32 @@ public final class LaunchPlanner {
         }
         if (!safeFallback(original)) return new PlanningResult(null, "invalid_request");
         if (request.containsKey("explicit_target")) return new PlanningResult(null,"invalid_request");
+        if (request.containsKey(BatchLinks.LINKS_KEY))
+            return planBatch(context, request, enabled, nativeEnabled, cloudLinkHandoff, rules, original, source);
         IceRuleRouting.Decision decision = rules==null?IceRuleRouting.decide(context, url, source):IceRuleRouting.decide(context,url,source,rules);
         if ("ambiguous".equals(decision.reason())) return new PlanningResult(null, "ambiguous");
         LinkRuleEntry rule = decision.rule();
         if (rule != null) {
-            // All packages use the same handoff: match the configured host, forward the original URL.
-            // Legacy conversion fields remain importable, but no app-specific URI templates execute.
-            String destination = url;
+            // Match user-configured domain/protocol rules; only protocol scheme case is normalized.
+            // Legacy conversion fields remain data-only; verified receiver contracts apply below.
+            String key = io.github.yudigaga.taplusbridge.recognition.RouteLink.ruleKey(url);
+            String destination = io.github.yudigaga.taplusbridge.recognition.RouteLink.protocolRule(key)
+                    ? key + url.substring(url.indexOf(':') + 1) : url;
+            if (cloudLinkHandoff) destination = CloudLinkHandoff.destination(rule.targetPackage, destination);
             if (safeUri(destination)) {
                 Intent target = new Intent(Intent.ACTION_VIEW, Uri.parse(destination))
                         .setPackage(rule.targetPackage)
                         .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-                return new PlanningResult(new Plan(rule.targetPackage, target, original, source, "域名规则"), "resolved");
+                return new PlanningResult(new Plan(rule.targetPackage, target, original, source,
+                        io.github.yudigaga.taplusbridge.recognition.RouteLink.protocolRule(key) ? "协议规则" : "域名规则"), "resolved");
             }
         }
+        if (io.github.yudigaga.taplusbridge.recognition.RouteLink.protocolRule(
+                io.github.yudigaga.taplusbridge.recognition.RouteLink.ruleKey(url)))
+            return new PlanningResult(null, decision.reason());
         // Native targets originate in Taplus's clicked recommendation, never in a public activity extra.
         if (candidate == null) return new PlanningResult(null, rule == null ? decision.reason() : "target_missing");
-        if (Intent.ACTION_VIEW.equals(candidate.getAction()) && IntentObservation.validHttpUrl(candidate.getDataString()))
+        if (Intent.ACTION_VIEW.equals(candidate.getAction()) && io.github.yudigaga.taplusbridge.recognition.RouteLink.valid(candidate.getDataString()))
             return new PlanningResult(null, decision.reason());
         if (!nativeEnabled) return new PlanningResult(null, "disabled");
         String targetPackage = candidate.getPackage();
@@ -77,6 +97,39 @@ public final class LaunchPlanner {
         target.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
         target.setPackage(targetPackage);
         return new PlanningResult(new Plan(targetPackage, target, original, source, "原生链接"), "resolved");
+    }
+    @SuppressWarnings("deprecation")
+    private static PlanningResult planBatch(Context context, Bundle request, boolean enabled, boolean nativeEnabled,
+                    boolean cloudLinkHandoff, List<LinkRuleEntry> rules, Intent original, String source) {
+        try {
+            if (request.containsKey("url") || request.containsKey("candidate")) return new PlanningResult(null, "invalid_request");
+            List<String> supplied = BatchLinks.normalize(request.get(BatchLinks.LINKS_KEY));
+            LinkedHashSet<String> canonical = new LinkedHashSet<>();
+            for (String link : supplied) canonical.add(RouteLink.ruleKey(link) + link.substring(link.indexOf(':') + 1));
+            List<String> links = List.copyOf(canonical);
+            if (links.size() == 1) {
+                Bundle single = new Bundle(request); single.remove(BatchLinks.LINKS_KEY); single.putString("url", links.get(0));
+                return planWithRules(context, single, enabled, nativeEnabled, cloudLinkHandoff, rules);
+            }
+            List<LinkRuleEntry> effective = rules == null ? new RuleRepository(context).effectiveRules() : rules;
+            String targetPackage = null;
+            for (String link : links) {
+                IceRuleRouting.Decision decision = IceRuleRouting.decide(context, link, source, effective);
+                if (decision.rule() == null) return new PlanningResult(null, decision.reason());
+                String target = decision.rule().targetPackage;
+                if (targetPackage != null && !targetPackage.equals(target)) return new PlanningResult(null, "batch_mixed_targets");
+                targetPackage = target;
+            }
+            if (!BatchLinks.supportedTarget(targetPackage)) return new PlanningResult(null, "batch_unsupported");
+            // 115's direct magnet/ed2k receiver forwards its whole data string to the multiline editor.
+            // Only this validated, rule-selected batch may carry LF; ordinary URI validation stays strict.
+            String destination = String.join("\n", links);
+            if (destination.getBytes(StandardCharsets.UTF_8).length > 32768)
+                return new PlanningResult(null, "invalid_request");
+            Intent target = new Intent(Intent.ACTION_VIEW, Uri.parse(destination)).setPackage(targetPackage)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            return new PlanningResult(new Plan(targetPackage, target, original, source, "批量规则"), "resolved");
+        } catch (RuntimeException invalid) { return new PlanningResult(null, "invalid_request"); }
     }
     public static boolean validPackage(String value) {
         return value != null && value.length() < 256 && value.matches("[A-Za-z][A-Za-z0-9_]*(?:\\.[A-Za-z][A-Za-z0-9_]*)+");

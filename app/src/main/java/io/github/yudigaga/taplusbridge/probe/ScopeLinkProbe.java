@@ -10,6 +10,7 @@ import io.github.yudigaga.taplusbridge.BuildConfig;
 import io.github.yudigaga.taplusbridge.capture.IntentObservation;
 import io.github.yudigaga.taplusbridge.capture.CaptureLease;
 import io.github.yudigaga.taplusbridge.runtime.RuntimeSnapshot;
+import io.github.yudigaga.taplusbridge.recognition.RouteLink;
 import java.util.Objects;
 import java.util.ArrayList;
 import java.util.List;
@@ -149,7 +150,7 @@ public final class ScopeLinkProbe {
         if (!owns) return interceptTail(uid, source, user);
         if (confirmed) worker.post(() -> finishObserved(run));
         if (url == null) log("rejected", rejectionReason(intent, source));
-        log("blocked", url == null ? "unsupported_launch" : "http");
+        log("blocked", url == null ? "unsupported_launch" : RouteLink.validHttp(url) ? "http" : "download_link");
         return true;
     }
 
@@ -421,12 +422,16 @@ public final class ScopeLinkProbe {
                 intent = nested;
             }
             if (!Intent.ACTION_VIEW.equals(intent.getAction())) return null;
-            String url = intent.getDataString();
-            if (!IntentObservation.validHttpUrl(url)) return null;
+            String url = ProbePayload.normalizedLink(intent.getDataString());
+            if (!RouteLink.valid(url)) return null;
             Bundle extras = intent.getExtras();
             if (extras != null) for (String key : new String[]{"url", "rawUrl", Intent.EXTRA_TEXT}) {
                 Object candidate = extras.get(key);
-                if (candidate instanceof String text && IntentObservation.validHttpUrl(text) && !url.equals(text)) return null;
+                if (candidate instanceof String text) {
+                    String target = ProbePayload.normalizedLink(text);
+                    if (ProbePayload.invalidLink(text, target)) return null;
+                    if (RouteLink.valid(target) && !url.equals(target)) return null;
+                }
             }
             return url;
         } catch (RuntimeException unreadable) { return null; }

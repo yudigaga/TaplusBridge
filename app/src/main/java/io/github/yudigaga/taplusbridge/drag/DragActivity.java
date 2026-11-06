@@ -34,10 +34,12 @@ import io.github.yudigaga.taplusbridge.hook.HostPolicy;
 import io.github.yudigaga.taplusbridge.runtime.RuntimeClient;
 import io.github.yudigaga.taplusbridge.ui.TransitActivity;
 import io.github.yudigaga.taplusbridge.ui.DragMenuUi;
+import io.github.yudigaga.taplusbridge.recognition.RouteLink;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -155,39 +157,110 @@ public final class DragActivity extends ComponentActivity {
         try {
             switch (action) {
                 case "share" -> share();
-                case "browser" -> selectLink(this::browser);
-                case "rules" -> selectLink(this::rules);
+                case "browser", "rules" -> selectLinks(action, payload.links());
                 case "copy" -> {
                     if (payload.text.isEmpty()) { fail("当前拖入的是图片，没有可复制的文字"); return; }
                     getSystemService(ClipboardManager.class).setPrimaryClip(ClipData.newPlainText("拖拽内容", payload.text));
                     Toast.makeText(this, "已复制", Toast.LENGTH_SHORT).show(); finish();
                 }
-                case "portal", "lens", "translate" -> handoff(action, false);
+                case "translate" -> {
+                    Intent translated = io.github.yudigaga.taplusbridge.translation.TranslationRequests.prepare(this, payload.text, source);
+                    if (translated != null) { startActivity(translated); finish(); }
+                    else handoff(action, false);
+                }
+                case "portal", "lens" -> handoff(action, false);
                 default -> finish();
             }
         } catch (IOException unavailable) { fail(unavailable.getMessage() == null ? "无法读取完整分享内容" : unavailable.getMessage()); }
         catch (RuntimeException unavailable) { fail("无法完成拖拽操作，请检查目标应用或模块设置"); }
     }
 
-    private void selectLink(Consumer<String> action) {
-        List<String> links = payload.links();
+    private void selectLinks(String action, List<String> supplied) {
+        if (!allowed()) { finish(); return; }
+        List<String> links = List.copyOf(new LinkedHashSet<>(supplied));
         if (links.isEmpty()) {
             Log.w(TAG, "stage=link_selection outcome=no_links");
-            fail("拖拽内容没有真实网址；卡片可使用原来的长按取链接"); return;
+            fail("拖拽内容没有有效链接；卡片可使用原来的长按取链接"); return;
         }
         Log.i(TAG, "stage=link_selection outcome=available count=" + links.size());
-        if (links.size() == 1) { action.accept(links.get(0)); return; }
-        DragMenuUi.showActions(this, "选择要打开的链接", links, index -> action.accept(links.get(index)));
+        if (links.size() == 1) { openSelectedLinks(action, links); return; }
+        List<String> downloads = links.stream().filter(DragActivity::downloadLink).collect(java.util.stream.Collectors.toList());
+        List<String> websites = links.stream().filter(RouteLink::validHttp).collect(java.util.stream.Collectors.toList());
+        if (downloads.size() + websites.size() != links.size()) { fail("本轮包含不受支持的链接，请重新识别"); return; }
+        if (!downloads.isEmpty() && !websites.isEmpty()) {
+            DragMenuUi.showActions(this, "选择链接类型", List.of("磁力与 ed2k（" + downloads.size() + " 条）\n可多选并按规则批量添加",
+                    "网页链接（" + websites.size() + " 条）\n选择一个网址打开"), index -> selectLinks(action, index == 0 ? downloads : websites));
+            return;
+        }
+        boolean multiple = websites.isEmpty();
+        List<String> labels = new ArrayList<>();
+        for (int i = 0; i < links.size(); i++) labels.add(preview("链接 " + (i + 1), links.get(i)));
+        DragMenuUi.showSelection(this, multiple ? "选择批量添加的链接" : "选择用于" + actionLabel(action) + "的内容",
+                multiple ? "可全选或逐条选择，按当前规则确定目标应用" : "每次打开一个网页链接",
+                labels, multiple, multiple ? "按规则添加" : "执行" + actionLabel(action), checked -> {
+                    ArrayList<String> selected = new ArrayList<>();
+                    for (int i = 0; i < checked.length; i++) if (checked[i]) selected.add(links.get(i));
+                    openSelectedLinks(action, selected);
+                });
+    }
+
+    private static boolean downloadLink(String link) { return RouteLink.protocolRule(RouteLink.ruleKey(link)); }
+
+    private void openSelectedLinks(String action, List<String> links) {
+        if (!allowed()) { finish(); return; }
+        if (links.isEmpty()) return;
+        if (links.size() == 1) {
+            if ("browser".equals(action)) browser(links.get(0)); else rules(links.get(0));
+            return;
+        }
+        if (!links.stream().allMatch(DragActivity::downloadLink)) {
+            unavailableBatch(links, "网页链接需要逐个打开，请重新选择"); return;
+        }
+        LinkedHashMap<String, List<String>> groups = new LinkedHashMap<>();
+        for (String link : links) {
+            Bundle request = ruleRequest(List.of(link));
+            LaunchPlanner.PlanningResult result = LaunchPlanner.planWithReason(this, request);
+            if (result.plan() == null) {
+                unavailableBatch(links, "所选链接含未匹配、冲突或不可用的规则，请先检查规则"); return;
+            }
+            groups.computeIfAbsent(result.plan().targetPackage(), ignored -> new ArrayList<>()).add(link);
+        }
+        if (groups.size() > 1) {
+            List<String> targets = new ArrayList<>(groups.keySet()), labels = new ArrayList<>();
+            for (String target : targets) labels.add(targetLabel(target) + "（" + groups.get(target).size() + " 条）\n仅处理选择的目标组");
+            DragMenuUi.showActions(this, "按规则选择目标组", labels, index -> rules(groups.get(targets.get(index)), targets.get(index)));
+            return;
+        }
+        rules(links, null);
+    }
+
+    private Bundle ruleRequest(List<String> links) {
+        Bundle request = new Bundle(); request.putString("source", source); request.putBoolean("ephemeral", true);
+        if (links.size() == 1) request.putString("url", links.get(0));
+        else request.putStringArrayList("links", new ArrayList<>(links));
+        return request;
     }
 
     private void rules(String url) {
+        rules(List.of(url), null);
+    }
+
+    private void rules(List<String> links, String expectedTarget) {
+        if (!allowed()) { finish(); return; }
         try {
-            Bundle request = new Bundle(); request.putString("url", url); request.putString("source", source);
-            request.putBoolean("ephemeral", true);
+            Bundle request = ruleRequest(links);
             LaunchPlanner.PlanningResult planned = LaunchPlanner.planWithReason(this, request);
             if (planned.plan() == null) {
                 Log.w(TAG, "stage=rules_plan outcome=" + planned.reason());
-                fail("未找到可用且唯一的链接规则，请在模块内检查对应域名与来源应用规则"); return;
+                if (links.size() > 1) {
+                    unavailableBatch(links, "batch_unsupported".equals(planned.reason()) ? "目标应用尚无已验证的批量入口"
+                            : "batch_mixed_targets".equals(planned.reason()) ? "所选链接的目标规则已变化，请重新选择目标组"
+                            : "所选链接的规则或接收入口不可用，请重新检查"); return;
+                }
+                fail("未找到可用且唯一的链接规则，请在模块内检查域名、协议和来源条件"); return;
+            }
+            if (expectedTarget != null && !expectedTarget.equals(planned.plan().targetPackage())) {
+                unavailableBatch(links, "目标规则已变化，请重新选择并确认目标应用"); return;
             }
             Intent ready = LaunchPlanner.directIfReady(this, planned.plan());
             if (ready != null) {
@@ -204,7 +277,28 @@ public final class DragActivity extends ComponentActivity {
         }
     }
 
+    private void unavailableBatch(List<String> links, String reason) {
+        DragMenuUi.showActions(this, "无法批量添加", List.of("复制已选链接\n" + reason + "；不会逐个启动或发送文本",
+                "重新选择链接\n返回多选列表调整选择"), index -> {
+                    if (!allowed()) { finish(); return; }
+                    if (index == 0) copySelectedLinks(links); else selectLinks("rules", links);
+                });
+    }
+
+    private void copySelectedLinks(List<String> links) {
+        if (!allowed()) { finish(); return; }
+        getSystemService(ClipboardManager.class).setPrimaryClip(ClipData.newPlainText("已选链接", String.join("\n", links)));
+        Toast.makeText(this, "已复制 " + links.size() + " 条链接", Toast.LENGTH_SHORT).show(); finish();
+    }
+
+    private String targetLabel(String target) {
+        try { return getPackageManager().getApplicationLabel(getPackageManager().getApplicationInfo(target, PackageManager.MATCH_DISABLED_COMPONENTS)).toString(); }
+        catch (PackageManager.NameNotFoundException | RuntimeException unavailable) { return target; }
+    }
+
     private void browser(String url) {
+        if (io.github.yudigaga.taplusbridge.recognition.RouteLink.valid(url)
+                && !io.github.yudigaga.taplusbridge.capture.IntentObservation.validHttpUrl(url)) { rules(url); return; }
         Intent generic = new Intent(Intent.ACTION_VIEW, Uri.parse("https://example.com/"))
                 .addCategory(Intent.CATEGORY_BROWSABLE);
         LinkedHashMap<String, ResolveInfo> browsers = new LinkedHashMap<>();
@@ -299,10 +393,10 @@ public final class DragActivity extends ComponentActivity {
     private void showContentChoice(DragActionStore.Choice choice) {
         String action = choice.action();
         ArrayList<Content> contents = new ArrayList<>();
-        boolean urlsOnly = "browser".equals(action) || "rules".equals(action);
+        if ("browser".equals(action) || "rules".equals(action)) { selectLinks(action, choice.payload().links()); return; }
         boolean imageOnly = "lens".equals(action);
         boolean allKinds = "share".equals(action) || "portal".equals(action);
-        if (!urlsOnly && !imageOnly) {
+        if (!imageOnly) {
             if (!choice.originalText().isBlank()) contents.add(new Content(preview("原文", choice.originalText()), choice.originalText(), null, false));
             if (!choice.recognizedText().isBlank() && !choice.recognizedText().trim().equals(choice.originalText().trim()))
                 contents.add(new Content(preview("图片识别文字", choice.recognizedText()), choice.recognizedText(), null, false));
@@ -310,15 +404,14 @@ public final class DragActivity extends ComponentActivity {
         if (choice.payload().image != null && (allKinds || imageOnly
                 || ("translate".equals(action) && choice.recognizedText().isBlank())))
             contents.add(new Content("图片（" + choice.payload().width + " × " + choice.payload().height + "）", null, null, true));
-        if (allKinds || urlsOnly) {
+        if (allKinds) {
             int index = 0;
             for (String url : choice.payload().links()) contents.add(new Content(preview("链接 " + (++index), url), null, url, false));
         }
         if (contents.isEmpty()) {
             Log.w(TAG, "stage=content_choice outcome=empty action=" + action + " links=" + choice.payload().links().size()
                     + " original_chars=" + choice.originalText().length() + " recognized_chars=" + choice.recognizedText().length());
-            fail(urlsOnly ? "本轮识别没有真实网址；卡片可使用原来的长按取链接"
-                    : imageOnly ? "本轮没有可供识图的图片" : "本轮未识别到可用于" + actionLabel(action) + "的文字"); return;
+            fail(imageOnly ? "本轮没有可供识图的图片" : "本轮未识别到可用于" + actionLabel(action) + "的文字"); return;
         }
         int textItems = 0, linkItems = 0, imageItems = 0;
         for (Content content : contents) {
@@ -326,9 +419,9 @@ public final class DragActivity extends ComponentActivity {
             else if (content.url != null) linkItems++;
             else textItems++;
         }
-        // 原文和识别文字分别计数；多个链接仍算同一种。浏览器和规则一次只能打开一个链接，所以仍要选择。
+        // 原文和识别文字分别计数；分享和传送门的多个链接仍算同一种。
         int kinds = textItems + imageItems + (linkItems > 0 ? 1 : 0);
-        if (kinds == 1 && !(urlsOnly && linkItems > 1)) {
+        if (kinds == 1) {
             Log.i(TAG, "stage=content_choice outcome=single_kind action=" + action + " items=" + contents.size());
             boolean[] selected = new boolean[contents.size()];
             java.util.Arrays.fill(selected, true);
@@ -337,9 +430,9 @@ public final class DragActivity extends ComponentActivity {
         }
         String title = "选择用于" + actionLabel(action) + "的内容";
         String summary = choice.payload().image != null && choice.recognizedText().isBlank()
-                ? "未识别到图片文字，可选择已有内容" : urlsOnly ? "每次打开一个链接" : "可同时选择多种内容";
+                ? "未识别到图片文字，可选择已有内容" : "可同时选择多种内容";
         DragMenuUi.showSelection(this, title, summary, java.util.Arrays.asList(contents.stream().map(Content::label).toArray(String[]::new)),
-                !urlsOnly, "执行" + actionLabel(action), checked -> applyChoice(action, contents, checked, -1));
+                true, "执行" + actionLabel(action), checked -> applyChoice(action, contents, checked, -1));
     }
 
     private boolean applyChoice(String action, List<Content> contents, boolean[] checked, int single) {

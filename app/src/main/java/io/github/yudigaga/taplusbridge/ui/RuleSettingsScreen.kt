@@ -43,6 +43,7 @@ import java.nio.charset.CodingErrorAction
     apps: List<SettingsController.AppEntry>,
     revision: Int,
     nativeEnabled: Boolean,
+    cloudLinkHandoffEnabled: Boolean,
     bottomBar: @Composable () -> Unit,
     onChanged: () -> Unit,
 ) {
@@ -106,7 +107,7 @@ import java.nio.charset.CodingErrorAction
         modifier = Modifier.testTag(if (editor) "page.rule_editor" else "page.rules"),
         topBar = {
             TopAppBar(title = if (editor) if (manualIndex < 0) "添加规则" else "编辑规则" else "流转规则",
-                subtitle = if (editor) "选择目标应用，填写域名或网站" else "按网站匹配应用，原样打开链接",
+                subtitle = if (editor) "选择目标应用，填写域名或协议" else "按域名或协议匹配应用",
                 navigationIcon = {
                     if (editor) IconButton({ editor = false }) { Icon(SettingsIcons.Back, "返回") }
                 }, actions = {
@@ -131,9 +132,9 @@ import java.nio.charset.CodingErrorAction
                             onClick = { picker = "target" }, modifier = Modifier.testTag("editor.pick_target"),
                             startAction = { AppIcon(appMap[draftTarget]?.icon) })
                         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                            TextField(draftHost, { draftHost = it }, label = "域名或网址", singleLine = true,
+                            TextField(draftHost, { draftHost = it }, label = "域名、网址或协议", singleLine = true,
                                 modifier = Modifier.fillMaxWidth().testTag("editor.host"))
-                            QuietText("可填写完整网址，保存时提取域名；同一域名及其子域名的链接会原样交给该应用。")
+                            QuietText("网页填写域名或完整网址；磁力填写 magnet:，电驴填写 ed2k:。也可粘贴完整链接，保存时提取匹配条件，按目标应用支持的入口打开。")
                         }
                     }
                 }
@@ -178,7 +179,7 @@ import java.nio.charset.CodingErrorAction
                                 Column(Modifier.weight(1f)) { Text("${entries.size} 条规则", fontSize = 21.sp, fontWeight = FontWeight.SemiBold); QuietText("${entries.map { it.targetPackage }.distinct().size} 个目标应用 · 手动优先") }
                                 Tag("IceBridge", true)
                             }
-                            TextField(query, { query = it }, label = "搜索应用、域名或来源", singleLine = true,
+                            TextField(query, { query = it }, label = "搜索应用、域名、协议或来源", singleLine = true,
                                 modifier = Modifier.fillMaxWidth().testTag("rules.search"))
                             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                 TextButton(if (onlyInstalled) "仅已安装 ✓" else "全部应用", { onlyInstalled = !onlyInstalled }, Modifier.testTag("rules.installed"))
@@ -189,7 +190,7 @@ import java.nio.charset.CodingErrorAction
                 }
                 item {
                     SettingsCard {
-                        ArrowPreference(title = "打开行为", summary = "原生目标兜底${if (nativeEnabled) "已开启" else "已关闭"} · 域名规则优先",
+                        ArrowPreference(title = "打开行为", summary = "网盘适配${if (cloudLinkHandoffEnabled) "已开启" else "已关闭"} · 原生兜底${if (nativeEnabled) "已开启" else "已关闭"}",
                             onClick = { dialog = "behavior" }, modifier = Modifier.testTag("rules.behavior"))
                         ArrowPreference(title = "规则管理", summary = "在线规则、手动规则导入导出与清空",
                             onClick = { dialog = "manage" }, modifier = Modifier.testTag("rules.manage"))
@@ -230,7 +231,7 @@ import java.nio.charset.CodingErrorAction
                             Modifier.padding(start = 68.dp, end = 16.dp, bottom = 16.dp))
                     }
                 }
-                item { QuietText("同一域名有多个可用目标时不会猜测。停用不使用的应用，或添加更明确的手动规则。", Modifier.padding(8.dp)) }
+                item { QuietText("同一域名或协议有多个可用目标时不会猜测。停用不使用的应用，或添加更明确的来源条件。", Modifier.padding(8.dp)) }
             }
         }
     }
@@ -251,6 +252,11 @@ import java.nio.charset.CodingErrorAction
         "behavior" -> OverlayDialog(show = true, title = "打开行为", onDismissRequest = { dialog = null }) {
             Column(Modifier.heightIn(max = LocalWindowInfo.current.containerDpSize.height * .60f), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Column(Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState())) {
+                    SwitchPreference(cloudLinkHandoffEnabled, { value -> changeRules { controller.setCloudLinkHandoffEnabled(value) } },
+                        title = "网盘链接适配", summary = "使用已适配网盘的应用入口打开分享链接；关闭后按原网址流转。切换立即保存。",
+                        modifier = Modifier.testTag("toggle.cloud_handoff")
+                            .semantics { toggleableState = if (cloudLinkHandoffEnabled) ToggleableState.On else ToggleableState.Off })
+                    if (cloudLinkHandoffEnabled) QuietText("已适配：123、百度、阿里、夸克、115、迅雷的指定分享地址。115、迅雷使用应用内网页；阿里暂仅无提取码链接。其他网盘保留原网址。磁力与 ed2k 始终按协议规则流转。", Modifier.padding(horizontal = 16.dp))
                     SwitchPreference(nativeEnabled, { value -> changeRules { controller.setNativeEnabled(value) } },
                         title = "原生目标兜底", summary = "无匹配规则时，接管传送门提供的原生目标；规则命中不受影响。切换立即保存。",
                         modifier = Modifier.testTag("toggle.native")
@@ -324,7 +330,7 @@ import java.nio.charset.CodingErrorAction
     var result by remember { mutableStateOf<SettingsController.Preview?>(null) }
     OverlayDialog(show = true, title = "匹配预览", summary = "只检查规则，不打开或解冻应用", onDismissRequest = dismiss) {
         Column(Modifier.heightIn(max = LocalWindowInfo.current.containerDpSize.height * .60f).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            TextField(url, { url = it }, label = "粘贴 HTTP(S) 链接", singleLine = true, modifier = Modifier.fillMaxWidth().testTag("preview.url"))
+            TextField(url, { url = it }, label = "粘贴网页、磁力或 ed2k 链接", singleLine = true, modifier = Modifier.fillMaxWidth().testTag("preview.url"))
             TextField(source, { source = it }, label = "来源包名（可留空）", singleLine = true, modifier = Modifier.fillMaxWidth().testTag("preview.source"))
             result?.let { Text(it.title, fontWeight = FontWeight.Medium, modifier = Modifier.testTag("preview.result")); QuietText(it.detail) }
             TextButton("检查匹配", { result = controller.matchPreview(url, source) }, Modifier.fillMaxWidth().testTag("preview.check"), colors = ButtonDefaults.textButtonColorsPrimary())

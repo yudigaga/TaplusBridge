@@ -44,6 +44,16 @@ public final class HostRecognitionEnhancer {
     private final Field intent;
     private final LinkedHashSet<String> links = new LinkedHashSet<>();
     private final Set<String> probeLinks = new LinkedHashSet<>();
+    private static final Map<Object, LinkCard> LINK_CARDS = Collections.synchronizedMap(new WeakHashMap<>());
+    private static final Set<Object> OWNED_LINK_CARDS = Collections.synchronizedSet(Collections.newSetFromMap(new WeakHashMap<>()));
+    private final Set<Object> ownedCards = Collections.newSetFromMap(new WeakHashMap<>());
+    public record LinkCard(List<String> links, String source, boolean clipboard) { }
+
+    public static LinkCard linkCard(Object model) { return LINK_CARDS.get(model); }
+    public static boolean isOwnedLinkCard(Object model) { return OWNED_LINK_CARDS.contains(model); }
+    public static List<String> batchLinks(Object model) {
+        LinkCard card = linkCard(model); return card == null ? List.of() : card.links();
+    }
     private final Map<String, CachedPreview> previews = new LinkedHashMap<>();
     private final Map<Object, Drawable> boundIcons = Collections.synchronizedMap(new WeakHashMap<>());
     private final Map<Object, String> boundTargets = Collections.synchronizedMap(new WeakHashMap<>());
@@ -125,6 +135,8 @@ public final class HostRecognitionEnhancer {
     }
 
     public synchronized void clear() {
+        for (Object card : ownedCards) LINK_CARDS.remove(card);
+        ownedCards.clear();
         links.clear();
         probeLinks.clear();
         synchronized (previews) { previews.clear(); }
@@ -192,7 +204,7 @@ public final class HostRecognitionEnhancer {
     }
 
     public synchronized void captureProbeUrl(String url) {
-        if (!io.github.yudigaga.taplusbridge.capture.IntentObservation.validHttpUrl(url)) return;
+        if (!io.github.yudigaga.taplusbridge.recognition.RouteLink.valid(url)) return;
         captureText(url, "probe"); probeLinks.add(url);
     }
     public synchronized boolean isProbeRecommendation(Object info) {
@@ -340,7 +352,15 @@ public final class HostRecognitionEnhancer {
     }
 
     /** Returns a new list, leaving the host's cached server result untouched. */
+    public ArrayList<Object> mergeClipboard(Context context, List<?> originals) {
+        return merge(context, originals == null ? new ArrayList<>() : new ArrayList<>(originals), null, true);
+    }
+
     public ArrayList<Object> merge(Context context, ArrayList<?> originals, String source) {
+        return merge(context, originals, source, false);
+    }
+
+    private ArrayList<Object> merge(Context context, ArrayList<?> originals, String source, boolean clipboard) {
         ArrayList<Object> result = new ArrayList<>();
         Set<String> existing = new LinkedHashSet<>();
         if (originals != null) for (Object info : originals) {
@@ -349,13 +369,26 @@ public final class HostRecognitionEnhancer {
                 if (url != null) existing.addAll(LinkExtractor.extract(url));
             }
         }
+        Map<String, List<String>> grouped = new LinkedHashMap<>();
+        Map<String, Preview> destinations = new LinkedHashMap<>();
         if (context != null) for (String url : capturedLinks()) {
             if (existing.contains(url)) continue;
             Preview resolved = resolve(context, url, null, source, true);
             if (resolved == null) continue;
+            grouped.computeIfAbsent(resolved.target(), ignored -> new ArrayList<>()).add(url);
+            destinations.put(resolved.target(), resolved);
+            existing.add(url);
+        }
+        for (Map.Entry<String, List<String>> entry : grouped.entrySet()) {
+            List<String> selected = List.copyOf(entry.getValue());
+            Preview resolved = destinations.get(entry.getKey());
             try {
-                result.add(newModel(url, resolved.target(), resolved.label()));
-                existing.add(url);
+                Object model = newModel(selected.get(0), resolved.target(), resolved.label());
+                if (selected.size() > 1) title.set(model, groupTitle(selected, resolved.label()));
+                synchronized (this) { ownedCards.add(model); }
+                OWNED_LINK_CARDS.add(model);
+                LINK_CARDS.put(model, new LinkCard(selected, source, clipboard));
+                result.add(model);
             } catch (ReflectiveOperationException ignored) { }
         }
         if (originals != null) for (Object original : originals) {
@@ -363,6 +396,11 @@ public final class HostRecognitionEnhancer {
             result.add(original);
         }
         return result;
+    }
+
+    private static String groupTitle(List<String> selected, String label) {
+        boolean downloads = selected.stream().allMatch(link -> !io.github.yudigaga.taplusbridge.recognition.RouteLink.validHttp(link));
+        return downloads ? "向" + label + "批量添加 " + selected.size() + " 条" : "在" + label + "选择 " + selected.size() + " 条链接";
     }
 
     Object newModel(String url, String target, String label) throws ReflectiveOperationException {
@@ -404,6 +442,11 @@ public final class HostRecognitionEnhancer {
         }
         Preview resolved = resolve(view.getContext(), read(detailUrl, info), candidate, source);
         if (resolved != null) applyCard(card, resolved);
+        LinkCard selected = linkCard(info);
+        if (resolved != null && selected != null && selected.links().size() > 1) {
+            Object caption = value(card, "mRecommendTitle");
+            if (caption instanceof TextView text) text.setText(groupTitle(selected.links(), resolved.label()));
+        }
         diagnostic("bind_recommend", resolved == null ? "none" : "success",
                 resolved == null ? null : resolved.target(), 0, 0, null, null);
     }

@@ -103,7 +103,7 @@ object MiuixSettingsScreen {
                 HOME -> OverviewSettingsScreen(snapshot, sourceScope, sourceScopeError, independent, controller, refresh)
                 RECOGNITION -> DragSettingsScreen(controller, onSaved = refresh)
                 APPS -> SourceScopeSettingsScreen(controller, apps, onSaved = refresh)
-                RULES -> RuleSettingsScreen(controller, apps, revision, snapshot.nativeEnabled, bottomBar = {}, onChanged = refresh)
+                RULES -> RuleSettingsScreen(controller, apps, revision, snapshot.nativeEnabled, snapshot.cloudLinkHandoffEnabled, bottomBar = {}, onChanged = refresh)
             }
         }
         LiquidGlassNavigationBar(selected = page, items = navigationItems,

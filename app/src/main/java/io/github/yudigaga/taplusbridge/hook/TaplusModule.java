@@ -69,6 +69,7 @@ public final class TaplusModule extends XposedModule {
         recognitionHooks = RecognitionHooks.install(this, loader, this::recommendationSource);
         HostScopeCaptureHooks.install(this, loader);
         PortalLensHooks.install(this, loader);
+        HostTranslationHooks.install(this, loader, this::recommendationSource);
         HostDragHooks.install(this, loader, recognitionHooks);
         try {
             Class<?> apps = loader.loadClass(HOST_ROOT + "utils.AppsUtils");
@@ -88,6 +89,7 @@ public final class TaplusModule extends XposedModule {
                             } catch (Throwable failure) {
                                 reportFailure(failure);
                                 return HostCaptureAction.isAction(chain.getArg(1))
+                                        || HostRecognitionEnhancer.isOwnedLinkCard(chain.getArg(1))
                                         || (recognitionHooks != null && recognitionHooks.isProbeRecommendation(chain.getArg(1))) ? null : original;
                             }
                         } finally { leaveGeneration(depth); }
@@ -128,14 +130,36 @@ public final class TaplusModule extends XposedModule {
 
     private Intent routeRecommendation(Context context, Object info, Intent original,
                                        RecommendationAccess access) throws ReflectiveOperationException {
+        HostRecognitionEnhancer.LinkCard local = HostRecognitionEnhancer.linkCard(info);
+        if (local == null && HostRecognitionEnhancer.isOwnedLinkCard(info)) return null;
+        if (local != null) {
+            if (local.links().size() > 1) {
+                Bundle request = new Bundle();
+                request.putStringArrayList("links", new java.util.ArrayList<>(local.links()));
+                if (local.source() != null) request.putString("source", local.source());
+                request.putBoolean("clipboard", local.clipboard());
+                Bundle response = BridgeTransport.call(context, "link_choice_prepare", request);
+                @SuppressWarnings("deprecation") Intent chooser = response == null ? null : response.getParcelable("direct");
+                if (chooser == null) android.widget.Toast.makeText(context, "链接选择界面不可用，请确认模块已启用且未被冻结", android.widget.Toast.LENGTH_LONG).show();
+                return chooser;
+            }
+            return prepare(context, null, null, local.links().get(0), local.source(), true, local.clipboard());
+        }
         if (HostCaptureAction.isAction(info)) {
             // Discard an old cached manual-action model; automatic probing owns the pick lifecycle.
             return null;
         }
         boolean ephemeral = recognitionHooks != null && recognitionHooks.isProbeRecommendation(info);
         Intent fallback = ephemeral ? null : original;
-        if (info == null || !access.type.isInstance(info)
-                || HostPolicy.isTranslation(access.get(access.category, info))) return fallback;
+        if (info == null || !access.type.isInstance(info)) return fallback;
+        if (HostPolicy.isTranslation(access.get(access.category, info))) {
+            try {
+                Object text = info.getClass().getMethod("getTitle").invoke(info);
+                Intent translated = text instanceof String title
+                        ? HostTranslationHooks.prepare(context, title, recommendationSource()) : null;
+                return translated == null ? fallback : translated;
+            } catch (ReflectiveOperationException | RuntimeException unavailable) { return fallback; }
+        }
         if (original != null && !HostPolicy.supportsHandoffAction(original.getAction())) return fallback;
         String packageName = access.get(access.packageName, info);
         String raw = access.get(access.intent, info);
@@ -170,8 +194,14 @@ public final class TaplusModule extends XposedModule {
         return prepare(context, original, candidate, webUrl, source, false);
     }
     private Intent prepare(Context context, Intent original, Intent candidate, String webUrl, String source, boolean ephemeral) {
+        return prepare(context, original, candidate, webUrl, source, ephemeral, false);
+    }
+
+    private Intent prepare(Context context, Intent original, Intent candidate, String webUrl, String source, boolean ephemeral, boolean clipboard) {
         Bundle extras = new Bundle();
         extras.putBoolean("ephemeral", ephemeral);
+        extras.putBoolean("local_recognition", ephemeral);
+        extras.putBoolean("clipboard", clipboard);
         extras.putParcelable("original", original == null ? null : new Intent(original));
         extras.putParcelable("candidate", candidate == null ? null : new Intent(candidate));
         extras.putString("url", webUrl);

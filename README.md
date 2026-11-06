@@ -1,6 +1,8 @@
 # taplusbridge
 
-当前正式版：**0.15.34 / 66**。
+当前正式版：**0.15.39 / 71**。
+
+剪贴板网页/磁力/ed2k使用本地规则入口，下载链接支持多选和按目标分组。本版取消115批量的主页/登录准备菜单，选好后一次直达离线添加入口，默认用户已登录。使用和验证边界见 [0.15.39更新说明](docs/2026-11-06-release-0.15.39-direct-batch.md)。
 
 设置已整理为「概览、识别、应用、规则」四页，支持点选和横向滑动。识别通道及补点等开关即时保存并同步；应用名单与手势草稿分别显式保存，系统生效状态以「系统已确认配置」为准。详细变化见 [0.15.34 更新说明](docs/release-notes-0.15.34.md)。
 
@@ -11,7 +13,7 @@
 ## 使用
 
 1. 安装 Release APK，在 LSPosed 启用 taplusbridge，并勾选「传送门」和「系统框架」作用域后重启。
-2. 在规则页添加目标应用和域名或网址并保存。
+2. 在规则页添加目标应用和域名、网址或协议并保存。磁力填写 `magnet:`，电驴填写 `ed2k:`，由规则选择目标应用。
 3. 长按内容触发传送门，点击显示目标应用名称和图标的卡片打开。
 
 不需要为单个目标应用编写适配。实际打开能力仍取决于目标应用是否处理该链接。
@@ -102,7 +104,7 @@
 
 需要 JDK 21、Android SDK 37 和 Gradle Wrapper。Release 构建需要本机 `keystore.properties`，其中设置 `storeFile`、`storePassword`、`keyAlias` 和 `keyPassword`。签名文件和属性不提交到仓库。
 
-0.15.34／66 的 Release 继续启用 R8 代码裁剪、优化和混淆，使用 Android 默认优化规则及 `app/proguard-rules.pro` 的外部入口保留规则。每次交付应一并归档本次构建的 `mapping.txt`，用于还原崩溃堆栈。
+0.15.39／71 的 Release 继续启用 R8 代码裁剪、优化和混淆，使用 Android 默认优化规则及 `app/proguard-rules.pro` 的外部入口保留规则。每次交付应一并归档本次构建的 `mapping.txt`，用于还原崩溃堆栈。
 
 ```powershell
 .\gradlew.bat :app:lintRelease :app:assembleRelease

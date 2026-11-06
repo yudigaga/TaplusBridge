@@ -56,6 +56,8 @@ public final class BridgeProvider extends ContentProvider {
                 && !"capture_arm".equals(method) && !"probe_arm".equals(method) && !"probe_status".equals(method) && !"capture_cancel".equals(method)
                 && !"source_scope".equals(method) && !"lens_config".equals(method)
                 && !"recognition_channels".equals(method)
+                && !"translation_prepare".equals(method)
+                && !"link_choice_prepare".equals(method)
                 && !"drag_take".equals(method) && !"drag_complete".equals(method) && !"drag_import".equals(method))) return Bundle.EMPTY;
         int uid = Binder.getCallingUid();
         if (uid / 100000 != Process.myUid() / 100000) return Bundle.EMPTY;
@@ -65,6 +67,25 @@ public final class BridgeProvider extends ContentProvider {
         try {
             PackageInfo host = context.getPackageManager().getPackageInfo(BridgeContract.HOST_PACKAGE, 0);
             if (!HostPolicy.supportedVersion(host.versionName, host.getLongVersionCode())) return declined("unsupported_host");
+            if ("link_choice_prepare".equals(method)) {
+                if (extras == null || !(extras.get("links") instanceof List<?> raw)
+                        || raw.isEmpty() || raw.size() > io.github.yudigaga.taplusbridge.links.LinkChoiceRequests.MAX_LINKS
+                        || !(extras.get("clipboard") instanceof Boolean clipboard)
+                        || extras.containsKey("source") && extras.get("source") != null && !(extras.get("source") instanceof String)
+                        || !java.util.Set.of("links", "source", "clipboard").containsAll(extras.keySet())) return Bundle.EMPTY;
+                List<String> links = new ArrayList<>();
+                for (Object value : raw) { if (!(value instanceof String link)) return Bundle.EMPTY; links.add(link); }
+                Intent direct = io.github.yudigaga.taplusbridge.links.LinkChoiceRequests.prepare(context, links, extras.getString("source"), clipboard);
+                if (direct == null) return Bundle.EMPTY;
+                Bundle response = new Bundle(); response.putParcelable("direct", direct); return response;
+            }
+            if ("translation_prepare".equals(method)) {
+                if (extras == null || !(extras.get("text") instanceof String text)
+                        || extras.containsKey("source") && !(extras.get("source") instanceof String)) return Bundle.EMPTY;
+                Intent direct = io.github.yudigaga.taplusbridge.translation.TranslationRequests.prepare(context, text, extras.getString("source"));
+                if (direct == null) return Bundle.EMPTY;
+                Bundle response = new Bundle(); response.putParcelable("direct", direct); return response;
+            }
             if ("drag_import".equals(method)) return io.github.yudigaga.taplusbridge.drag.DragNativeImport.receive(context, extras);
             if ("drag_complete".equals(method)) {
                 ConfigStore config = new ConfigStore(context);
@@ -132,12 +153,15 @@ public final class BridgeProvider extends ContentProvider {
                 if (extras == null) return Bundle.EMPTY;
                 context.getSharedPreferences("status", Context.MODE_PRIVATE).edit()
                         .putLong("recognition_at", System.currentTimeMillis())
-                        .putInt("recognition_links", Math.max(0, Math.min(8, extras.getInt("links"))))
+                        .putInt("recognition_links", Math.max(0, Math.min(io.github.yudigaga.taplusbridge.recognition.LinkExtractor.MAX_RESULTS, extras.getInt("links"))))
                         .apply();
                 return Bundle.EMPTY;
             }
-            if ("resolve".equals(method) && extras != null && extras.getBoolean("local_recognition")
+            if (extras != null && extras.getBoolean("local_recognition")
                     && !new ConfigStore(context).recognitionEnabled()) return declined("recognition_disabled");
+            if (extras != null && extras.getBoolean("clipboard") && (extras.getString("source") != null
+                    || !new ConfigStore(context).recognitionChannels().enabled(
+                            io.github.yudigaga.taplusbridge.config.RecognitionChannels.Channel.CLIPBOARD))) return declined("recognition_disabled");
             // A host IPC cannot impersonate an explicit choice made in our own foreground UI.
             if (extras != null && extras.containsKey("explicit_target")) return declined("invalid_request");
             boolean ephemeral = extras != null && extras.getBoolean("ephemeral");
@@ -191,7 +215,8 @@ public final class BridgeProvider extends ContentProvider {
     }
     /** Called only from the module's own foreground drop screen after local rule validation. */
     public static String issueDrag(Context context, Bundle request) {
-        return LaunchPlanner.plan(context, request) == null ? null : new TicketStore(context).issue(request);
+        return LaunchPlanner.plan(context, request) == null ? null : request.getBoolean("ephemeral")
+                ? EphemeralTicketStore.issue(request) : new TicketStore(context).issue(request);
     }
     @Override public Cursor query(Uri uri, String[] projection, String selection, String[] args, String order) { return null; }
     @Override public String getType(Uri uri) { return null; }

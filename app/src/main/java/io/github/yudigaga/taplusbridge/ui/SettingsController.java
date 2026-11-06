@@ -113,7 +113,7 @@ public final class SettingsController implements AutoCloseable {
 
     /** Immutable display state; hostSupported means inspected version, not LSPosed activation. */
     public static final class Snapshot {
-        public final boolean enabled, nativeEnabled, recognitionEnabled, captureEnabled, lensEnabled;
+        public final boolean enabled, nativeEnabled, recognitionEnabled, captureEnabled, lensEnabled, cloudLinkHandoffEnabled;
         public final ThawEngine.Mode mode;
         public final boolean hostInstalled, hostSupported, shizukuGranted;
         public final String hostVersionName, hostVersion, shizukuStatus, versionName;
@@ -126,6 +126,7 @@ public final class SettingsController implements AutoCloseable {
             enabled = config.enabled(); nativeEnabled = config.nativeEnabled();
             recognitionEnabled = config.recognitionEnabled(); captureEnabled = config.captureEnabled();
             lensEnabled = config.lensEnabled();
+            cloudLinkHandoffEnabled = config.cloudLinkHandoffEnabled();
             dragSettings = config.getDragSettings();
             recognitionChannels = config.recognitionChannels();
             mode = config.mode(); this.hostInstalled = hostInstalled; this.hostSupported = hostSupported;
@@ -146,6 +147,11 @@ public final class SettingsController implements AutoCloseable {
         } catch (PackageManager.NameNotFoundException ignored) { }
         return new Snapshot(config, installed, supported, hostVersion, hostCode,
                 shizukuAuthorization.granted(), shizukuAuthorization.status());
+    }
+
+    public void setCloudLinkHandoffEnabled(boolean enabled) {
+        requireOpen(); config.setCloudLinkHandoffEnabled(enabled);
+        RuntimePublisher.publishSavedSettings(context);
     }
 
     /** Compatibility projection for the initial UI draft; runtime routing uses full Ice entries. */
@@ -416,8 +422,8 @@ public final class SettingsController implements AutoCloseable {
     /** Pure preview: neither opens a page nor thaws an application. */
     public Preview matchPreview(String url, String source) {
         String value = clean(url), origin = clean(source);
-        if (!IntentObservation.validHttpUrl(value)) return new Preview(PreviewStatus.INVALID,
-                "链接格式无效", "请输入完整的 http:// 或 https:// 链接", null, null);
+        if (!io.github.yudigaga.taplusbridge.recognition.RouteLink.valid(value)) return new Preview(PreviewStatus.INVALID,
+                "链接格式无效", "请输入完整的网页、磁力或 ed2k 文件链接", null, null);
         if (!origin.isEmpty() && !"*".equals(origin) && !RouteRule.validPackage(origin)) return new Preview(PreviewStatus.INVALID,
                 "来源包名无效", "来源可留空，或填写应用包名", null, null);
         String normalizedSource = origin.isEmpty() || "*".equals(origin) ? null : origin;
@@ -427,15 +433,19 @@ public final class SettingsController implements AutoCloseable {
                 "存在多个已安装目标", "同优先级有多个已安装目标应用，请通过应用开关或手动规则选择；无感识别不会自动打开", null, null);
         LaunchPlanner.Plan plan = planned.plan();
         if (plan == null) return new Preview("invalid_request".equals(planned.reason()) ? PreviewStatus.INVALID : PreviewStatus.NO_MATCH, "未匹配到可用规则",
-                ("disabled".equals(planned.reason()) ? "请先开启应用流转" : "target_missing".equals(planned.reason()) ? "候选应用未安装在当前用户中" : "当前来源和域名没有启用规则")
+                ("disabled".equals(planned.reason()) ? "请先开启应用流转" : "target_missing".equals(planned.reason()) ? "候选应用未安装在当前用户中" : "当前来源和链接没有启用规则")
                         + "；普通识别保留原打开方式，无感识别结束，不回放原网页", null, null);
         LinkRuleEntry rule = IceRuleRouting.decide(context, value, normalizedSource).rule();
         if (rule != null && !plan.targetPackage().equals(rule.targetPackage)) rule = null;
+        String handoff = value.equals(plan.target().getDataString()) ? "链接保持原样，不改写地址"
+                : io.github.yudigaga.taplusbridge.recognition.RouteLink.protocolRule(
+                        io.github.yudigaga.taplusbridge.recognition.RouteLink.ruleKey(value))
+                        ? "仅规范协议头，文件名、哈希和参数保持原样" : "使用已适配的应用入口，保留对应分享信息；部分网盘在应用内网页打开";
         return new Preview(PreviewStatus.MATCHED, "已匹配到" + appLabel(plan.targetPackage()),
-                "目标包名：" + plan.targetPackage() + (rule == null ? "" : "\n匹配域名：" + rule.host
+                "目标包名：" + plan.targetPackage() + (rule == null ? "" : "\n匹配条件：" + rule.host
                         + "\n来源条件：" + ("*".equals(rule.sourcePackage) ? "所有应用" : appLabel(rule.sourcePackage))
                         + "\n规则来源：" + (LinkRuleEntry.SOURCE_MANUAL.equals(rule.source) ? "手动" : "在线"))
-                        + "\n链接保持原样，不改写地址\n预览不会解冻或打开应用", rule, plan.targetPackage(), plan.target().getDataString());
+                        + "\n" + handoff + "\n预览不会解冻或打开应用", rule, plan.targetPackage(), plan.target().getDataString());
     }
 
     public void loadInstalledApps(Consumer<List<AppEntry>> callback) {

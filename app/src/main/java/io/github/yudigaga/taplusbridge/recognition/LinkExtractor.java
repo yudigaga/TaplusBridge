@@ -13,13 +13,15 @@ import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-/** Extracts supplied web links only; never predicts a destination from a title or expands a URL. */
+/** Extracts supplied supported links; never predicts a destination from a title or expands a URL. */
 public final class LinkExtractor {
     public static final int MAX_INPUT_LENGTH = 128 * 1024;
     public static final int MAX_URL_LENGTH = 8192;
-    public static final int MAX_RESULTS = 8;
+    public static final int MAX_RESULTS = 64;
     private static final Pattern ENTITY = Pattern.compile("&(?:amp|lt|gt|quot|apos|nbsp|#[0-9]{1,7}|#x[0-9a-fA-F]{1,6});");
-    private static final Pattern URL_TOKEN = Pattern.compile("(?i)(?<![a-z0-9_])(?:https?://|www\\.)[^\\s<>\\\"'\\p{Cc}，。！？；、‘’“”《》【】]+");
+    private static final Pattern URL_TOKEN = Pattern.compile("(?i)(?<![a-z0-9_])(?:"
+            + "(?:magnet:\\?|ed2k://)[^\\s<>\\\"\\p{Cc}]+"
+            + "|(?:https?://|www\\.)[^\\s<>\\\"'\\p{Cc}，。！？；、‘’“”《》【】]+)");
     private static final Pattern TAG = Pattern.compile("(?s)<!\\[CDATA\\[.*?\\]\\]>|<!--.*?-->|<[^>]{0,8192}>");
     private static final Pattern TAG_NAME = Pattern.compile("^<\\s*(/?)\\s*([A-Za-z_][A-Za-z0-9_:.-]*)");
     private static final Pattern HREF = Pattern.compile("(?is)\\bhref\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)'|([^\\s>]+))");
@@ -30,8 +32,11 @@ public final class LinkExtractor {
 
     public static List<String> extract(String raw) {
         if (raw == null || raw.isEmpty() || raw.length() > MAX_INPUT_LENGTH) return Collections.emptyList();
-        String text = decodeEntities(raw);
-        String upper = text.toUpperCase(Locale.ROOT);
+        String complete = raw.trim();
+        if (RouteLink.valid(complete) && !RouteLink.validHttp(complete)) return List.of(complete);
+        String decoded = decodeEntities(raw);
+        String text = !TAG.matcher(raw).find() && TAG.matcher(decoded).find() ? decoded : raw;
+        String upper = decoded.toUpperCase(Locale.ROOT);
         // No XML parser or entity resolver is used. Declaration URLs must not become results.
         if (upper.contains("<!DOCTYPE") || upper.contains("<!ENTITY")) return Collections.emptyList();
         Markup markup = readMarkup(text);
@@ -40,8 +45,16 @@ public final class LinkExtractor {
         if (!markup.anchors.isEmpty()) return immutable(markup.anchors);
         if (CARD.matcher(text).find()) return Collections.emptyList();
         Set<String> links = new LinkedHashSet<>();
-        Matcher matcher = URL_TOKEN.matcher(TAG.matcher(text).replaceAll(" "));
-        while (matcher.find() && links.size() < MAX_RESULTS) add(links, matcher.group());
+        Matcher matcher = URL_TOKEN.matcher(TAG.matcher(raw).replaceAll(" "));
+        while (matcher.find() && links.size() < MAX_RESULTS) {
+            String token = matcher.group();
+            boolean download = token.regionMatches(true, 0, "magnet:", 0, 7) || token.regionMatches(true, 0, "ed2k:", 0, 5);
+            if (download) add(links, token);
+            else {
+                Matcher parts = URL_TOKEN.matcher(decodeEntities(token));
+                while (parts.find() && links.size() < MAX_RESULTS) add(links, parts.group());
+            }
+        }
         return immutable(links);
     }
 
@@ -69,7 +82,7 @@ public final class LinkExtractor {
                     String value = text.substring(urlStart, tags.start()).trim();
                     if (value.startsWith("<![CDATA[") && value.endsWith("]]>")) {
                         value = value.substring(9, value.length() - 3).trim();
-                    }
+                    } else value = decodeEntities(value);
                     add(canonical ? found.canonical : found.urls, value);
                     urlStart = -1;
                 }
@@ -81,7 +94,7 @@ public final class LinkExtractor {
                 if (href.find()) {
                     String value = href.group(1) != null ? href.group(1)
                             : href.group(2) != null ? href.group(2) : href.group(3);
-                    add(found.anchors, value);
+                    add(found.anchors, decodeEntities(value));
                 }
             }
             if (tag.matches("(?s).*/\\s*>")) continue;
@@ -98,8 +111,10 @@ public final class LinkExtractor {
 
     private static void add(Set<String> links, String raw) {
         if (links.size() >= MAX_RESULTS || raw == null) return;
+        String supplied = raw.trim();
+        if (RouteLink.valid(supplied) && !RouteLink.validHttp(supplied)) { links.add(supplied); return; }
         if (raw.contains("…") || raw.matches("(?s).*\\.{3,}[)\\]}.。！？，,;:]*$")) return;
-        String value = trimPunctuation(raw.trim());
+        String value = trimPunctuation(supplied);
         if (value.regionMatches(true, 0, "www.", 0, 4)) value = "https://" + value;
         // An ellipsis is display truncation, not enough information to construct a destination.
         if (value.contains("…") || value.endsWith("...") || value.length() > MAX_URL_LENGTH) return;
@@ -126,6 +141,7 @@ public final class LinkExtractor {
     }
 
     private static boolean validUrl(String value) {
+        if (RouteLink.valid(value) && !RouteLink.validHttp(value)) return true;
         if (value.isEmpty()) return false;
         for (int i = 0; i < value.length(); i++) {
             char c = value.charAt(i);
