@@ -62,7 +62,8 @@ public final class RuntimePublisher {
             if(expected!=generation.get())return;
             message="框架已保存配置，等待系统确认";
             configurationEvent("stored",snapshot);
-            main.post(()->RuntimeClient.connect(app,()->worker.submit(()->confirm(expected,snapshot,0))));
+            // Status retries also reconnect; a pending bind must not own confirmation progress.
+            confirm(expected,snapshot,0);
         }catch(RuntimeException failed){
             if(expected!=generation.get())return;
             message=attempt<5?"本体已保存，系统同步失败；等待重试":"本体已保存，系统同步失败；请手动重试";
@@ -83,6 +84,7 @@ public final class RuntimePublisher {
         if(!raw.equals(target.getString(RuntimeSnapshot.KEY,null)))throw new IllegalStateException("framework_store_mismatch");
     }
     private void confirm(long expected,RuntimeSnapshot snapshot,int attempt){
+        if(expected!=generation.get())return;
         android.os.Bundle status=RuntimeClient.call(app,"status",null);
         if(expected!=generation.get())return;
         if(status!=null && snapshot.identity.equals(status.getString("identity")) && status.getBoolean("ready")

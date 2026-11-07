@@ -28,6 +28,10 @@ import io.github.yudigaga.taplusbridge.runtime.RuntimeServer;
 import io.github.yudigaga.taplusbridge.runtime.RuntimeSnapshot;
 import io.github.yudigaga.taplusbridge.runtime.ScopeCaptureStore;
 import java.io.ByteArrayOutputStream;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.Executor;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 
 /** Physical long-press capture with an optional, explicitly enabled original-click link probe. */
@@ -35,6 +39,10 @@ import java.util.function.Supplier;
 public final class SystemScopeCapture implements RuntimeServer.SourceCapture {
     public static final String ACTION = "io.github.yudigaga.taplusbridge.SCOPE_CAPTURE";
     public static final String LINK_PREPARE = "io.github.yudigaga.taplusbridge.SCOPE_LINK_PREPARE";
+    private static final Executor IMAGE_ENCODER = new ThreadPoolExecutor(0, 1, 30, TimeUnit.SECONDS,
+            new ArrayBlockingQueue<>(1), task -> {
+                Thread thread = new Thread(task, "TaplusBridge-png"); thread.setDaemon(true); return thread;
+            });
     private static final class LinkWindow {
         final String nonce;
         final RuntimeSnapshot config;
@@ -51,6 +59,10 @@ public final class SystemScopeCapture implements RuntimeServer.SourceCapture {
     private volatile LinkWindow linkWindow;
     private final XposedModule module;
     private final Handler worker;
+    private final Executor imageEncoder;
+    // Owned by the pointer worker; a waiting request retains no screenshot pixels.
+    private boolean encodingImage;
+    private Runnable pendingEncoding;
     private final Supplier<Context> context;
     private final Supplier<Object> atms;
     private final Supplier<RuntimeServer> runtime;
@@ -131,8 +143,14 @@ public final class SystemScopeCapture implements RuntimeServer.SourceCapture {
     SystemScopeCapture(XposedModule module, Handler worker, Supplier<Context> context,
                        Supplier<Object> atms, Supplier<RuntimeServer> runtime, ScopeCaptureWindow windows,
                        PhysicalTouchState physical) {
+        this(module, worker, context, atms, runtime, windows, physical, IMAGE_ENCODER);
+    }
+
+    SystemScopeCapture(XposedModule module, Handler worker, Supplier<Context> context,
+                       Supplier<Object> atms, Supplier<RuntimeServer> runtime, ScopeCaptureWindow windows,
+                       PhysicalTouchState physical, Executor imageEncoder) {
         this.module = module; this.worker = worker; this.context = context; this.atms = atms;
-        this.runtime = runtime; this.physical = physical; this.windows = windows;
+        this.runtime = runtime; this.physical = physical; this.windows = windows; this.imageEncoder = imageEncoder;
     }
 
     /** Copy only touch primitives before returning to the system input dispatcher. */
@@ -324,12 +342,14 @@ public final class SystemScopeCapture implements RuntimeServer.SourceCapture {
                                 long began, String url) {
         Bitmap image = null;
         try {
-            RuntimeServer server = runtime.get(); Context system = context.get();
-            RuntimeSnapshot latest = server == null ? null : server.sourceCaptureConfiguration();
-            if (DragGestureGate.suppressLongPress() || expected != generation || gestureInputGeneration != inputGeneration.get()
-                    || latest == null || !latest.identity.equals(config.identity)
-                    || !unlocked(system) || !physical.released() || nativeUrlSince(picked.source, began)) return;
-            byte[] png = null;
+            long input = gestureInputGeneration;
+            RuntimeSnapshot latest = captureConfiguration(expected, picked, config, began, input);
+            if (latest == null) return;
+            if (latest.scopeCapture && encodingImage) {
+                pendingEncoding = () -> deliverCapture(expected, picked, config, began, url);
+                return;
+            }
+            Context system = context.get();
             SystemAssistContent content = assistContent;
             String text = content == null ? "" : content.read(picked, latest, began, sourceDown).deliveryText();
             if (nativeSince(picked.source, began) && !config.scopeLinkProbe && text.isBlank()) return;
@@ -340,24 +360,81 @@ public final class SystemScopeCapture implements RuntimeServer.SourceCapture {
                 try {
                     image = windows.captureBehindHost(atms.get(), picked, host.applicationInfo.uid);
                     if (image == null || image.isRecycled()) throw new IllegalStateException("scope_image_missing");
-                    var output = new LimitedPng();
-                    if (!image.compress(Bitmap.CompressFormat.PNG, 100, output)) throw new IllegalStateException("scope_image_encode");
-                    png = output.toByteArray();
+                    encodeImage(image, expected, picked, config, began, input, host.applicationInfo.uid, text, url);
+                    image = null;
+                    return;
                 } catch (ReflectiveOperationException | RuntimeException unavailable) {
                     if (!latest.scopeLinkProbe) throw unavailable;
                     event("failed", reasonOf(unavailable));
                 }
             }
-            if (png == null) {
+            submitCapture(expected, picked, config, began, input, host.applicationInfo.uid, text, url, null);
+        } catch (ReflectiveOperationException | PackageManager.NameNotFoundException | RuntimeException failure) {
+            store.clear(); event("failed", reasonOf(failure));
+        } finally { if (image != null && !image.isRecycled()) image.recycle(); }
+    }
+
+    private RuntimeSnapshot captureConfiguration(long expected, ScopeCaptureWindow.Snapshot picked,
+                                                 RuntimeSnapshot config, long began, long input) {
+        RuntimeServer server = runtime.get();
+        RuntimeSnapshot latest = server == null ? null : server.sourceCaptureConfiguration();
+        return config != null && expected == generation && input == gestureInputGeneration && input == inputGeneration.get()
+                && !DragGestureGate.suppressLongPress() && latest != null && latest.identity.equals(config.identity)
+                && unlocked(context.get()) && physical.released() && !nativeUrlSince(picked.source, began) ? latest : null;
+    }
+
+    private void encodeImage(Bitmap image, long expected, ScopeCaptureWindow.Snapshot picked, RuntimeSnapshot config,
+                             long began, long input, int hostUid, String text, String url) {
+        encodingImage = true;
+        try {
+            imageEncoder.execute(() -> {
+                byte[] png = null;
+                RuntimeException failure = null;
+                try {
+                    if (image.isRecycled()) throw new IllegalStateException("scope_image_missing");
+                    var output = new LimitedPng();
+                    if (!image.compress(Bitmap.CompressFormat.PNG, 100, output)) throw new IllegalStateException("scope_image_encode");
+                    png = output.toByteArray();
+                } catch (RuntimeException unavailable) { failure = unavailable; }
+                finally { if (!image.isRecycled()) image.recycle(); }
+                byte[] encoded = png;
+                RuntimeException error = failure;
+                worker.post(() -> {
+                    encodingImage = false;
+                    try {
+                        if (captureConfiguration(expected, picked, config, began, input) == null) return;
+                        if (error != null) {
+                            event("failed", reasonOf(error));
+                            if (!config.scopeLinkProbe) return;
+                        }
+                        submitCapture(expected, picked, config, began, input, hostUid, text, url, encoded);
+                    } finally {
+                        Runnable pending = pendingEncoding; pendingEncoding = null;
+                        if (pending != null) pending.run();
+                    }
+                });
+            });
+        } catch (RuntimeException rejected) { encodingImage = false; throw rejected; }
+    }
+
+    private void submitCapture(long expected, ScopeCaptureWindow.Snapshot picked, RuntimeSnapshot config,
+                               long began, long input, int hostUid, String text, String url, byte[] png) {
+        try {
+            RuntimeSnapshot latest = captureConfiguration(expected, picked, config, began, input);
+            if (latest == null || (nativeSince(picked.source, began) && !latest.scopeLinkProbe && text.isBlank())) return;
+            Context system = context.get();
+            var host = system.getPackageManager().getPackageInfo(HostPolicy.HOST_PACKAGE, PackageManager.MATCH_DISABLED_COMPONENTS);
+            if (!HostPolicy.supportedVersion(host.versionName, host.getLongVersionCode()) || host.applicationInfo == null
+                    || !host.applicationInfo.enabled || host.applicationInfo.uid != hostUid) return;
+            if (png != null) windows.validateBehindHost(atms.get(), picked, hostUid);
+            else {
                 try { windows.validate(atms.get(), picked); }
                 catch (IllegalStateException blocked) {
                     if (!"capture_focus".equals(blocked.getMessage()) || (url == null && !latest.scopeLinkProbe)) throw blocked;
                 }
             }
             if (png == null && url == null && text.isBlank() && !latest.scopeLinkProbe) return;
-            if (DragGestureGate.suppressLongPress() || !physical.released() || expected != generation
-                    || nativeUrlSince(picked.source, began)
-                    || (nativeSince(picked.source, began) && !config.scopeLinkProbe && text.isBlank())) return;
+            if (captureConfiguration(expected, picked, config, began, input) == null) return;
             Point size = new Point(); Display display = system.getSystemService(DisplayManager.class).getDisplay(0);
             if (display == null) return; display.getRealSize(size);
             Bundle data = new Bundle(); data.putString("source", picked.source); data.putString("activity", picked.activity);
@@ -375,14 +452,14 @@ public final class SystemScopeCapture implements RuntimeServer.SourceCapture {
                     : url != null ? store.issueText(host.applicationInfo.uid, latest, data, url)
                     : store.issueResume(host.applicationInfo.uid, latest, data);
             pendingTarget = picked;
-            pendingInputGeneration = gestureInputGeneration;
+            pendingInputGeneration = input;
             Intent start = new Intent(ACTION).setComponent(new ComponentName(HostPolicy.HOST_PACKAGE,
                     "com.miui.contentextension.services.TextContentExtensionService")).putExtra("scope_nonce", nonce);
             if (system.startService(start) == null) { store.clear(); throw new IllegalStateException("scope_host_unavailable"); }
             event("submitted", "none");
         } catch (ReflectiveOperationException | PackageManager.NameNotFoundException | RuntimeException failure) {
             store.clear(); event("failed", reasonOf(failure));
-        } finally { if (image != null && !image.isRecycled()) image.recycle(); }
+        }
     }
 
     @Override public Bundle take(int owner, Bundle request, RuntimeSnapshot config) {
@@ -425,7 +502,7 @@ public final class SystemScopeCapture implements RuntimeServer.SourceCapture {
     private void cancel() {
         SystemAssistContent content = assistContent;
         if (content != null && origin != null) content.cancelPending(origin, configuration, downElapsed, sourceDown);
-        generation++; gestureActive = false; origin = null; configuration = null; gesture.cancel();
+        generation++; gestureActive = false; origin = null; configuration = null; gesture.cancel(); pendingEncoding = null;
         recognitionFeedbackSent = false;
         ScopeLinkProbe link = linkProbe; if (link != null) link.cancel();
     }

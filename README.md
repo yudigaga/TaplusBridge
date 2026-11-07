@@ -1,8 +1,10 @@
 # taplusbridge
 
-当前正式版：**0.15.39 / 71**。
+当前正式版：**0.15.40 / 72**。
 
-剪贴板网页/磁力/ed2k使用本地规则入口，下载链接支持多选和按目标分组。本版取消115批量的主页/登录准备菜单，选好后一次直达离线添加入口，默认用户已登录。使用和验证边界见 [0.15.39更新说明](docs/2026-11-06-release-0.15.39-direct-batch.md)。
+0.15.40 修复配置确认与批量链接去重，优化批量规则读取、截图编码及 Lens 缩略图取消，并补齐可复现测试与 CI。见 [0.15.40 更新说明](docs/release-notes-0.15.40.md)。
+
+剪贴板网页/磁力/ed2k使用本地规则入口，下载链接支持多选和按目标分组。115批量选好后一次直达离线添加入口，默认用户已登录。使用和验证边界见 [0.15.39更新说明](docs/2026-11-06-release-0.15.39-direct-batch.md)。
 
 设置已整理为「概览、识别、应用、规则」四页，支持点选和横向滑动。识别通道及补点等开关即时保存并同步；应用名单与手势草稿分别显式保存，系统生效状态以「系统已确认配置」为准。详细变化见 [0.15.34 更新说明](docs/release-notes-0.15.34.md)。
 
@@ -104,8 +106,21 @@
 
 需要 JDK 21、Android SDK 37 和 Gradle Wrapper。Release 构建需要本机 `keystore.properties`，其中设置 `storeFile`、`storePassword`、`keyAlias` 和 `keyPassword`。签名文件和属性不提交到仓库。
 
-0.15.39／71 的 Release 继续启用 R8 代码裁剪、优化和混淆，使用 Android 默认优化规则及 `app/proguard-rules.pro` 的外部入口保留规则。每次交付应一并归档本次构建的 `mapping.txt`，用于还原崩溃堆栈。
+0.15.40／72 的 Release 继续启用 R8 代码裁剪、优化和混淆，使用 Android 默认优化规则及 `app/proguard-rules.pro` 的外部入口保留规则。每次交付应一并归档本次构建的 `mapping.txt`，用于还原崩溃堆栈。
 
 ```powershell
 .\gradlew.bat :app:lintRelease :app:assembleRelease
 ```
+
+## 开发验证
+
+测试源码及脱敏样例位于 `app/src/test/`，与源码一起维护。完整本地验证：
+
+```powershell
+.\gradlew.bat :app:testDebugUnitTest :app:lintRelease
+python -m unittest discover -s tools/tests -p 'test_*.py'
+```
+
+Linux 使用 `bash ./gradlew`；截图输出由 Gradle 统一指定到仓库的 `artifacts/`，不依赖开发机绝对路径。GitHub Actions 在推送、PR 或手动触发时运行这些检查，需要下载 Gradle、Android SDK 37 和测试依赖，不需要正式签名密钥。
+
+本地单元测试和 CI 不代替手机上的 LSPosed 回调、ROM 窗口与手势时序、Root／Shizuku、Google Lens 网络及目标应用服务验收。

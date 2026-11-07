@@ -35,6 +35,8 @@ import io.github.yudigaga.taplusbridge.runtime.RuntimeClient;
 import io.github.yudigaga.taplusbridge.ui.TransitActivity;
 import io.github.yudigaga.taplusbridge.ui.DragMenuUi;
 import io.github.yudigaga.taplusbridge.recognition.RouteLink;
+import io.github.yudigaga.taplusbridge.rules.LinkRuleEntry;
+import io.github.yudigaga.taplusbridge.rules.RuleRepository;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -216,10 +218,14 @@ public final class DragActivity extends ComponentActivity {
         if (!links.stream().allMatch(DragActivity::downloadLink)) {
             unavailableBatch(links, "网页链接需要逐个打开，请重新选择"); return;
         }
+        ConfigStore config = new ConfigStore(this);
+        boolean enabled = config.enabled(), nativeLinks = config.nativeEnabled(), cloudLinkHandoff = config.cloudLinkHandoffEnabled();
+        List<LinkRuleEntry> rules = new RuleRepository(this).effectiveRules();
         LinkedHashMap<String, List<String>> groups = new LinkedHashMap<>();
         for (String link : links) {
             Bundle request = ruleRequest(List.of(link));
-            LaunchPlanner.PlanningResult result = LaunchPlanner.planWithReason(this, request);
+            LaunchPlanner.PlanningResult result = LaunchPlanner.planWithRules(this, request,
+                    enabled, nativeLinks, cloudLinkHandoff, rules);
             if (result.plan() == null) {
                 unavailableBatch(links, "所选链接含未匹配、冲突或不可用的规则，请先检查规则"); return;
             }

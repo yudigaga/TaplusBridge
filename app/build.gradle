@@ -14,8 +14,8 @@ android {
         applicationId 'io.github.yudigaga.taplusbridge'
         minSdk 28
         targetSdk 35
-        versionCode 71
-        versionName '0.15.39'
+        versionCode 72
+        versionName '0.15.40'
     }
     signingConfigs {
         taplusRelease {
@@ -77,4 +77,8 @@ dependencies {
     testImplementation 'androidx.compose.ui:ui-test-junit4-android:1.12.0'
     debugImplementation 'androidx.compose.ui:ui-test-manifest:1.12.0'
 }
-tasks.withType(Test).configureEach { maxHeapSize = '1g'; maxParallelForks = 1 }
+tasks.withType(Test).configureEach {
+    maxHeapSize = '1g'
+    maxParallelForks = 1
+    systemProperty 'taplus.testArtifacts', rootProject.file('artifacts').absolutePath
+}

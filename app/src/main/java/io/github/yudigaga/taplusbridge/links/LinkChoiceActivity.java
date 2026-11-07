@@ -10,8 +10,11 @@ import androidx.activity.ComponentActivity;
 import io.github.yudigaga.taplusbridge.R;
 import io.github.yudigaga.taplusbridge.bridge.BridgeProvider;
 import io.github.yudigaga.taplusbridge.bridge.LaunchPlanner;
+import io.github.yudigaga.taplusbridge.config.ConfigStore;
 import io.github.yudigaga.taplusbridge.recognition.BatchLinks;
 import io.github.yudigaga.taplusbridge.recognition.RouteLink;
+import io.github.yudigaga.taplusbridge.rules.LinkRuleEntry;
+import io.github.yudigaga.taplusbridge.rules.RuleRepository;
 import io.github.yudigaga.taplusbridge.ui.DragMenuUi;
 import io.github.yudigaga.taplusbridge.ui.TransitActivity;
 import java.util.ArrayList;
@@ -73,9 +76,13 @@ public final class LinkChoiceActivity extends ComponentActivity {
     }
     private void downloads(List<String> links) {
         if (!authorize()) return;
+        ConfigStore config = new ConfigStore(this);
+        boolean enabled = config.enabled(), nativeLinks = config.nativeEnabled(), cloudLinkHandoff = config.cloudLinkHandoffEnabled();
+        List<LinkRuleEntry> rules = new RuleRepository(this).effectiveRules();
         Map<String, List<String>> groups = new LinkedHashMap<>();
         for (String link : links) {
-            LaunchPlanner.PlanningResult planned = LaunchPlanner.planWithReason(this, singleRequest(link));
+            LaunchPlanner.PlanningResult planned = LaunchPlanner.planWithRules(this, singleRequest(link),
+                    enabled, nativeLinks, cloudLinkHandoff, rules);
             String key = planned.plan() == null ? "" : planned.plan().targetPackage();
             groups.computeIfAbsent(key, ignored -> new ArrayList<>()).add(link);
         }
@@ -116,7 +123,7 @@ public final class LinkChoiceActivity extends ComponentActivity {
     private void openBatch() {
         if (!authorize()) return;
         Bundle request = batchRequest(); LaunchPlanner.Plan fresh = LaunchPlanner.plan(this, request);
-        if (fresh == null || !fresh.targetPackage().equals(session.target) || !"批量规则".equals(fresh.kind())) {
+        if (fresh == null || !fresh.targetPackage().equals(session.target)) {
             failure("规则已不可用，请重新识别。"); return;
         }
         open(request, fresh);
