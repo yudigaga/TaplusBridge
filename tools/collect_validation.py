@@ -44,6 +44,7 @@ def collect(build, artifacts, version, code, warnings, variant="debug", certific
     renamed = {}
     mapping_lines = []
     code_presence = {}
+    removed_frozen_code = {}
     if release:
         assert mapping.is_file(), "Release R8 mapping missing"
         mapping_lines = mapping.read_text(encoding="utf-8").splitlines()
@@ -90,8 +91,17 @@ def collect(build, artifacts, version, code, warnings, variant="debug", certific
         assert not any(name.startswith(("Lio/github/libxposed/api/", "Lde/robv/android/xposed/")) for name in classes)
         assert "Lio/github/yudigaga/taplusbridge/bridge/GenericLinkLauncher;" not in classes
         assert "Lio/github/yudigaga/taplusbridge/rules/FluidCloudRuleCatalog;" not in classes
+        for original in ("io.github.yudigaga.taplusbridge.runtime.RuntimeLaunchEntry",
+                         "io.github.yudigaga.taplusbridge.runtime.SystemPackageOps"):
+            packaged = renamed.get(original, original)
+            descriptor = "L" + packaged.replace(".", "/") + ";"
+            frame = re.compile(r"\s" + re.escape(original) + r"\.[A-Za-z_$<>][A-Za-z0-9_$<>]*\(")
+            assert descriptor not in classes and original not in renamed and not any(
+                frame.search(line) for line in mapping_lines), "Removed frozen-runtime code retained: " + original
+            removed_frozen_code[original] = {"dex_definition_absent": True, "r8_mapping_absent": True}
         for original in ("io.github.yudigaga.taplusbridge.runtime.RuntimeServer",
-                         "io.github.yudigaga.taplusbridge.runtime.RuntimeLaunchEntry",
+                         "io.github.yudigaga.taplusbridge.runtime.ModuleProcessLifecycle",
+                         "io.github.yudigaga.taplusbridge.runtime.BridgeTransport",
                          "io.github.libxposed.service.XposedService",
                          "top.yukonga.miuix.kmp.basic.ScaffoldKt"):
             packaged = renamed.get(original, original)
@@ -145,12 +155,16 @@ def collect(build, artifacts, version, code, warnings, variant="debug", certific
         "rules": {"engine": "IceBridge", "offline_seed_revision": 1, "offline_seed_rules": 32, "legacy_table_removed": True},
         "thaw_channels": ["ROOT", "SHIZUKU"], "icebox_sdk_removed": True,
         "recognition_diagnostics_ui_removed": True,
-        "frozen_module_runtime": {"scope": "owner user 0, Android 13+", "storage": "framework remote preferences, versioned complete rule/config snapshot",
-                                  "module_process_required_while_frozen": False, "target_thaw": "authenticated system framework package operations",
-                                  "device_verified": False},
-        "runtime_launch_request_code_zero_supported": True,
+        "frozen_module_runtime": False,
+        "ordinary_provider_route": "module ContentProvider",
+        "module_idle_retirement_ms": 3000,
+        "removed_frozen_runtime_code": removed_frozen_code,
+        "system_runtime_channels": {"scope": "owner user 0, Android 13+",
+                                    "storage": "framework preferences: versioned system configuration and opaque routing identity",
+                                    "capabilities": ["source_scope", "source_content", "capture", "supplemental_link_probe", "drag_gesture"],
+                                    "target_package_operations": False, "device_verified": False},
         "generic_user_target": False, "manual_link_open": False, "legacy_global_target_removed": True,
-        "rule_forwarding": "configured domain and source select package, original HTTP(S) ACTION_VIEW, no app-specific conversion",
+        "rule_forwarding": "module Provider/Activity selects configured domain or protocol and source; optional verified cloud-link adapters",
         "online_snapshot_storage": "versioned Base64 UTF-8 in atomic preference transaction; legacy plaintext compatible",
         "libxposed_metadata": metadata, "scope": scope,
         "api_classes_bundled": False, "legacy_xposed_classes_bundled": False,
@@ -162,15 +176,14 @@ def collect(build, artifacts, version, code, warnings, variant="debug", certific
         "release_signed_with_long_term_key": release, "remote_published": False,
         "wechat_or_source_app_hooked": False,
         "real_screenshot_card_payload_verified": False,
-        "system_capture_mode": "automatic per-pick invisible probe after monitored physical UP; targeted source input; public Binder launch consumed before original body",
+        "system_capture_mode": "owner-user source capture and supplemental link probes; source launch interception restricted to an authenticated gesture",
         "probe_protocol": 2,
         "probe_global_source_cooldown": False,
         "system_capture_verified_on_device": False,
         "system_capture_raw_urls_persisted": False,
         "probe_synthetic_input_verified_on_device": False,
         "probe_source_page_never_visible_verified_on_device": False,
-        "probe_frozen_launch_tickets": "bounded, single-use, in-memory HTTP-rule tickets; no browser or native launcher fallback",
-        "recognition_limits": "Automatic probe requires fresh source geometry, physical-UP evidence, default portrait display and verified source-window targeting. Only the verified public ATMS entry is consumed; unknown asynchronous source launches cannot be attributed perfectly, other launch APIs and in-Activity navigation are not proven covered. Zero flash and real destination require device validation.",
+        "recognition_limits": "Automatic probe requires fresh source geometry, physical-UP evidence, default portrait display and verified source-window targeting. Only verified source-launch entries are consumed; unknown asynchronous source launches cannot be attributed perfectly, other launch APIs and in-Activity navigation are not proven covered. Zero flash and real destination require device validation.",
     }
     python_tests = artifacts / ("python-tests-" + version + ".txt")
     if python_tests.exists():

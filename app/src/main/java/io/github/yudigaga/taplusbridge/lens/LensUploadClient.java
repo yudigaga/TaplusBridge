@@ -225,7 +225,10 @@ public final class LensUploadClient {
         ScheduledThreadPoolExecutor executor = new ScheduledThreadPoolExecutor(1, task -> {
             Thread thread = new Thread(task, "TaplusBridge-Lens-upload-timeout"); thread.setDaemon(true); return thread;
         });
-        executor.setRemoveOnCancelPolicy(true); return executor;
+        executor.setRemoveOnCancelPolicy(true);
+        executor.setKeepAliveTime(3, TimeUnit.SECONDS);
+        executor.allowCoreThreadTimeOut(true);
+        return executor;
     }
     private static final class Stopped extends IOException {
         final boolean timeout;

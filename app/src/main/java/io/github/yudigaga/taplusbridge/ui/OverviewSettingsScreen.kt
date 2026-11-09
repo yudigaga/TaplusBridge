@@ -15,7 +15,6 @@ import androidx.compose.ui.state.ToggleableState
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import io.github.yudigaga.taplusbridge.config.ConfigStore
 import io.github.yudigaga.taplusbridge.config.SourceScopePolicy
 import io.github.yudigaga.taplusbridge.runtime.RuntimePublisher
 import io.github.yudigaga.taplusbridge.thaw.ThawEngine
@@ -29,7 +28,6 @@ import top.yukonga.miuix.kmp.preference.SwitchPreference
     snapshot: SettingsController.Snapshot,
     sourceScope: SourceScopePolicy,
     sourceScopeError: String?,
-    independent: Boolean,
     controller: SettingsController,
     refresh: () -> Unit,
 ) {
@@ -71,7 +69,7 @@ import top.yukonga.miuix.kmp.preference.SwitchPreference
             }
             item {
                 SettingsCard {
-                    ArrowPreference(title = "运行与授权", summary = "${modeLabel(snapshot.mode)} · " + if (independent) "允许本体冻结后独立打开" else "独立打开已关闭",
+                    ArrowPreference(title = "运行与授权", summary = "${modeLabel(snapshot.mode)} · 系统配置与目标应用授权",
                         onClick = { dialog = "runtime" }, modifier = Modifier.testTag("action.runtime"))
                     ArrowPreference(title = "关于与日志", summary = "${snapshot.versionName} · 传送门版本与诊断说明",
                         onClick = { dialog = "about" }, modifier = Modifier.testTag("action.about"))
@@ -91,15 +89,17 @@ import top.yukonga.miuix.kmp.preference.SwitchPreference
                         if (error.isNotEmpty()) item { QuietText(error, Modifier.testTag("overview.dialog.error")) }
                         when (section) {
                             "runtime" -> {
-                                item { QuietText("本组切换立即保存。独立打开只覆盖支持的路由能力，Google Lens 仍需要本体与可访问 Google 的网络。") }
-                                item {
-                                    SwitchPreference(independent, { value -> change { ConfigStore(context).setIndependentEnabled(value); RuntimePublisher.synchronize(context) } },
-                                        title = "本体冻结后独立打开", summary = "Android 13+ 主用户；冻结前需等待系统确认配置",
-                                        modifier = Modifier.testTag("toggle.independent").semantics { toggleableState = if (independent) ToggleableState.On else ToggleableState.Off })
-                                }
+                                item { QuietText("设置立即保存并同步到系统；目标应用按所选方式解冻，模块用完后自动回收。") }
+                                item { SwitchPreference(title = "隐藏模块应用图标",
+                                    summary = "仅隐藏桌面入口；可从 LSPosed 的模块设置重新进入并恢复图标",
+                                    checked = snapshot.launcherIconHidden,
+                                    onCheckedChange = { change { controller.setLauncherIconHidden(it) } },
+                                    modifier = Modifier.testTag("toggle.hide_launcher_icon").semantics {
+                                        toggleableState = if (snapshot.launcherIconHidden) ToggleableState.On else ToggleableState.Off
+                                    }) }
                                 item { ArrowPreference(title = "系统配置同步", summary = runtimeStatus,
                                     onClick = { RuntimePublisher.synchronize(context); runtimeStatus = RuntimePublisher.status() }, modifier = Modifier.testTag("action.runtime_sync")) }
-                                item { SectionLabel("解冻方式") }
+                                item { SectionLabel("目标应用解冻方式") }
                                 items(ThawEngine.Mode.values().size) { index ->
                                     val mode = ThawEngine.Mode.values()[index]
                                     RadioButtonPreference(title = modeLabel(mode), summary = modeSummary(mode), selected = snapshot.mode == mode,

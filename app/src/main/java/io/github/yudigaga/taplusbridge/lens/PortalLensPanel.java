@@ -61,7 +61,7 @@ import java.util.UUID;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
@@ -72,8 +72,8 @@ import java.util.function.Supplier;
 /** Separate result window; the original image card never receives injected result views. */
 public final class PortalLensPanel implements View.OnAttachStateChangeListener {
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
-    private static final ExecutorService IO = Executors.newFixedThreadPool(2);
-    private static final ExecutorService SIGNALS = Executors.newSingleThreadExecutor();
+    private static final ExecutorService IO = idleExecutor(2, "TaplusBridge-Lens-panel");
+    private static final ExecutorService SIGNALS = idleExecutor(1, "TaplusBridge-Lens-signals");
     private static final ThreadPoolExecutor THUMBNAILS = thumbnailExecutor("TaplusBridge-Lens-thumbnail");
     private static final ThreadPoolExecutor THUMBNAIL_CLOSES = thumbnailExecutor("TaplusBridge-Lens-thumbnail-close");
     private static volatile Interaction interactionLease;
@@ -113,8 +113,17 @@ public final class PortalLensPanel implements View.OnAttachStateChangeListener {
     private LensEmbeddedBrowser embeddedBrowser;
     private String embeddedViewId;
 
+    private static ExecutorService idleExecutor(int threads, String name) {
+        ThreadPoolExecutor executor = new ThreadPoolExecutor(threads, threads, 3, TimeUnit.SECONDS,
+                new LinkedBlockingQueue<>(), task -> {
+                    Thread thread = new Thread(task, name); thread.setDaemon(true); return thread;
+                });
+        executor.allowCoreThreadTimeOut(true);
+        return executor;
+    }
+
     private static ThreadPoolExecutor thumbnailExecutor(String name) {
-        ThreadPoolExecutor executor = new ThreadPoolExecutor(2, 2, 30, TimeUnit.SECONDS,
+        ThreadPoolExecutor executor = new ThreadPoolExecutor(2, 2, 3, TimeUnit.SECONDS,
                 new ArrayBlockingQueue<>(40), task -> {
                     Thread thread = new Thread(task, name); thread.setDaemon(true); return thread;
                 });

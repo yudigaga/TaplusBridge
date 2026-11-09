@@ -23,6 +23,7 @@ import io.github.yudigaga.taplusbridge.capture.CaptureBroker;
 import io.github.yudigaga.taplusbridge.capture.CaptureLease;
 import io.github.yudigaga.taplusbridge.hook.HostPolicy;
 import io.github.yudigaga.taplusbridge.runtime.RuntimeSnapshot;
+import io.github.yudigaga.taplusbridge.runtime.ModuleProcessLifecycle;
 
 public final class BridgeProvider extends ContentProvider {
     @Override public boolean onCreate() {
@@ -30,6 +31,9 @@ public final class BridgeProvider extends ContentProvider {
         return true;
     }
     @Override public Bundle call(String method, String arg, Bundle extras) {
+        try (var work = ModuleProcessLifecycle.acquire()) { return dispatch(method, arg, extras); }
+    }
+    private Bundle dispatch(String method, String arg, Bundle extras) {
         Context context = getContext();
         if (context != null && "lens_config".equals(method) && Binder.getCallingUid() == Process.myUid()) {
             Bundle result = new Bundle(); result.putBoolean("enabled", new ConfigStore(context).lensEnabled()); return result;

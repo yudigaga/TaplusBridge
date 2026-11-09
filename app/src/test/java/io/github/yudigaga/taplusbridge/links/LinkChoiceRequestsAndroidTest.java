@@ -76,6 +76,13 @@ public final class LinkChoiceRequestsAndroidTest {
         Intent stale = prepare(List.of(URL, MAGNET), null, true); assertNotNull(stale);
         config.setNativeEnabled(!config.nativeEnabled()); assertNull(consume(stale.getStringExtra("token")));
     }
+    @Test public void changedRoutingRulesInvalidateAWaitingChoiceEvenWithoutFrameworkRouting() throws Exception {
+        var rules = new io.github.yudigaga.taplusbridge.rules.RuleRepository(context);
+        rules.saveManualRule(-1, "*", "choice.example", "example.first", "none", "");
+        Intent stale = prepare(List.of("https://choice.example/item"), null, true); assertNotNull(stale);
+        rules.saveManualRule(0, "*", "choice.example", "example.second", "none", "");
+        assertNull(consume(stale.getStringExtra("token")));
+    }
     @Test public void sourceScopeAndClipboardChannelAreIndependentOfDragEnabled() throws Exception {
         config.setDragSettings(io.github.yudigaga.taplusbridge.config.DragSettings.defaults());
         config.saveSourceScope(SourceScopePolicy.Mode.WHITELIST, List.of(), List.of("example.allowed"));

@@ -3,21 +3,27 @@ package io.github.yudigaga.taplusbridge.bridge;
 import android.os.Bundle;
 import android.content.Intent;
 import android.os.SystemClock;
+import android.os.Handler;
+import android.os.Looper;
 import android.util.Base64;
 import java.security.SecureRandom;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.ArrayList;
 import io.github.yudigaga.taplusbridge.recognition.BatchLinks;
+import io.github.yudigaga.taplusbridge.runtime.ModuleProcessLifecycle;
 
 /** Probe URLs never enter disk-backed launch tickets. A process restart intentionally loses them. */
 final class EphemeralTicketStore {
     private static final Map<String, Entry> ENTRIES = new LinkedHashMap<>();
-    private record Entry(long issued, Bundle request) { }
+    private record Entry(long issued, Bundle request, ModuleProcessLifecycle.Lease lease) { }
     private EphemeralTicketStore() { }
     static synchronized String issue(Bundle request) {
         long now = SystemClock.elapsedRealtime();
-        ENTRIES.entrySet().removeIf(e -> !live(e.getValue(), now));
+        ENTRIES.entrySet().removeIf(e -> {
+            if (live(e.getValue(), now)) return false;
+            e.getValue().lease.close(); return true;
+        });
         if (request == null || ENTRIES.size() >= TicketPolicy.CAPACITY) return null;
         ArrayList<String> links = null;
         if (request.containsKey(BatchLinks.LINKS_KEY)) {
@@ -32,10 +38,13 @@ final class EphemeralTicketStore {
         if (links != null) copy.putStringArrayList(BatchLinks.LINKS_KEY, links);
         @SuppressWarnings("deprecation") Intent candidate = request.getParcelable("candidate");
         if (candidate != null) copy.putParcelable("candidate", new Intent(candidate));
-        ENTRIES.put(token, new Entry(now, copy)); return token;
+        ENTRIES.put(token, new Entry(now, copy, ModuleProcessLifecycle.acquire(TicketPolicy.TTL_MILLIS)));
+        new Handler(Looper.getMainLooper()).postDelayed(() -> expire(token), TicketPolicy.TTL_MILLIS);
+        return token;
     }
     static synchronized Bundle consume(String token) {
         Entry entry = token == null ? null : ENTRIES.remove(token);
+        if (entry != null) entry.lease.close();
         if (!live(entry, SystemClock.elapsedRealtime())) return null;
         Bundle copy = new Bundle(entry.request());
         if (copy.containsKey(BatchLinks.LINKS_KEY))
@@ -43,6 +52,9 @@ final class EphemeralTicketStore {
         return copy;
     }
     private static boolean live(Entry entry, long now) {
-        return entry != null && now >= entry.issued() && now - entry.issued() < 30_000;
+        return entry != null && now >= entry.issued() && now - entry.issued() < TicketPolicy.TTL_MILLIS;
+    }
+    private static synchronized void expire(String token) {
+        Entry entry = ENTRIES.remove(token); if (entry != null) entry.lease.close();
     }
 }

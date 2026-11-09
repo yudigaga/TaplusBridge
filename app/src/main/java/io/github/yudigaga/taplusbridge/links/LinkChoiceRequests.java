@@ -13,6 +13,7 @@ import io.github.yudigaga.taplusbridge.config.RecognitionChannels;
 import io.github.yudigaga.taplusbridge.hook.HostPolicy;
 import io.github.yudigaga.taplusbridge.recognition.RouteLink;
 import io.github.yudigaga.taplusbridge.runtime.RuntimeSnapshot;
+import io.github.yudigaga.taplusbridge.runtime.ModuleProcessLifecycle;
 import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -25,7 +26,8 @@ public final class LinkChoiceRequests {
     public static final int MAX_LINKS = 64, MAX_CHARS = 128 * 1024;
     private static final long TTL = 30_000;
     private static final Map<String, Entry> ENTRIES = new LinkedHashMap<>();
-    private record Entry(long issued, List<String> links, String source, boolean clipboard, String identity) { }
+    private record Entry(long issued, List<String> links, String source, boolean clipboard, String identity,
+                         ModuleProcessLifecycle.Lease lease) { }
     private LinkChoiceRequests() { }
 
     public static synchronized Intent prepare(Context context, List<String> supplied, String source, boolean clipboard) {
@@ -34,11 +36,14 @@ public final class LinkChoiceRequests {
             RuntimeSnapshot current = active(context, source, clipboard);
             if (current == null) return null;
             long now = SystemClock.elapsedRealtime();
-            ENTRIES.entrySet().removeIf(item -> !live(item.getValue(), now));
+            ENTRIES.entrySet().removeIf(item -> {
+                if (live(item.getValue(), now)) return false;
+                item.getValue().lease.close(); return true;
+            });
             if (ENTRIES.size() >= 16) return null;
             byte[] bytes = new byte[32]; new SecureRandom().nextBytes(bytes);
             String token = Base64.encodeToString(bytes, Base64.NO_WRAP | Base64.NO_PADDING | Base64.URL_SAFE);
-            ENTRIES.put(token, new Entry(now, links, source, clipboard, current.identity));
+            ENTRIES.put(token, new Entry(now, links, source, clipboard, current.identity, ModuleProcessLifecycle.acquire(TTL)));
             new Handler(Looper.getMainLooper()).postDelayed(() -> remove(token), TTL);
             return new Intent().setComponent(new ComponentName(BridgeContract.APP_PACKAGE,
                     BridgeContract.APP_PACKAGE + ".links.LinkChoiceActivity"))
@@ -49,6 +54,7 @@ public final class LinkChoiceRequests {
     public static synchronized Bundle consume(Context context, String token) {
         if (token == null || !token.matches("[A-Za-z0-9_-]{43}")) return null;
         Entry entry = ENTRIES.remove(token);
+        if (entry != null) entry.lease.close();
         if (!live(entry, SystemClock.elapsedRealtime()) || !isCurrent(context, entry.source, entry.clipboard, entry.identity)) return null;
         Bundle result = new Bundle(); result.putStringArrayList("links", new ArrayList<>(entry.links));
         if (entry.source != null) result.putString("source", entry.source);
@@ -82,6 +88,8 @@ public final class LinkChoiceRequests {
         } catch (RuntimeException unavailable) { return null; }
     }
     private static boolean live(Entry entry, long now) { return entry != null && now >= entry.issued && now - entry.issued < TTL; }
-    private static synchronized void remove(String token) { ENTRIES.remove(token); }
+    private static synchronized void remove(String token) {
+        Entry entry = ENTRIES.remove(token); if (entry != null) entry.lease.close();
+    }
     private static IllegalArgumentException invalid() { return new IllegalArgumentException("invalid_link_choices"); }
 }

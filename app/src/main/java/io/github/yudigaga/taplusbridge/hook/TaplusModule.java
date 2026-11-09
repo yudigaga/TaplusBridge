@@ -55,7 +55,6 @@ public final class TaplusModule extends XposedModule {
         if (!apiSupported || !BridgeContract.HOST_PACKAGE.equals(param.getPackageName())
                 || !installAttempted.compareAndSet(false, true)) return;
         ClassLoader loader = param.getClassLoader();
-        BridgeTransport.install();
         HostSourceScopeHooks.install(this, loader);
         try {
             Method create=android.app.Application.class.getDeclaredMethod("onCreate");
@@ -210,10 +209,6 @@ public final class TaplusModule extends XposedModule {
         if (response != null) {
             @SuppressWarnings("deprecation") Intent direct = response.getParcelable("direct");
             if (direct != null) return direct;
-            String systemToken=response.getString("system_token");
-            if(io.github.yudigaga.taplusbridge.capture.CaptureBroker.validNonce(systemToken))
-                return new Intent(RuntimeClient.OPEN).setPackage("android").putExtra("system_token",systemToken)
-                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
         }
         String token = response == null ? null : response.getString("token");
         if (token == null || token.isEmpty() || token.length() > 256) {

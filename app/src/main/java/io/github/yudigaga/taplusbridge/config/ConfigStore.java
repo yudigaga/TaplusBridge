@@ -81,8 +81,6 @@ public final class ConfigStore {
     }
     public boolean captureEnabled() { return prefs.getBoolean("capture", true); }
     public void setCaptureEnabled(boolean value) { prefs.edit().putBoolean("capture", value).commit(); }
-    public boolean independentEnabled(){return prefs.getBoolean("independent_runtime",true);}
-    public void setIndependentEnabled(boolean value){prefs.edit().putBoolean("independent_runtime",value).commit();}
     public boolean scopeCaptureEnabled() {
         try { return prefs.getBoolean(SCOPE_CAPTURE_KEY, false); }
         catch (RuntimeException malformed) { return false; }

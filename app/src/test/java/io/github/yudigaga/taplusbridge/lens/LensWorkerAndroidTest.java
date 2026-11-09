@@ -199,6 +199,23 @@ public final class LensWorkerAndroidTest {
         assertEquals(0, updates[0]); assertNull(LensSession.current("request-1"));
         assertThrows(IllegalStateException.class, descriptor::getFd); source.delete();
     }
+    @Test public void rebindCannotReviveImageWorkQueuedByThePreviousBinding() throws Exception {
+        File source = File.createTempFile("lens-old-binding-", ".png", context.getCacheDir()); Files.write(source.toPath(), PNG);
+        ParcelFileDescriptor descriptor = ParcelFileDescriptor.open(source, ParcelFileDescriptor.MODE_READ_ONLY);
+        int[] updates = {0};
+        try {
+            ShadowBinder.setCallingUid(hostUid);
+            ipc.search(descriptor, request(PNG), new ILensCallback.Stub() {
+                @Override public void onUpdate(Bundle update) { updates[0]++; }
+            });
+            service.onUnbind(new Intent());
+            service.onBind(new Intent());
+            org.robolectric.shadows.ShadowLooper.idleMainLooper();
+            assertEquals("The new binding must not own the old pending image", 0, updates[0]);
+            assertNull(LensSession.current("request-1"));
+            assertThrows(IllegalStateException.class, descriptor::getFd);
+        } finally { LensService.close(descriptor); source.delete(); }
+    }
     @Test public void stalePagesCannotCompleteCurrentRequest() throws Exception {
         Bundle request = request(PNG); Bundle parsed = new Bundle();
         parsed.putString("request_id", "request-1"); parsed.putInt("page_generation", 2);

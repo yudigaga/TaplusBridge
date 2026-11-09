@@ -8,10 +8,14 @@ import android.content.pm.PackageInfo
 import android.content.pm.ResolveInfo
 import android.graphics.Bitmap
 import android.graphics.Canvas
+import android.app.Application
+import android.os.Handler
+import android.os.Looper
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import io.github.yudigaga.taplusbridge.translation.TranslationSettings
 import io.github.yudigaga.taplusbridge.translation.TranslationStore
+import io.github.yudigaga.taplusbridge.runtime.ModuleProcessLifecycle
 import org.junit.Assert.*
 import org.junit.Rule
 import org.junit.Test
@@ -23,6 +27,8 @@ import org.robolectric.Shadows
 import org.robolectric.annotation.Config
 import org.robolectric.annotation.GraphicsMode
 import java.io.File
+import java.time.Duration
+import java.util.concurrent.atomic.AtomicInteger
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [28], qualifiers = "w390dp-h844dp-mdpi")
@@ -48,6 +54,40 @@ class TranslationSettingsUiTest {
         compose.onNodeWithTag("translation.dialog.list").assertDoesNotExist()
         compose.runOnIdle {
             assertEquals(TranslationSettings.Mode.NATIVE, TranslationStore(compose.activity).load().mode)
+        }
+    }
+
+    @Test fun unfinishedTranslationDraftSurvivesBackgroundingAndReleasesTheProcessWhenClosed() {
+        val exits = AtomicInteger()
+        lateinit var lifetime: Application.ActivityLifecycleCallbacks
+        compose.runOnIdle {
+            val install = ModuleProcessLifecycle::class.java.getDeclaredMethod("installForTest", Handler::class.java, Runnable::class.java)
+            install.isAccessible = true
+            lifetime = install.invoke(null, Handler(Looper.getMainLooper()), Runnable { exits.incrementAndGet() }) as Application.ActivityLifecycleCallbacks
+            lifetime.onActivityStarted(compose.activity)
+        }
+        try {
+            open()
+            node("translation.mode.AI").performClick()
+            node("translation.model").performTextReplacement("unsaved-background-model")
+            compose.runOnIdle {
+                lifetime.onActivityStopped(compose.activity)
+                Shadows.shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(4))
+                assertEquals("An unfinished private draft must keep the editor process alive", 0, exits.get())
+                assertEquals(TranslationSettings.Mode.NATIVE, TranslationStore(compose.activity).load().mode)
+            }
+            node("translation.model").assertTextContains("unsaved-background-model")
+            compose.onNodeWithTag("translation.cancel").performClick()
+            compose.runOnIdle {
+                Shadows.shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(3))
+                assertEquals("Closing the draft must allow the stopped process to retire", 1, exits.get())
+                assertEquals(TranslationSettings.Mode.NATIVE, TranslationStore(compose.activity).load().mode)
+            }
+        } finally {
+            compose.runOnIdle {
+                val reset = ModuleProcessLifecycle::class.java.getDeclaredMethod("resetForTest")
+                reset.isAccessible = true; reset.invoke(null)
+            }
         }
     }
 

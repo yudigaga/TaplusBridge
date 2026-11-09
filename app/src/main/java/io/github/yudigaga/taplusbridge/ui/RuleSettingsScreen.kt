@@ -57,7 +57,7 @@ import java.nio.charset.CodingErrorAction
     var query by rememberSaveable { mutableStateOf("") }
     var editor by rememberSaveable { mutableStateOf(false) }
     var manualIndex by rememberSaveable { mutableIntStateOf(-1) }
-    var draftHost by remember { mutableStateOf("") }
+    var draftHost by rememberSaveable { mutableStateOf("") }
     var draftTarget by rememberSaveable { mutableStateOf("") }
     var draftSource by rememberSaveable { mutableStateOf("*") }
     var draftNote by rememberSaveable { mutableStateOf("") }
@@ -69,7 +69,6 @@ import java.nio.charset.CodingErrorAction
     var expanded by rememberSaveable { mutableStateOf<String?>(null) }
     var onlyInstalled by rememberSaveable { mutableStateOf(false) }
     var updating by remember { mutableStateOf(false) }
-    var pendingExport by remember { mutableStateOf("") }
     val toast: (String) -> Unit = { Toast.makeText(context, it, Toast.LENGTH_SHORT).show() }
     fun changeRules(action: () -> Unit) {
         try { action(); onChanged() }
@@ -85,21 +84,26 @@ import java.nio.charset.CodingErrorAction
     }
     val importer = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) scope.launch {
+            val work = io.github.yudigaga.taplusbridge.runtime.ModuleProcessLifecycle.acquire()
             try {
                 val result = withContext(Dispatchers.IO) { controller.importRules(readRuleFile(context, uri)) }
                 onChanged(); toast("已导入 $result 条手动规则")
             } catch (error: Exception) { message = error.message ?: "无法读取规则文件"; dialog = "message" }
+            finally { work.close() }
         }
     }
     val exporter = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri ->
         if (uri != null) scope.launch {
+            val work = io.github.yudigaga.taplusbridge.runtime.ModuleProcessLifecycle.acquire()
             try {
                 withContext(Dispatchers.IO) {
+                    val export = controller.exportRules()
                     requireNotNull(context.contentResolver.openOutputStream(uri, "wt")) { "无法写入所选文件" }
-                        .use { it.write(pendingExport.toByteArray(Charsets.UTF_8)) }
+                        .use { it.write(export.toByteArray(Charsets.UTF_8)) }
                 }
                 toast("手动规则已导出")
             } catch (error: Exception) { message = error.message ?: "导出失败"; dialog = "message" }
+            finally { work.close() }
         }
     }
     BackHandler(editor) { editor = false; formError = "" }
@@ -274,7 +278,7 @@ import java.nio.charset.CodingErrorAction
                     ArrowPreference(title = "导入手动规则", summary = "兼容 IceBridge JSON 规则文件",
                         onClick = { importer.launch(arrayOf("application/json", "text/plain", "application/octet-stream")) }, modifier = Modifier.testTag("rules.import"))
                     ArrowPreference(title = "导出手动规则", summary = "保存来源、网站、目标与备注", onClick = {
-                        try { pendingExport = controller.exportRules(); exporter.launch("TaplusBridge-rules.json") }
+                        try { controller.exportRules(); exporter.launch("TaplusBridge-rules.json") }
                         catch (error: RuntimeException) { message = error.message ?: "导出失败"; dialog = "message" }
                     }, modifier = Modifier.testTag("rules.export"))
                     ArrowPreference(title = "清空手动规则", summary = "保留已校验的在线规则", onClick = { dialog = "clear" }, modifier = Modifier.testTag("rules.clear"))
@@ -325,7 +329,7 @@ import java.nio.charset.CodingErrorAction
 }
 
 @Composable private fun RulePreview(controller: SettingsController, dismiss: () -> Unit) {
-    var url by remember { mutableStateOf("") }
+    var url by rememberSaveable { mutableStateOf("") }
     var source by rememberSaveable { mutableStateOf("") }
     var result by remember { mutableStateOf<SettingsController.Preview?>(null) }
     OverlayDialog(show = true, title = "匹配预览", summary = "只检查规则，不打开或解冻应用", onDismissRequest = dismiss) {

@@ -11,6 +11,7 @@ import android.util.Base64;
 import io.github.yudigaga.taplusbridge.bridge.BridgeContract;
 import io.github.yudigaga.taplusbridge.config.ConfigStore;
 import io.github.yudigaga.taplusbridge.hook.HostPolicy;
+import io.github.yudigaga.taplusbridge.runtime.ModuleProcessLifecycle;
 import java.security.SecureRandom;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -19,7 +20,7 @@ import java.util.Map;
 public final class TranslationRequests {
     private static final long TTL = 30_000;
     private static final Map<String, Entry> ENTRIES = new LinkedHashMap<>();
-    private record Entry(long issued, String text, String source, String profile) {}
+    private record Entry(long issued, String text, String source, String profile, ModuleProcessLifecycle.Lease lease) {}
     private TranslationRequests() {}
 
     public static synchronized Intent prepare(Context context, String text, String source) {
@@ -31,11 +32,14 @@ public final class TranslationRequests {
             catch (RuntimeException unavailable) { return null; }
         }
         long now = SystemClock.elapsedRealtime();
-        ENTRIES.entrySet().removeIf(item -> !live(item.getValue(), now));
+        ENTRIES.entrySet().removeIf(item -> {
+            if (live(item.getValue(), now)) return false;
+            item.getValue().lease.close(); return true;
+        });
         if (ENTRIES.size() >= 16) return null;
         byte[] bytes = new byte[32]; new SecureRandom().nextBytes(bytes);
         String token = Base64.encodeToString(bytes, Base64.NO_WRAP | Base64.NO_PADDING | Base64.URL_SAFE);
-        ENTRIES.put(token, new Entry(now, text, source, settings.toJson()));
+        ENTRIES.put(token, new Entry(now, text, source, settings.toJson(), ModuleProcessLifecycle.acquire(TTL)));
         new Handler(Looper.getMainLooper()).postDelayed(() -> remove(token), TTL);
         return new Intent().setComponent(new ComponentName(BridgeContract.APP_PACKAGE,
                 BridgeContract.APP_PACKAGE + ".translation.TranslationActivity"))
@@ -45,6 +49,7 @@ public final class TranslationRequests {
     public static synchronized Bundle consume(Context context, String token) {
         if (token == null || !token.matches("[A-Za-z0-9_-]{43}")) return null;
         Entry entry = ENTRIES.remove(token);
+        if (entry != null) entry.lease.close();
         if (!live(entry, SystemClock.elapsedRealtime())) return null;
         TranslationSettings current = active(context, entry.source);
         if (current == null || !current.toJson().equals(entry.profile)) return null;
@@ -71,5 +76,8 @@ public final class TranslationRequests {
         } catch (RuntimeException invalid) { return null; }
     }
     private static boolean live(Entry entry, long now) { return entry != null && now >= entry.issued && now - entry.issued < TTL; }
-    private static synchronized void remove(String token) { ENTRIES.remove(token); }
+    private static synchronized void remove(String token) {
+        Entry entry = ENTRIES.remove(token);
+        if (entry != null) entry.lease.close();
+    }
 }

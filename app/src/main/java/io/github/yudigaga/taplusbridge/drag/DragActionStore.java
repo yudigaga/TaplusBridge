@@ -8,6 +8,7 @@ import android.os.ParcelFileDescriptor;
 import android.os.SystemClock;
 import android.util.Base64;
 import io.github.yudigaga.taplusbridge.config.DragSettings;
+import io.github.yudigaga.taplusbridge.runtime.ModuleProcessLifecycle;
 import java.io.IOException;
 import java.security.SecureRandom;
 import java.util.ArrayList;
@@ -18,8 +19,9 @@ public final class DragActionStore {
     public static final long TTL = 60_000;
     private static Entry current;
     private static Ready ready;
-    private record Entry(String token, String action, DragPayload payload, long issued, boolean recognize, boolean claimed) { }
-    private record Ready(String token, Choice choice, long issued) { }
+    private record Entry(String token, String action, DragPayload payload, long issued, boolean recognize, boolean claimed,
+                         ModuleProcessLifecycle.Lease lease) { }
+    private record Ready(String token, Choice choice, long issued, ModuleProcessLifecycle.Lease lease) { }
     public record Choice(String action, DragPayload payload, String originalText, String recognizedText) { }
     private DragActionStore() { }
 
@@ -36,10 +38,11 @@ public final class DragActionStore {
     private static String issue(String action, DragPayload payload, boolean recognize) {
         if (!DragSettings.ACTIONS.contains(action) || "none".equals(action) || payload == null)
             throw new IllegalArgumentException("drag_action");
-        if (current != null) current.payload.close();
-        if (ready != null) { ready.choice.payload.close(); ready = null; }
         String token = token();
-        current = new Entry(token, action, payload, SystemClock.elapsedRealtime(), recognize, false);
+        var lease = ModuleProcessLifecycle.acquire(TTL);
+        if (current != null) { current.payload.close(); current.lease.close(); }
+        if (ready != null) { ready.choice.payload.close(); ready.lease.close(); ready = null; }
+        current = new Entry(token, action, payload, SystemClock.elapsedRealtime(), recognize, false, lease);
         new Handler(Looper.getMainLooper()).postDelayed(() -> cancel(token), TTL);
         return token;
     }
@@ -68,11 +71,11 @@ public final class DragActionStore {
                 result.putParcelable("fd", ParcelFileDescriptor.open(payload.image, ParcelFileDescriptor.MODE_READ_ONLY));
             }
             if (entry.recognize) {
-                current = new Entry(entry.token, entry.action, entry.payload, entry.issued, true, true); retained = true;
+                current = new Entry(entry.token, entry.action, entry.payload, entry.issued, true, true, entry.lease); retained = true;
             }
             return result;
         } catch (IOException | RuntimeException unavailable) { return null; }
-        finally { if (!retained) { current = null; entry.payload.close(); } }
+        finally { if (!retained) { current = null; entry.payload.close(); entry.lease.close(); } }
     }
 
     public static synchronized String complete(Context context, String token, String text) {
@@ -87,8 +90,10 @@ public final class DragActionStore {
         String recognized = text == null ? "" : text;
         if (recognized.length() > DragPayload.MAX_TEXT || !DragPayload.validRecognizedLinks(links)) return null;
         DragPayload result = entry.payload.withRecognizedLinks(recognized, links);
-        String resultToken = token(); current = null;
-        ready = new Ready(resultToken, new Choice(entry.action, result, entry.payload.text, recognized), SystemClock.elapsedRealtime());
+        String resultToken = token();
+        var lease = ModuleProcessLifecycle.acquire(TTL);
+        ready = new Ready(resultToken, new Choice(entry.action, result, entry.payload.text, recognized), SystemClock.elapsedRealtime(), lease);
+        current = null; entry.lease.close();
         new Handler(Looper.getMainLooper()).postDelayed(() -> cancel(resultToken), TTL);
         return resultToken;
     }
@@ -96,14 +101,14 @@ public final class DragActionStore {
     public static synchronized Choice takeChoice(String token) {
         Ready result = ready;
         if (result == null || token == null || !result.token.equals(token)) return null;
-        ready = null;
+        ready = null; result.lease.close();
         long age = SystemClock.elapsedRealtime() - result.issued;
         if (age < 0 || age >= TTL) { result.choice.payload.close(); return null; }
         return result.choice;
     }
 
     public static synchronized void cancel(String token) {
-        if (current != null && current.token.equals(token)) { current.payload.close(); current = null; }
-        if (ready != null && ready.token.equals(token)) { ready.choice.payload.close(); ready = null; }
+        if (current != null && current.token.equals(token)) { current.payload.close(); current.lease.close(); current = null; }
+        if (ready != null && ready.token.equals(token)) { ready.choice.payload.close(); ready.lease.close(); ready = null; }
     }
 }

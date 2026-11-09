@@ -13,7 +13,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /** Obtain an authenticated Binder from system_server without touching the module's components. */
 public final class RuntimeClient {
     public static final String BIND="io.github.yudigaga.taplusbridge.RUNTIME_BIND_V1";
-    public static final String OPEN="io.github.yudigaga.taplusbridge.RUNTIME_OPEN_V1";
     private static volatile IRuntimeBridge remote;
     private static final AtomicBoolean connecting=new AtomicBoolean();
     private RuntimeClient(){}

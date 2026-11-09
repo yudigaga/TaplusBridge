@@ -71,6 +71,16 @@ public final class AiTranslationClientAndroidTest {
         assertEquals("translation_input",assertThrows(IOException.class,
                 ()->AiTranslationClient.translate(settings(),"a".repeat(32769),null,url->{throw new AssertionError("must not connect");})).getMessage());
     }
+    @Test public void completedRequestDoesNotLeaveItsDeadlineThreadRunning() throws Exception {
+        AiTranslationClient.translate(settings(),"hello",null,url->
+                new FakeConnection(200,"{\"choices\":[{\"message\":{\"content\":\"译文\"}}]}"));
+        var deadlines=Thread.getAllStackTraces().keySet().stream()
+                .filter(thread->thread.getName().equals("TaplusBridge-translation-timeout")).toList();
+        for(Thread thread:deadlines) {
+            thread.join(5_000);
+            assertFalse("A completed request must release its idle deadline thread",thread.isAlive());
+        }
+    }
     @Test public void truncatedOrFilteredOutputCannotBeReportedAsACompleteTranslation() throws Exception {
         for (String reason : new String[]{"length","content_filter","tool_calls"}) {
             FakeConnection partial = new FakeConnection(200,"{\"choices\":[{\"finish_reason\":\""+reason+"\",\"message\":{\"content\":\"partial translation\"}}]}");

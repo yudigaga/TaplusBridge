@@ -12,6 +12,7 @@ import io.github.yudigaga.taplusbridge.R;
 import io.github.yudigaga.taplusbridge.bridge.BridgeProvider;
 import io.github.yudigaga.taplusbridge.bridge.LaunchPlanner;
 import io.github.yudigaga.taplusbridge.config.ConfigStore;
+import io.github.yudigaga.taplusbridge.runtime.ModuleProcessLifecycle;
 import io.github.yudigaga.taplusbridge.thaw.ThawEngine;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -122,6 +123,7 @@ public final class TransitActivity extends Activity {
         private final Handler main = new Handler(Looper.getMainLooper());
         private final ExecutorService executor = Executors.newSingleThreadExecutor();
         private Future<?> future;
+        private ModuleProcessLifecycle.Lease work;
         private final Runnable deadline = this::onTimeout;
         Job(Bundle request) { this.request = request; }
         synchronized void attach(TransitActivity activity) { owner = activity; }
@@ -132,17 +134,20 @@ public final class TransitActivity extends Activity {
                     : "解冻等待超时，已停止自动打开。你可以使用原始方式打开。";
             if (future != null) future.cancel(true);
             executor.shutdownNow();
+            releaseWork();
             synchronized (Job.this) { if (owner != null) owner.render(); }
         }
         void complete(LaunchPlanner.Plan completedPlan, String completedMessage, boolean completedSuccess) {
             if (cancelled || !settled.compareAndSet(false, true)) return;
             main.removeCallbacks(deadline);
             plan = completedPlan; message = completedMessage; ready = completedSuccess; failed = !completedSuccess;
-            synchronized (Job.this) { if (owner != null) owner.render(); }
+            try { synchronized (Job.this) { if (owner != null) owner.render(); } }
+            finally { releaseWork(); }
         }
         void start(android.content.Context context) {
+            work = ModuleProcessLifecycle.acquire();
             main.postDelayed(deadline, 20_000L);
-            future = executor.submit(() -> {
+            try { future = executor.submit(() -> {
                 LaunchPlanner.Plan found = null;
                 String outcome;
                 boolean success;
@@ -156,13 +161,19 @@ public final class TransitActivity extends Activity {
                 LaunchPlanner.Plan completedPlan = found;
                 String completedMessage = outcome;
                 boolean completedSuccess = success;
-                main.post(() -> complete(completedPlan, completedMessage, completedSuccess));
+                if (!main.post(() -> complete(completedPlan, completedMessage, completedSuccess))) releaseWork();
                 executor.shutdown();
-            });
+            }); } catch (RuntimeException unavailable) {
+                main.removeCallbacks(deadline); releaseWork(); executor.shutdownNow(); throw unavailable;
+            }
         }
         void cancel() {
             cancelled = true; settled.set(true); main.removeCallbacks(deadline);
             if (future != null) future.cancel(true); executor.shutdownNow();
+            releaseWork();
+        }
+        private synchronized void releaseWork() {
+            if (work != null) { work.close(); work = null; }
         }
     }
 }

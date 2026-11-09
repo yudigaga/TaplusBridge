@@ -84,6 +84,33 @@ public final class DragHandoffAndroidTest {
         assertThrows(IllegalArgumentException.class, () -> DragActionStore.issueExecute(context, "lens", text("title")));
         assertThrows(IllegalArgumentException.class, () -> DragActionStore.issueExecute(context, "browser", text("https://example.com")));
     }
+    @Test public void sharedImageCanBeReopenedAfterTheModuleProcessLosesItsMemory() throws Exception {
+        DragPayload payload = image(); Uri uri = DragShareProvider.expose(context, payload);
+        // A receiver may open the granted URI after the module's idle process has exited.
+        try {
+            var memory = DragShareProvider.class.getDeclaredField("files"); memory.setAccessible(true);
+            ((java.util.Map<?, ?>) memory.get(null)).clear();
+        } catch (NoSuchFieldException persistedInstead) { }
+        var reopened = Robolectric.buildContentProvider(DragShareProvider.class).create(DragShareProvider.AUTHORITY).get();
+        assertEquals("image/png", reopened.getType(uri));
+        try (var in = new ParcelFileDescriptor.AutoCloseInputStream(reopened.openFile(uri, "r"))) {
+            assertArrayEquals(PNG, in.readAllBytes());
+        }
+    }
+    @Test public void sharedImageExpiresWhenTheWallClockMovesBackwards() throws Exception {
+        var provider = Robolectric.buildContentProvider(DragShareProvider.class).create(DragShareProvider.AUTHORITY).get();
+        Uri uri = DragShareProvider.expose(context, image());
+        assertTrue(android.os.SystemClock.setCurrentTimeMillis(System.currentTimeMillis() - 1_000));
+        assertThrows(FileNotFoundException.class, () -> provider.openFile(uri, "r"));
+    }
+    @Test public void sharingMoreThanEightImagesRevokesTheOldestWithoutDeletingOtherFiles() throws Exception {
+        var provider = Robolectric.buildContentProvider(DragShareProvider.class).create(DragShareProvider.AUTHORITY).get();
+        DragPayload oldest = image(); Uri first = DragShareProvider.expose(context, oldest);
+        Uri newest = null;
+        for (int i = 0; i < 8; i++) newest = DragShareProvider.expose(context, image());
+        assertThrows(FileNotFoundException.class, () -> provider.openFile(first, "r"));
+        assertFalse(oldest.image.exists()); assertEquals("image/png", provider.getType(newest));
+    }
     @Test public void completePreservesOriginalTextOcrImageAndLinksForOneChoiceOnly() throws Exception {
         DragPayload originalImage = image();
         DragPayload card = new DragPayload("原卡片标题", "com.example.source", originalImage.image, "image/png", 1, 1,

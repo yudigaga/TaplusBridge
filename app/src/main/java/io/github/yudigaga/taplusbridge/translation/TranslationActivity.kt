@@ -20,8 +20,10 @@ import androidx.compose.ui.platform.LocalWindowInfo
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import io.github.yudigaga.taplusbridge.ui.SettingsTheme
+import io.github.yudigaga.taplusbridge.runtime.ModuleProcessLifecycle
 import java.io.IOException
 import java.util.concurrent.Executors
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Future
 import top.yukonga.miuix.kmp.basic.ButtonDefaults
 import top.yukonga.miuix.kmp.basic.Scaffold
@@ -115,6 +117,8 @@ internal class TranslationJob(
     var future: Future<*>? = null
     private var generation = 0
     private var closed = false
+    private var worker: ExecutorService? = null
+    private var workLease: ModuleProcessLifecycle.Lease? = null
 
     fun start() {
         if (closed || settings.mode != TranslationSettings.Mode.AI
@@ -125,28 +129,41 @@ internal class TranslationJob(
         cancellation = signal
         status = TranslationStatus.LOADING
         message = ""
-        future = worker.submit {
-            if (!isAuthorized()) {
-                main.post { if (!closed && expected == generation) expire() }
-                return@submit
-            }
-            var translated = ""
-            var failure = ""
-            try { translated = translator(settings, text, signal) }
-            catch (error: IOException) { failure = errorMessage(error.message) }
-            catch (error: RuntimeException) { failure = "翻译暂时失败，请重试" }
-            main.post {
-                if (closed || expected != generation || signal.isCanceled) return@post
-                if (!isAuthorized()) { expire(); return@post }
-                future = null
-                cancellation = null
-                if (failure.isEmpty()) {
-                    result = translated
-                    status = TranslationStatus.SUCCESS
-                } else {
-                    message = failure
-                    status = TranslationStatus.ERROR
+        val requestWorker = Executors.newSingleThreadExecutor { task ->
+            Thread(task, "TaplusBridge-translation").apply { isDaemon = true }
+        }
+        val requestLease = ModuleProcessLifecycle.acquire()
+        worker = requestWorker
+        workLease = requestLease
+        future = requestWorker.submit {
+            try {
+                if (!isAuthorized()) {
+                    main.post { if (!closed && expected == generation) expire() }
+                    return@submit
                 }
+                var translated = ""
+                var failure = ""
+                try { translated = translator(settings, text, signal) }
+                catch (error: IOException) { failure = errorMessage(error.message) }
+                catch (error: RuntimeException) { failure = "翻译暂时失败，请重试" }
+                main.post {
+                    if (closed || expected != generation || signal.isCanceled) return@post
+                    if (!isAuthorized()) { expire(); return@post }
+                    future = null
+                    cancellation = null
+                    worker = null
+                    workLease = null
+                    if (failure.isEmpty()) {
+                        result = translated
+                        status = TranslationStatus.SUCCESS
+                    } else {
+                        message = failure
+                        status = TranslationStatus.ERROR
+                    }
+                }
+            } finally {
+                requestWorker.shutdown()
+                requestLease.close()
             }
         }
     }
@@ -165,15 +182,17 @@ internal class TranslationJob(
         closed = true
         generation++
         cancellation?.cancel()
+        cancellation = null
         future?.cancel(true)
         future = null
+        worker?.shutdownNow()
+        worker = null
+        workLease?.close()
+        workLease = null
     }
 
     companion object {
         private val main = Handler(Looper.getMainLooper())
-        private val worker = Executors.newCachedThreadPool { task ->
-            Thread(task, "TaplusBridge-translation").apply { isDaemon = true }
-        }
         fun expired() = TranslationJob(TranslationSettings.defaults(), "").apply { status = TranslationStatus.EXPIRED }
         private fun errorMessage(reason: String?) = when {
             reason == "translation_timeout" -> "翻译请求超时，请检查网络后重试"

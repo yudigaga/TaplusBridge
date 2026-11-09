@@ -1,8 +1,10 @@
 package io.github.yudigaga.taplusbridge.ui
 
 import android.content.Context
+import android.content.ComponentName
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageInfo
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import androidx.compose.ui.test.*
@@ -52,6 +54,14 @@ class MiuixSettingsScreenTest {
             for (name in listOf("config", "status", "capture", RuleRepository.PREFS))
                 context.getSharedPreferences(name, Context.MODE_PRIVATE).edit().clear().commit()
             val manager = Shadows.shadowOf(context.packageManager)
+            val launcher = ComponentName(context.packageName, "io.github.yudigaga.taplusbridge.ui.LauncherAlias")
+            manager.addActivityIfNotPresent(launcher).apply {
+                targetActivity = MainActivity::class.java.name
+                applicationInfo = context.applicationInfo
+                enabled = true; exported = true
+            }
+            context.packageManager.setComponentEnabledSetting(launcher,
+                PackageManager.COMPONENT_ENABLED_STATE_DEFAULT, PackageManager.DONT_KILL_APP)
             for ((pkg, label) in listOf("tv.danmaku.bili" to "哔哩哔哩", "com.coolapk.market" to "酷安", "com.tencent.mm" to "微信")) {
                 manager.installPackage(PackageInfo().apply {
                     packageName = pkg
@@ -167,14 +177,46 @@ class MiuixSettingsScreenTest {
         compose.onNodeWithTag("source_scope.app.com.tencent.mm").assertDoesNotExist()
     }
 
-    @Test fun freezingTheModuleRequiresAnExplicitSystemSyncStatus() {
+    @Test fun normalSystemSyncHasNoFrozenModuleOption() {
         openOverview("runtime")
-        overviewNode("toggle.independent").assertIsDisplayed().performClick()
-        compose.runOnIdle { assertFalse(ConfigStore(compose.activity).independentEnabled()) }
-        overviewNode("toggle.independent").performClick()
+        compose.onNodeWithTag("toggle.independent").assertDoesNotExist()
         overviewNode("action.runtime_sync").assertIsDisplayed()
         compose.onNodeWithText("系统已确认配置，可冻结本体").assertDoesNotExist()
         capture("runtime-sync-light")
+        closeOverview()
+    }
+
+    @Test fun launcherIconSwitchHidesOnlyTheLauncherAliasAndRestoresIt() {
+        val packages = compose.activity.packageManager
+        val alias = ComponentName(compose.activity.packageName, "io.github.yudigaga.taplusbridge.ui.LauncherAlias")
+        val main = ComponentName(compose.activity, MainActivity::class.java)
+        val mainState = packages.getComponentEnabledSetting(main)
+        val packageState = packages.getApplicationEnabledSetting(compose.activity.packageName)
+        compose.onNodeWithTag("toggle.hide_launcher_icon").assertDoesNotExist()
+        openOverview("runtime")
+        overviewNode("toggle.hide_launcher_icon").assertIsOff()
+        compose.onNodeWithText("隐藏模块应用图标").assertIsDisplayed()
+        overviewNode("toggle.hide_launcher_icon").performClick().assertIsOn()
+        compose.runOnIdle {
+            assertEquals(PackageManager.COMPONENT_ENABLED_STATE_DISABLED, packages.getComponentEnabledSetting(alias))
+            assertEquals("Hiding the icon must leave MainActivity available to module settings", mainState,
+                packages.getComponentEnabledSetting(main))
+            assertTrue(packages.getActivityInfo(main, PackageManager.MATCH_DISABLED_COMPONENTS).enabled)
+            assertEquals("The module package must stay enabled", packageState,
+                packages.getApplicationEnabledSetting(compose.activity.packageName))
+            assertTrue(packages.getApplicationInfo(compose.activity.packageName, 0).enabled)
+        }
+        capture("runtime-launcher-hidden")
+        closeOverview()
+        openOverview("runtime")
+        overviewNode("toggle.hide_launcher_icon").assertIsOn().performClick().assertIsOff()
+        compose.runOnIdle {
+            assertTrue(packages.getComponentEnabledSetting(alias) in setOf(
+                PackageManager.COMPONENT_ENABLED_STATE_DEFAULT, PackageManager.COMPONENT_ENABLED_STATE_ENABLED))
+            assertTrue(packages.getActivityInfo(alias, 0).enabled)
+            assertEquals(mainState, packages.getComponentEnabledSetting(main))
+            assertEquals(packageState, packages.getApplicationEnabledSetting(compose.activity.packageName))
+        }
         closeOverview()
     }
 
@@ -708,6 +750,16 @@ class MiuixSettingsScreenTest {
         compose.onNodeWithTag("preview.check").performScrollTo().performClick()
         compose.onNodeWithTag("preview.result").assertTextContains("酷安", substring = true)
         capture("preview-light")
+    }
+
+    @Test fun unfinishedRuleHostSurvivesActivityStateRestorationWithoutSavingARule() {
+        compose.onNodeWithTag("nav.rules").performClick()
+        compose.onNodeWithTag("rules.add").performClick()
+        compose.onNodeWithTag("editor.host").performTextInput("https://unsaved.example/private-draft")
+        compose.activityRule.scenario.recreate()
+        compose.onNodeWithTag("page.rule_editor").assertExists()
+        compose.onNodeWithTag("editor.host").assertTextContains("https://unsaved.example/private-draft")
+        compose.runOnIdle { assertTrue(RuleRepository(compose.activity).manualRules().isEmpty()) }
     }
 
     @Test @Config(qualifiers = "w320dp-h640dp-night-mdpi")

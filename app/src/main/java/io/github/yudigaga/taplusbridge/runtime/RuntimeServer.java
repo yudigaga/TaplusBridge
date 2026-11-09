@@ -1,6 +1,5 @@
 package io.github.yudigaga.taplusbridge.runtime;
 
-import android.app.ActivityManager;
 import android.app.KeyguardManager;
 import android.content.BroadcastReceiver;
 import android.content.Context;
@@ -16,7 +15,6 @@ import android.os.ResultReceiver;
 import android.os.SystemClock;
 import io.github.yudigaga.taplusbridge.BuildConfig;
 import io.github.yudigaga.taplusbridge.bridge.BridgeContract;
-import io.github.yudigaga.taplusbridge.bridge.LaunchPlanner;
 import io.github.yudigaga.taplusbridge.capture.CaptureBroker;
 import io.github.yudigaga.taplusbridge.capture.CaptureLease;
 import io.github.yudigaga.taplusbridge.hook.HostPolicy;
@@ -25,14 +23,12 @@ import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.function.Supplier;
 
-/** Framework runtime: reads framework storage, no module Provider/Activity/process required. */
+/** System configuration, capture and gesture bridge. App launches stay in the module process. */
 public final class RuntimeServer {
     private final Context context;
     private final Handler worker;
     private final Supplier<SharedPreferences> preferences;
-    private final SystemPackageOps packages;
     private final java.util.function.Consumer<String> logger;
-    private final LinkedHashMap<String,Ticket> tickets=new LinkedHashMap<>();
     private final LinkedHashMap<String,Long> dragLaunches=new LinkedHashMap<>();
     private final SecureRandom random=new SecureRandom();
     private final Object snapshotLock=new Object();
@@ -65,7 +61,7 @@ public final class RuntimeServer {
         return config != null && config.build == BuildConfig.VERSION_CODE && config.user == 0 && config.enabled
                 && config.drag.enabled ? config : null;
     }
-    /** Local system use only; capture support does not require the independent routing toggle. */
+    /** Local system use only. */
     public RuntimeSnapshot sourceCaptureConfiguration() {
         RuntimeSnapshot config = current();
         return config != null && config.build == BuildConfig.VERSION_CODE && config.enabled
@@ -78,11 +74,10 @@ public final class RuntimeServer {
         return config != null && config.build == BuildConfig.VERSION_CODE && config.user == 0 && config.enabled
                 && config.recognition && config.sourceScope.managed ? config : null;
     }
-    private record Ticket(LaunchPlanner.Plan plan,String identity,int owner,long until,String origin){}
     private record Lease(String nonce,String source,int sourceUid,int owner,long issued,boolean taken,String identity,boolean probe){}
-    public RuntimeServer(Context context,Handler worker,Supplier<SharedPreferences> preferences,SystemPackageOps packages,
+    public RuntimeServer(Context context,Handler worker,Supplier<SharedPreferences> preferences,
                          java.util.function.Consumer<String> logger){
-        this.context=context;this.worker=worker;this.preferences=preferences;this.packages=packages;this.logger=logger;
+        this.context=context;this.worker=worker;this.preferences=preferences;this.logger=logger;
     }
     public void register(){
         io.github.yudigaga.taplusbridge.bridge.IceRuleRouting.registerPackageInvalidationReceiver(context,worker);
@@ -112,7 +107,7 @@ public final class RuntimeServer {
             event("Source app scope package observer unavailable: " + unavailable.getClass().getSimpleName());
         }
         worker.post(() -> publishSourceScope(current()));
-        event("runtime channel ready; provider_required=false");
+        event("System configuration bridge ready");
     }
     private final IRuntimeBridge.Stub binder=new IRuntimeBridge.Stub(){
         public Bundle call(String method,Bundle request){return handle(Binder.getCallingUid(),method,request);}
@@ -228,7 +223,7 @@ public final class RuntimeServer {
                 result.putBoolean("scope_ready", publishSourceScope(config));
                 result.putBoolean("scope_capture_ready", sourceCapture != null);
                 result.putBoolean("scope_link_probe_ready", sourceCapture != null && sourceCapture.linkReady());
-                result.putBoolean("ready",config!=null && config.build==BuildConfig.VERSION_CODE && packages.ready());
+                result.putBoolean("ready",config!=null && config.build==BuildConfig.VERSION_CODE);
                 if(config!=null) {
                     result.putString("identity",config.identity);
                 }
@@ -248,7 +243,7 @@ public final class RuntimeServer {
                 result.putString("identity", config.identity);
                 result.putBoolean("active", config.enabled && config.recognition); return result;
             }
-            if(config==null || !config.usable() || !packages.ready()) {
+            if(config==null || !config.usable()) {
                 return declined("runtime_unavailable");
             }
             if(!config.enabled) {
@@ -260,7 +255,6 @@ public final class RuntimeServer {
                 case "probe_arm", "capture_arm" -> arm(uid,request,config,"probe_arm".equals(method));
                 case "capture_cancel" -> cancel(uid,request);
                 case "recognition_status", "probe_status" -> Bundle.EMPTY;
-                case "resolve", BridgeContract.PREPARE -> route(uid,method,request,config);
                 default -> declined("unsupported_request");
             };
         }catch(RuntimeException failed){return declined("exception");}finally{Binder.restoreCallingIdentity(identity);}
@@ -333,46 +327,6 @@ public final class RuntimeServer {
             event("Source app scope publication unavailable: " + failed.getClass().getSimpleName()); return false;
         }
     }
-    private Bundle route(int owner,String method,Bundle request,RuntimeSnapshot config){
-        if(request.containsKey("explicit_target"))return declined("invalid_request");
-        if(request.getBoolean("local_recognition") && !config.recognition)return declined("recognition_disabled");
-        if(request.getBoolean("clipboard") && (request.getString("source")!=null || !config.channels.enabled(
-                io.github.yudigaga.taplusbridge.config.RecognitionChannels.Channel.CLIPBOARD)))return declined("recognition_disabled");
-        boolean ephemeral=request.getBoolean("ephemeral");
-        if(ephemeral){request.remove("original");request.remove("candidate");}
-        long planningStarted=SystemClock.elapsedRealtimeNanos();
-        LaunchPlanner.PlanningResult result=LaunchPlanner.planWithRules(context,request,config.enabled,config.nativeLinks,
-                config.cloudLinkHandoff,config.rules);
-        perf("route_plan",planningStarted,result.plan()==null?"no_match":"resolved");
-        if(result.plan()==null)return declined(result.reason());
-        var plan=result.plan();
-        if("resolve".equals(method))return preview(plan);
-        Intent direct=LaunchPlanner.directIfReady(context,plan);
-        Bundle response=new Bundle();if(direct!=null){response.putParcelable("direct",direct);return response;}
-        String token=token();
-        String origin=request.getString("source");if(origin==null)origin=foregroundPackage();
-        if(origin==null)return declined("background");
-        synchronized(tickets){
-            long now=SystemClock.elapsedRealtime();tickets.entrySet().removeIf(e->now>=e.getValue().until());
-            if(tickets.size()>=16)return declined("busy");
-            tickets.put(token,new Ticket(plan,config.identity,owner,now+20_000,origin));
-        }
-        response.putString("system_token",token);return response;
-    }
-    private Bundle preview(LaunchPlanner.Plan plan){
-        long started=SystemClock.elapsedRealtimeNanos();
-        String outcome="missing";
-        try {
-            var pm=context.getPackageManager();var info=pm.getApplicationInfo(plan.targetPackage(),PackageManager.MATCH_DISABLED_COMPONENTS|PackageManager.MATCH_UNINSTALLED_PACKAGES);
-            Bundle result=new Bundle();result.putString("target",plan.targetPackage());result.putString("title",pm.getApplicationLabel(info).toString());
-            try {
-                var icon=pm.getApplicationIcon(info);var bitmap=android.graphics.Bitmap.createBitmap(64,64,android.graphics.Bitmap.Config.ARGB_8888);
-                icon.setBounds(0,0,64,64);icon.draw(new android.graphics.Canvas(bitmap));result.putParcelable("icon",bitmap);
-            }catch(RuntimeException ignored){}
-            outcome="ready";return result;
-        }catch(PackageManager.NameNotFoundException missing){return declined("target_missing");}
-        finally{perf("target_preview",started,outcome);}
-    }
     private synchronized Bundle arm(int owner,Bundle input,RuntimeSnapshot config,boolean probe){
         String source=input.getString("source");
         if(!config.capture || !config.recognition || (probe && !config.scopeLinkProbe) || !CaptureLease.allowedSource(source))return declined("disabled");
@@ -410,52 +364,6 @@ public final class RuntimeServer {
         return user==0 && capture!=null && capture.probe() && capture.taken() && capture.nonce().equals(nonce)
                 && config!=null && config.usable() && config.enabled && config.recognition && config.capture && config.scopeLinkProbe
                 && config.identity.equals(capture.identity());
-    }
-    /** Called at the public ATMS entry, before any launch locks; no Activity exists for this token. */
-    public boolean intercept(String callingPackage,int uid,int requestedUser,Intent marker){
-        if(marker==null || !RuntimeClient.OPEN.equals(marker.getAction()) || !"android".equals(marker.getPackage()))return false;
-        if(!BridgeContract.HOST_PACKAGE.equals(callingPackage) || !host(uid))return false;
-        String token=marker.getStringExtra("system_token");Ticket ticket;
-        synchronized(tickets){ticket=tickets.remove(token);}
-        if(ticket==null || ticket.owner()!=uid || (requestedUser!=0 && requestedUser!=-2 && requestedUser!=-3)) {
-            event("runtime launch declined: invalid_ticket");return true;
-        }
-        event("runtime launch claimed; result_callback=false");
-        worker.post(()->open(ticket));return true;
-    }
-    private void open(Ticket ticket){
-        long preflightStarted=SystemClock.elapsedRealtimeNanos();
-        RuntimeSnapshot config=current();long now=SystemClock.elapsedRealtime();
-        if(config==null || !config.usable() || !config.enabled || !ticket.identity().equals(config.identity)
-                || now>=ticket.until() || !foreground(ticket.origin())){
-            perf("open_preflight",preflightStarted,"declined");event("runtime launch declined: stale_or_background");return;
-        }
-        perf("open_preflight",preflightStarted,"accepted");
-        long launchStarted=SystemClock.elapsedRealtimeNanos();
-        try {
-            packages.thawAndOpen(ticket.plan(),()->{
-                RuntimeSnapshot latest=current();return latest!=null && latest.usable() && latest.enabled
-                        && latest.identity.equals(ticket.identity()) && SystemClock.elapsedRealtime()<ticket.until()
-                        && foreground(ticket.origin());
-            });perf("thaw_and_start",launchStarted,"submitted");event("runtime launch submitted; module_started=false");
-        }catch(Exception failed){
-            perf("thaw_and_start",launchStarted,"failed");event("runtime launch failed: "+failed.getClass().getSimpleName());
-        }
-    }
-    private boolean foreground(String source){
-        String top=foregroundPackage();
-        return top!=null && (BridgeContract.HOST_PACKAGE.equals(top) || (source!=null && source.equals(top)));
-    }
-    private String foregroundPackage(){
-        try {
-            PowerManager power=context.getSystemService(PowerManager.class);KeyguardManager keyguard=context.getSystemService(KeyguardManager.class);
-            if(power==null || !power.isInteractive() || keyguard==null || keyguard.isKeyguardLocked())return null;
-            var tasks=context.getSystemService(ActivityManager.class).getRunningTasks(1);
-            if(tasks==null || tasks.size()!=1 || tasks.get(0).topActivity==null)return null;
-            var task=tasks.get(0);
-            if(task.getClass().getField("userId").getInt(task)!=0 || task.getClass().getField("displayId").getInt(task)!=0)return null;
-            return task.topActivity.getPackageName();
-        }catch(ReflectiveOperationException|RuntimeException unavailable){return null;}
     }
     private String token(){byte[] bytes=new byte[32];random.nextBytes(bytes);return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);}
     private void event(String value){if(logger!=null)logger.accept(value);}

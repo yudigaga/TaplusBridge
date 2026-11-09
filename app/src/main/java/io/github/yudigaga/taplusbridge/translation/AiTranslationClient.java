@@ -9,8 +9,7 @@ import java.net.URL;
 import java.nio.ByteBuffer;
 import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import javax.net.ssl.HttpsURLConnection;
@@ -21,11 +20,19 @@ import org.json.JSONObject;
 /** Synchronous worker-only transport; secrets and response bodies never enter diagnostic messages. */
 public final class AiTranslationClient {
     private static final int MAX_INPUT = 32768, MAX_OUTPUT = 1024 * 1024;
-    private static final ScheduledExecutorService TIMEOUT = Executors.newSingleThreadScheduledExecutor(task -> {
-        Thread thread = new Thread(task, "TaplusBridge-translation-timeout"); thread.setDaemon(true); return thread;
-    });
+    private static final ScheduledThreadPoolExecutor TIMEOUT = deadlines();
     interface ConnectionFactory { HttpURLConnection open(URL endpoint) throws IOException; }
     private AiTranslationClient() {}
+
+    private static ScheduledThreadPoolExecutor deadlines() {
+        ScheduledThreadPoolExecutor executor = new ScheduledThreadPoolExecutor(1, task -> {
+            Thread thread = new Thread(task, "TaplusBridge-translation-timeout"); thread.setDaemon(true); return thread;
+        });
+        executor.setRemoveOnCancelPolicy(true);
+        executor.setKeepAliveTime(3, TimeUnit.SECONDS);
+        executor.allowCoreThreadTimeOut(true);
+        return executor;
+    }
 
     public static String translate(TranslationSettings settings, String text, CancellationSignal cancel) throws IOException {
         return translate(settings, text, cancel, endpoint -> (HttpsURLConnection) endpoint.openConnection());

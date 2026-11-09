@@ -95,6 +95,26 @@ public final class RuntimePublisherSaveAndroidTest {
         stopPublisher();
         RuntimeClient.testBridge(null);
         clearServiceHelper();
+        ModuleProcessLifecycle.resetForTest();
+    }
+
+    @Test public void publicationKeepsTheProcessUntilNormalConfigurationIsConfirmed() throws Exception {
+        ModuleProcessLifecycle.installForTest(new Handler(Looper.getMainLooper()), () -> {});
+        publishSavedSettings();drainWorker();
+        assertEquals("Pending confirmation must keep the module process alive",1,ModuleProcessLifecycle.activeLeaseCountForTest());
+        acknowledgeCurrent=true;advanceMainAndWorker(250);
+        assertEquals("Successful confirmation releases background work",0,ModuleProcessLifecycle.activeLeaseCountForTest());
+        assertEquals("系统已确认配置",RuntimePublisher.status());
+    }
+    @Test public void newerPublicationAndFrameworkDeathReleaseThePreviousProcessHold() throws Exception {
+        ModuleProcessLifecycle.installForTest(new Handler(Looper.getMainLooper()), () -> {});
+        publishSavedSettings();drainWorker();
+        assertEquals(1,ModuleProcessLifecycle.activeLeaseCountForTest());
+        config.setScopeLinkProbeEnabled(false);publishSavedSettings();drainWorker();
+        assertEquals("Superseding a publication must replace its hold",1,ModuleProcessLifecycle.activeLeaseCountForTest());
+        XposedServiceHelper.OnServiceListener listener=(XposedServiceHelper.OnServiceListener)field(XposedServiceHelper.class,"mListener").get(null);
+        listener.onServiceDied(service);
+        assertEquals("Disconnected publication cannot leave the process pinned",0,ModuleProcessLifecycle.activeLeaseCountForTest());
     }
 
     @Test public void savedOffChoicePublishesWithoutWaitingForMainLooperDebounce() throws Exception {

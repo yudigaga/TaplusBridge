@@ -32,8 +32,6 @@ public final class HostTranslationHooksAndroidTest {
     private RecordingContext context;
 
     @Before public void attachProvider() throws Exception {
-        Method reset = io.github.yudigaga.taplusbridge.runtime.BridgeTransport.class.getDeclaredMethod("testReset");
-        reset.setAccessible(true); reset.invoke(null);
         var provider = Robolectric.buildContentProvider(TranslationProvider.class).create(BridgeContract.AUTHORITY).get();
         ShadowContentResolver.registerProviderInternal(BridgeContract.AUTHORITY, provider);
         TranslationProvider.response = Bundle.EMPTY; TranslationProvider.request = null;

@@ -11,6 +11,7 @@ import android.os.Looper;
 import android.os.ParcelFileDescriptor;
 import android.os.Process;
 import io.github.yudigaga.taplusbridge.hook.HostPolicy;
+import io.github.yudigaga.taplusbridge.runtime.ModuleProcessLifecycle;
 import java.io.IOException;
 import java.util.Arrays;
 
@@ -19,6 +20,7 @@ public final class LensService extends Service {
     private final Handler main = new Handler(Looper.getMainLooper());
     private volatile boolean bound;
     private volatile int bindingGeneration;
+    private ModuleProcessLifecycle.Lease bindingLease;
     private final ILensService.Stub binder = new ILensService.Stub() {
         @Override public void search(ParcelFileDescriptor image, Bundle request, ILensCallback callback) {
             try {
@@ -98,16 +100,24 @@ public final class LensService extends Service {
         }
     }
 
-    @Override public IBinder onBind(Intent intent) { bound = true; bindingGeneration++; return binder; }
+    @Override public IBinder onBind(Intent intent) {
+        if (bindingLease == null) bindingLease = ModuleProcessLifecycle.acquire();
+        bound = true; bindingGeneration++; return binder;
+    }
     @Override public boolean onUnbind(Intent intent) {
         bound = false; bindingGeneration++;
-        LensSession.cancelAll();
+        try { LensSession.cancelAll(); }
+        finally { releaseBinding(); }
         return false;
     }
     @Override public void onDestroy() {
         bound = false; bindingGeneration++;
-        LensSession.cancelAll();
+        try { LensSession.cancelAll(); }
+        finally { releaseBinding(); }
         super.onDestroy();
+    }
+    private void releaseBinding() {
+        if (bindingLease != null) { bindingLease.close(); bindingLease = null; }
     }
     static void close(ParcelFileDescriptor file) {
         if (file != null) try { file.close(); } catch (IOException ignored) { }

@@ -28,6 +28,7 @@ import io.github.yudigaga.taplusbridge.rules.LinkRuleEntry;
 import io.github.yudigaga.taplusbridge.rules.RuleRepository;
 import io.github.yudigaga.taplusbridge.rules.RuleConfigTransfer;
 import io.github.yudigaga.taplusbridge.runtime.RuntimePublisher;
+import io.github.yudigaga.taplusbridge.runtime.ModuleProcessLifecycle;
 import io.github.yudigaga.taplusbridge.thaw.ThawEngine;
 import io.github.yudigaga.taplusbridge.thaw.ShizukuAccess;
 import java.lang.ref.WeakReference;
@@ -39,7 +40,9 @@ import java.util.Set;
 import java.util.Objects;
 import java.util.LinkedHashMap;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.function.Consumer;
@@ -86,7 +89,14 @@ public final class SettingsController implements AutoCloseable {
     };
 
     public SettingsController(Activity activity) {
-        this(activity, Executors.newSingleThreadExecutor(), ThawEngine::probeRoot);
+        this(activity, createWorker(), ThawEngine::probeRoot);
+    }
+
+    private static ThreadPoolExecutor createWorker() {
+        ThreadPoolExecutor executor=new ThreadPoolExecutor(1,1,1,TimeUnit.SECONDS,new LinkedBlockingQueue<>(),r->{
+            Thread thread=new Thread(r,"TaplusBridge-settings");thread.setDaemon(true);return thread;
+        });
+        executor.allowCoreThreadTimeOut(true);return executor;
     }
 
     /** Controlled worker seam for lifecycle tests; the production constructor uses real Root checks. */
@@ -114,6 +124,7 @@ public final class SettingsController implements AutoCloseable {
     /** Immutable display state; hostSupported means inspected version, not LSPosed activation. */
     public static final class Snapshot {
         public final boolean enabled, nativeEnabled, recognitionEnabled, captureEnabled, lensEnabled, cloudLinkHandoffEnabled;
+        public final boolean launcherIconHidden;
         public final ThawEngine.Mode mode;
         public final boolean hostInstalled, hostSupported, shizukuGranted;
         public final String hostVersionName, hostVersion, shizukuStatus, versionName;
@@ -122,7 +133,9 @@ public final class SettingsController implements AutoCloseable {
         public final DragSettings dragSettings;
         public final RecognitionChannels recognitionChannels;
         private Snapshot(ConfigStore config, boolean hostInstalled, boolean hostSupported,
-                         String hostVersionName, long hostVersionCode, boolean shizukuGranted, String shizukuStatus) {
+                         String hostVersionName, long hostVersionCode, boolean shizukuGranted, String shizukuStatus,
+                         boolean launcherIconHidden) {
+            this.launcherIconHidden = launcherIconHidden;
             enabled = config.enabled(); nativeEnabled = config.nativeEnabled();
             recognitionEnabled = config.recognitionEnabled(); captureEnabled = config.captureEnabled();
             lensEnabled = config.lensEnabled();
@@ -146,7 +159,27 @@ public final class SettingsController implements AutoCloseable {
             hostCode = host.getLongVersionCode(); supported = HostPolicy.supportedVersion(hostVersion, hostCode);
         } catch (PackageManager.NameNotFoundException ignored) { }
         return new Snapshot(config, installed, supported, hostVersion, hostCode,
-                shizukuAuthorization.granted(), shizukuAuthorization.status());
+                shizukuAuthorization.granted(), shizukuAuthorization.status(), launcherIconHidden());
+    }
+
+    private static final ComponentName LAUNCHER_ALIAS = new ComponentName(BridgeContract.APP_PACKAGE,
+            BridgeContract.APP_PACKAGE + ".ui.LauncherAlias");
+    private boolean launcherIconHidden() {
+        int state = context.getPackageManager().getComponentEnabledSetting(LAUNCHER_ALIAS);
+        return state == PackageManager.COMPONENT_ENABLED_STATE_DISABLED
+                || state == PackageManager.COMPONENT_ENABLED_STATE_DISABLED_USER
+                || state == PackageManager.COMPONENT_ENABLED_STATE_DISABLED_UNTIL_USED;
+    }
+    public void setLauncherIconHidden(boolean hidden) {
+        requireOpen();
+        if (launcherIconHidden() == hidden) return;
+        try {
+            context.getPackageManager().setComponentEnabledSetting(LAUNCHER_ALIAS,
+                    hidden ? PackageManager.COMPONENT_ENABLED_STATE_DISABLED : PackageManager.COMPONENT_ENABLED_STATE_ENABLED,
+                    PackageManager.DONT_KILL_APP);
+        } catch (RuntimeException failed) {
+            throw new IllegalStateException("桌面图标设置失败，请重试", failed);
+        }
     }
 
     public void setCloudLinkHandoffEnabled(boolean enabled) {
@@ -473,12 +506,14 @@ public final class SettingsController implements AutoCloseable {
             pending.removeIf(Future::isDone);
             try {
                 pending.add(worker.submit(() -> {
-                    T value = task.get();
-                    main.post(() -> {
-                        synchronized (lifecycleLock) { if (closed || generation != acceptedGeneration) return; }
-                        Activity owner = activity.get();
-                        if (owner != null && !owner.isFinishing() && !owner.isDestroyed()) callback.accept(value);
-                    });
+                    try (ModuleProcessLifecycle.Lease ignored = ModuleProcessLifecycle.acquire()) {
+                        T value = task.get();
+                        main.post(() -> {
+                            synchronized (lifecycleLock) { if (closed || generation != acceptedGeneration) return; }
+                            Activity owner = activity.get();
+                            if (owner != null && !owner.isFinishing() && !owner.isDestroyed()) callback.accept(value);
+                        });
+                    }
                 }));
             } catch (RejectedExecutionException unavailable) { throw new IllegalStateException("页面任务已结束，请重新打开页面"); }
         }

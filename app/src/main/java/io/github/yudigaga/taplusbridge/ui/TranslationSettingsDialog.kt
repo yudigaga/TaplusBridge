@@ -19,6 +19,7 @@ import io.github.yudigaga.taplusbridge.translation.AiTranslationClient
 import io.github.yudigaga.taplusbridge.translation.TranslationApps
 import io.github.yudigaga.taplusbridge.translation.TranslationSettings
 import io.github.yudigaga.taplusbridge.translation.TranslationStore
+import io.github.yudigaga.taplusbridge.runtime.ModuleProcessLifecycle
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -61,7 +62,13 @@ import top.yukonga.miuix.kmp.preference.RadioButtonPreference
         catch (failure: RuntimeException) { error = "无法读取翻译应用，请关闭后重试" }
         finally { loading = false }
     }
-    DisposableEffect(Unit) { onDispose { cancellation?.cancel(); testJob?.cancel() } }
+    DisposableEffect(Unit) {
+        val editing = ModuleProcessLifecycle.acquire()
+        onDispose {
+            try { cancellation?.cancel(); testJob?.cancel() }
+            finally { editing.close() }
+        }
+    }
 
     fun stopTest() {
         cancellation?.cancel(); testJob?.cancel()

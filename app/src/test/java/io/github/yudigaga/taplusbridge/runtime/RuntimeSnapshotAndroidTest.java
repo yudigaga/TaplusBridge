@@ -23,54 +23,7 @@ import static org.junit.Assert.*;
 @RunWith(RobolectricTestRunner.class)
 @Config(sdk=34,manifest=Config.NONE)
 public final class RuntimeSnapshotAndroidTest {
-    @Test public void cloudAdapterSettingIsAnExplicitBooleanInTheNewFrameworkSchema() throws Exception {
-        context.getSharedPreferences("config", 0).edit().putBoolean("cloud_link_handoff", false).commit();
-        JSONObject snapshot = new JSONObject(RuntimeSnapshot.from(context));
-        assertEquals(7, snapshot.getInt("schema"));
-        assertTrue(snapshot.has("cloud_link_handoff"));
-        assertEquals(Boolean.FALSE, snapshot.get("cloud_link_handoff"));
-    }
-    @Test public void changingOnlyTheCloudAdapterInvalidatesTheFrameworkConfigurationIdentity() {
-        context.getSharedPreferences("config", 0).edit().putBoolean("cloud_link_handoff", true).commit();
-        RuntimeSnapshot before = RuntimeSnapshot.parse(RuntimeSnapshot.from(context));
-        context.getSharedPreferences("config", 0).edit().putBoolean("cloud_link_handoff", false).commit();
-        RuntimeSnapshot after = RuntimeSnapshot.parse(RuntimeSnapshot.from(context));
-        assertNotEquals(before.identity, after.identity);
-    }
-    @Test public void schemaSevenRequiresItsStrictBooleanAndEveryEarlierSchemaKeepsTheAdapterOff() throws Exception {
-        JSONObject current = new JSONObject(RuntimeSnapshot.from(context));
-        assertEquals(16, current.length());
-        assertTrue(RuntimeSnapshot.parse(current.toString()).cloudLinkHandoff);
-        for (Object invalid : List.of("true", 1, JSONObject.NULL, new JSONObject())) {
-            String damaged = new JSONObject(current.toString()).put(ConfigStore.CLOUD_LINK_HANDOFF_KEY, invalid).toString();
-            assertThrows(IllegalArgumentException.class, () -> RuntimeSnapshot.parse(damaged));
-        }
-        JSONObject missing = new JSONObject(current.toString()); missing.remove(ConfigStore.CLOUD_LINK_HANDOFF_KEY);
-        assertThrows(IllegalArgumentException.class, () -> RuntimeSnapshot.parse(missing.toString()));
-        missing.put("unknown", false);
-        assertThrows(IllegalArgumentException.class, () -> RuntimeSnapshot.parse(missing.toString()));
-        for (int schema = 1; schema <= 6; schema++) {
-            JSONObject legacy = new JSONObject(current.toString()).put("schema", schema);
-            legacy.remove(ConfigStore.CLOUD_LINK_HANDOFF_KEY);
-            if (schema < 6) legacy.remove(RecognitionChannels.KEY);
-            if (schema < 5) legacy.remove(DragSettings.KEY);
-            if (schema < 4) legacy.remove(ConfigStore.SCOPE_LINK_PROBE_KEY);
-            if (schema < 3) legacy.remove(ConfigStore.SCOPE_CAPTURE_KEY);
-            if (schema < 2) legacy.remove(SourceScopePolicy.KEY);
-            assertFalse("schema " + schema, RuntimeSnapshot.parse(legacy.toString()).cloudLinkHandoff);
-            String unversioned = new JSONObject(legacy.toString()).put(ConfigStore.CLOUD_LINK_HANDOFF_KEY, true).toString();
-            assertThrows(IllegalArgumentException.class, () -> RuntimeSnapshot.parse(unversioned));
-        }
-    }
 
-    @Test public void theCloudAdapterChoiceSurvivesFrameworkStorageWithoutPrivateModulePreferences() {
-        config.setCloudLinkHandoffEnabled(false);
-        String raw = RuntimeSnapshot.from(context); RuntimePublisher.store(framework, raw);
-        context.getSharedPreferences("config", 0).edit().clear().commit();
-        RuntimeSnapshot restored = RuntimeSnapshot.parse(framework.getString(RuntimeSnapshot.KEY, null));
-        assertFalse(restored.cloudLinkHandoff);
-        assertEquals(RuntimeSnapshot.parse(raw).identity, restored.identity);
-    }
 
     private Context context;private SharedPreferences framework;private ConfigStore config;
     @Before public void setup(){
@@ -79,11 +32,11 @@ public final class RuntimeSnapshotAndroidTest {
         config=new ConfigStore(context);framework=context.getSharedPreferences("framework_snapshot_test",0);
         new RuleRepository(context).saveManualRule(-1,"com.tencent.mm","https://configured.example/path?private=not-retained","com.example.reader","none","do not share private note");
     }
-    @Test public void sharedSnapshotRetainsSourceRulesButNoContentOrNotes(){
+    @Test public void sharedSnapshotContainsSystemConfigurationWithoutRoutingData(){
         String raw=RuntimeSnapshot.from(context);RuntimeSnapshot snapshot=RuntimeSnapshot.parse(raw);
         assertFalse(snapshot.scopeCapture);
         assertFalse(snapshot.scopeLinkProbe);
-        assertTrue(snapshot.usable());assertTrue(snapshot.rules.stream().anyMatch(r->r.host.equals("configured.example") && r.sourcePackage.equals("com.tencent.mm")));
+        assertTrue(snapshot.usable());assertFalse(raw.contains("configured.example"));assertFalse(raw.contains("\"rules\""));
         assertFalse(raw.contains("path?"));assertFalse(raw.contains("not-retained"));assertFalse(raw.contains("private note"));
     }
     @Test public void frameworkValueColdReloadDoesNotNeedModulePrivatePreferences()throws Exception {
@@ -93,16 +46,12 @@ public final class RuntimeSnapshotAndroidTest {
         SharedPreferences cold=(SharedPreferences)constructor.newInstance(file,0);
         context.getSharedPreferences("config",0).edit().clear().commit();context.getSharedPreferences(RuleRepository.PREFS,0).edit().clear().commit();
         RuntimeSnapshot restored=RuntimeSnapshot.parse(cold.getString(RuntimeSnapshot.KEY,null));
-        assertEquals(RuntimeSnapshot.parse(raw).identity,restored.identity);assertTrue(restored.rules.stream().anyMatch(r->r.host.equals("configured.example")));
+        assertEquals(RuntimeSnapshot.parse(raw).identity,restored.identity);assertEquals(RuntimeSnapshot.parse(raw).drag.toJson(),restored.drag.toJson());
     }
-    @Test public void switchAndRuleChangesReplaceTheWholeConfigurationIdentity(){
+    @Test public void systemSwitchChangesReplaceTheWholeConfigurationIdentity(){
         RuntimeSnapshot before=RuntimeSnapshot.parse(RuntimeSnapshot.from(context));config.setCaptureEnabled(false);
         RuntimeSnapshot after=RuntimeSnapshot.parse(RuntimeSnapshot.from(context));assertNotEquals(before.identity,after.identity);assertFalse(after.capture);
         RuntimePublisher.store(framework,after.encode());assertEquals(after.identity,RuntimeSnapshot.parse(framework.getString(RuntimeSnapshot.KEY,null)).identity);
-    }
-    @Test public void disabledTargetGroupsAreNotReenabledBySharing(){
-        new RuleRepository(context).setTargetEnabled("com.example.reader",false);
-        assertTrue(RuntimeSnapshot.parse(RuntimeSnapshot.from(context)).rules.stream().noneMatch(r->r.targetPackage.equals("com.example.reader")));
     }
     @Test public void wrongUserSchemaAndCorruptValueAreRejected(){
         String raw=RuntimeSnapshot.from(context);
@@ -163,9 +112,6 @@ public final class RuntimeSnapshotAndroidTest {
         assertEquals(Boolean.FALSE,new JSONObject(raw).get(ConfigStore.SCOPE_LINK_PROBE_KEY));
         assertFalse(RuntimeSnapshot.parse(raw).scopeLinkProbe);
     }
-    @Test public void independentRuntimeCanBeExplicitlyRevoked(){
-        config.setIndependentEnabled(false);RuntimeSnapshot off=RuntimeSnapshot.parse(RuntimeSnapshot.from(context));assertFalse(off.usable());
-    }
     @Test public void selectedSourcePolicyIsIncludedInFrameworkSnapshotAndItsIdentity(){
         RuntimeSnapshot before=RuntimeSnapshot.parse(RuntimeSnapshot.from(context));assertFalse(before.sourceScope.managed);
         config.saveSourceScope(SourceScopePolicy.Mode.WHITELIST,Set.of("com.example.blocked"),Set.of("com.example.allowed"));
@@ -177,7 +123,7 @@ public final class RuntimeSnapshotAndroidTest {
         assertEquals(saved.identity,restored.identity);assertEquals(Set.of("com.example.blocked"),restored.sourceScope.blacklist);
     }
     @Test public void legacySchemaOneRemainsUnmanagedAndExactFieldCountIsEnforced()throws Exception {
-        JSONObject legacy=new JSONObject(RuntimeSnapshot.from(context));legacy.remove(SourceScopePolicy.KEY);
+        JSONObject legacy=legacyConfiguration();legacy.remove(SourceScopePolicy.KEY);
         legacy.remove(ConfigStore.CLOUD_LINK_HANDOFF_KEY);
         legacy.remove(DragSettings.KEY);
         legacy.remove(RecognitionChannels.KEY);
@@ -206,7 +152,7 @@ public final class RuntimeSnapshotAndroidTest {
 
     @Test public void legacySchemaTwoRetainsItsScopeButNeverEnablesTheNewFallback()throws Exception {
         assertTrue(config.saveSourceScope(SourceScopePolicy.Mode.WHITELIST,Set.of("com.example.blocked"),Set.of("com.example.allowed"),true));
-        JSONObject legacy=new JSONObject(RuntimeSnapshot.from(context));legacy.put("schema",2);legacy.remove(ConfigStore.SCOPE_CAPTURE_KEY);
+        JSONObject legacy=legacyConfiguration();legacy.put("schema",2);legacy.remove(ConfigStore.SCOPE_CAPTURE_KEY);
         legacy.remove(ConfigStore.CLOUD_LINK_HANDOFF_KEY);
         legacy.remove(DragSettings.KEY);
         legacy.remove(RecognitionChannels.KEY);
@@ -221,7 +167,7 @@ public final class RuntimeSnapshotAndroidTest {
     }
 
     @Test public void schemaThreeRequiresAnExplicitStrictBooleanFallbackAndExactlyTwelveFields()throws Exception {
-        JSONObject legacy=new JSONObject(RuntimeSnapshot.from(context));legacy.put("schema",3);legacy.remove(ConfigStore.SCOPE_LINK_PROBE_KEY);
+        JSONObject legacy=legacyConfiguration();legacy.put("schema",3);legacy.remove(ConfigStore.SCOPE_LINK_PROBE_KEY);
         legacy.remove(ConfigStore.CLOUD_LINK_HANDOFF_KEY);
         legacy.remove(DragSettings.KEY);
         legacy.remove(RecognitionChannels.KEY);
@@ -248,7 +194,7 @@ public final class RuntimeSnapshotAndroidTest {
 
     @Test public void schemaThreeRetainsScreenshotChoiceButCannotEnableTheNewAutomaticLinkProbe()throws Exception {
         assertTrue(config.saveSourceScope(SourceScopePolicy.Mode.BLACKLIST,Set.of(),Set.of(),true,true));
-        JSONObject legacy=new JSONObject(RuntimeSnapshot.from(context));legacy.put("schema",3);legacy.remove(ConfigStore.SCOPE_LINK_PROBE_KEY);
+        JSONObject legacy=legacyConfiguration();legacy.put("schema",3);legacy.remove(ConfigStore.SCOPE_LINK_PROBE_KEY);
         legacy.remove(ConfigStore.CLOUD_LINK_HANDOFF_KEY);
         legacy.remove(DragSettings.KEY);
         legacy.remove(RecognitionChannels.KEY);
@@ -258,7 +204,7 @@ public final class RuntimeSnapshotAndroidTest {
     }
 
     @Test public void schemaFourRequiresStrictLinkProbeBooleanAndPreservesIndependentSwitches()throws Exception {
-        JSONObject legacy=new JSONObject(RuntimeSnapshot.from(context));legacy.put("schema",4);legacy.remove(DragSettings.KEY);
+        JSONObject legacy=legacyConfiguration();legacy.put("schema",4);legacy.remove(DragSettings.KEY);
         legacy.remove(ConfigStore.CLOUD_LINK_HANDOFF_KEY);
         legacy.remove(RecognitionChannels.KEY);
         String raw=legacy.toString();assertEquals(13,new JSONObject(raw).length());
@@ -279,7 +225,7 @@ public final class RuntimeSnapshotAndroidTest {
         RuntimeSnapshot before=RuntimeSnapshot.parse(RuntimeSnapshot.from(context));assertFalse(before.drag.enabled);
         config.setDragSettings(new DragSettings(true,"rules","browser","copy","none",true,
                 List.of("com.example.second/.Share","com.example.first/.Share")));
-        JSONObject legacy=new JSONObject(RuntimeSnapshot.from(context)).put("schema",5);legacy.remove(RecognitionChannels.KEY);
+        JSONObject legacy=legacyConfiguration().put("schema",5);legacy.remove(RecognitionChannels.KEY);
         legacy.remove(ConfigStore.CLOUD_LINK_HANDOFF_KEY);
         String raw=legacy.toString();assertEquals(14,new JSONObject(raw).length());
         assertEquals(5,new JSONObject(raw).getInt("schema"));
@@ -296,7 +242,7 @@ public final class RuntimeSnapshotAndroidTest {
 
     @Test public void schemaFourCannotImplicitlyEnableDragOrCarryUnversionedDragSettings()throws Exception {
         config.setDragSettings(new DragSettings(true,"share","share","share","share",true,List.of()));
-        JSONObject legacy=new JSONObject(RuntimeSnapshot.from(context));legacy.put("schema",4);legacy.remove(DragSettings.KEY);
+        JSONObject legacy=legacyConfiguration();legacy.put("schema",4);legacy.remove(DragSettings.KEY);
         legacy.remove(ConfigStore.CLOUD_LINK_HANDOFF_KEY);
         legacy.remove(RecognitionChannels.KEY);
         assertEquals(13,legacy.length());
@@ -308,7 +254,7 @@ public final class RuntimeSnapshotAndroidTest {
     }
 
     @Test public void schemaFiveRejectsUnknownDragActionsFieldsTypesAndMissingConfiguration()throws Exception {
-        JSONObject legacy=new JSONObject(RuntimeSnapshot.from(context)).put("schema",5);legacy.remove(RecognitionChannels.KEY);
+        JSONObject legacy=legacyConfiguration().put("schema",5);legacy.remove(RecognitionChannels.KEY);
         legacy.remove(ConfigStore.CLOUD_LINK_HANDOFF_KEY);
         String raw=legacy.toString();
         for(String direction:DragSettings.DIRECTIONS) {
@@ -327,5 +273,48 @@ public final class RuntimeSnapshotAndroidTest {
         assertThrows(IllegalArgumentException.class,()->RuntimeSnapshot.parse(new JSONObject(raw).put("unexpected",false).toString()));
         missing.put("unexpected",false);assertEquals(14,missing.length());
         assertThrows(IllegalArgumentException.class,()->RuntimeSnapshot.parse(missing.toString()));
+    }
+    private void assertRoutingIdentityChanges(Runnable change) {
+        String before=RuntimeSnapshot.parse(RuntimeSnapshot.from(context)).identity;
+        change.run();
+        assertNotEquals(before,RuntimeSnapshot.parse(RuntimeSnapshot.from(context)).identity);
+    }
+    @Test public void ordinaryTicketIdentityStillTracksNativeCloudAndThawModeChoices() {
+        assertRoutingIdentityChanges(()->config.setNativeEnabled(false));
+        assertRoutingIdentityChanges(()->config.setCloudLinkHandoffEnabled(false));
+        assertRoutingIdentityChanges(()->config.setMode(io.github.yudigaga.taplusbridge.thaw.ThawEngine.Mode.SHIZUKU));
+    }
+    @Test public void ordinaryTicketIdentityStillTracksRuleEditsAndTargetSwitches() {
+        RuleRepository rules=new RuleRepository(context);
+        assertRoutingIdentityChanges(()->rules.saveManualRule(-1,"*","another.example","com.example.other","none","private note"));
+        assertRoutingIdentityChanges(()->rules.setTargetEnabled("com.example.other",false));
+    }
+    @Test public void routingFingerprintKeepsRuleContentAndNotesOutOfFrameworkStorage() throws Exception {
+        JSONObject data=new JSONObject(RuntimeSnapshot.from(context));
+        assertTrue("Snapshot must contain only an opaque routing fingerprint",data.optString("routing_identity").matches("[0-9a-f]{64}"));
+        assertFalse(data.toString().contains("configured.example"));assertFalse(data.toString().contains("private note"));
+        for(Object damaged:List.of("",false,JSONObject.NULL,"a".repeat(63),"A".repeat(64))) {
+            String invalid=new JSONObject(data.toString()).put("routing_identity",damaged).toString();
+            assertThrows(IllegalArgumentException.class,()->RuntimeSnapshot.parse(invalid));
+        }
+    }
+    private JSONObject legacyConfiguration() throws Exception {
+        JSONObject data=new JSONObject(RuntimeSnapshot.from(context));data.remove("routing_identity");
+        return data.put("schema",7)
+                .put("native",true).put("independent",false).put("mode","ROOT")
+                .put("rules",new org.json.JSONArray()).put(ConfigStore.CLOUD_LINK_HANDOFF_KEY,true);
+    }
+    @Test public void allHistoricalSchemasKeepNormalConfigurationAndIgnoreRemovedRoutingChoices() throws Exception {
+        for(int schema=1;schema<=7;schema++) {
+            JSONObject old=legacyConfiguration().put("schema",schema);
+            if(schema<7)old.remove(ConfigStore.CLOUD_LINK_HANDOFF_KEY);
+            if(schema<6)old.remove(RecognitionChannels.KEY);
+            if(schema<5)old.remove(DragSettings.KEY);
+            if(schema<4)old.remove(ConfigStore.SCOPE_LINK_PROBE_KEY);
+            if(schema<3)old.remove(ConfigStore.SCOPE_CAPTURE_KEY);
+            if(schema<2)old.remove(SourceScopePolicy.KEY);
+            RuntimeSnapshot parsed=RuntimeSnapshot.parse(old.toString());
+            assertTrue(parsed.usable());assertTrue(parsed.enabled);assertTrue(parsed.recognition);
+        }
     }
 }

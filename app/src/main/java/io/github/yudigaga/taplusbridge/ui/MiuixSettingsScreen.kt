@@ -15,7 +15,6 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import androidx.core.view.WindowCompat
-import io.github.yudigaga.taplusbridge.config.ConfigStore
 import io.github.yudigaga.taplusbridge.runtime.RuntimePublisher
 import io.github.yudigaga.taplusbridge.thaw.ThawEngine
 import kotlinx.coroutines.flow.distinctUntilChanged
@@ -66,12 +65,10 @@ object MiuixSettingsScreen {
     var sourceScope by remember { mutableStateOf(controller.sourceScope()) }
     var sourceScopeError by remember { mutableStateOf(controller.sourceScopeError()) }
     var apps by remember { mutableStateOf<List<SettingsController.AppEntry>>(emptyList()) }
-    var independent by remember { mutableStateOf(ConfigStore(activity).independentEnabled()) }
     val refresh: () -> Unit = {
         snapshot = controller.snapshot()
         sourceScope = controller.sourceScope()
         sourceScopeError = controller.sourceScopeError()
-        independent = ConfigStore(activity).independentEnabled()
         revision++
     }
     LaunchedEffect(pagerState) {
@@ -100,7 +97,7 @@ object MiuixSettingsScreen {
     Box(Modifier.fillMaxSize().testTag("settings.root")) {
         HorizontalPager(state = pagerState, modifier = Modifier.fillMaxSize().padding(bottom = 112.dp), key = { it }) { index ->
             when (index) {
-                HOME -> OverviewSettingsScreen(snapshot, sourceScope, sourceScopeError, independent, controller, refresh)
+                HOME -> OverviewSettingsScreen(snapshot, sourceScope, sourceScopeError, controller, refresh)
                 RECOGNITION -> DragSettingsScreen(controller, onSaved = refresh)
                 APPS -> SourceScopeSettingsScreen(controller, apps, onSaved = refresh)
                 RULES -> RuleSettingsScreen(controller, apps, revision, snapshot.nativeEnabled, snapshot.cloudLinkHandoffEnabled, bottomBar = {}, onChanged = refresh)

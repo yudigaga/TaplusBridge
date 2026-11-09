@@ -11,6 +11,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [34], manifest = Config.NONE)
@@ -71,5 +72,46 @@ class TranslationJobAndroidTest {
         assertEquals(1, calls.get())
         assertEquals(TranslationStatus.SUCCESS, job.status)
         assertEquals("唯一译文", job.result)
+    }
+
+    @Test fun cancellingAnInFlightTranslationStopsItsWorkerAndReleasesTheCancellationSignal() {
+        val entered = CountDownLatch(1)
+        val exited = CountDownLatch(1)
+        val worker = AtomicReference<Thread>()
+        val job = TranslationJob(settings(), "private text", translator = { _, _, signal ->
+            worker.set(Thread.currentThread())
+            entered.countDown()
+            try { CountDownLatch(1).await() }
+            finally { assertTrue(signal.isCanceled); exited.countDown() }
+            "late result"
+        })
+        try {
+            job.start()
+            assertTrue(entered.await(2, TimeUnit.SECONDS))
+            job.cancel()
+            assertTrue(exited.await(2, TimeUnit.SECONDS))
+            worker.get().join(2_000)
+            assertFalse("Closing translation must release its request thread", worker.get().isAlive)
+            assertNull(job.cancellation)
+            assertNull(job.future)
+            ShadowLooper.idleMainLooper()
+            assertEquals("", job.result)
+        } finally { job.cancel() }
+    }
+
+    @Test fun completedTranslationReleasesItsWorkerWhileKeepingTheVisibleResult() {
+        val worker = AtomicReference<Thread>()
+        val job = TranslationJob(settings(), "private text", translator = { _, _, _ ->
+            worker.set(Thread.currentThread()); "保留的译文"
+        })
+        try {
+            job.start()
+            job.future!!.get(2, TimeUnit.SECONDS)
+            worker.get().join(2_000)
+            assertFalse("A finished request must not leave an idle translation thread", worker.get().isAlive)
+            ShadowLooper.idleMainLooper()
+            assertEquals(TranslationStatus.SUCCESS, job.status)
+            assertEquals("保留的译文", job.result)
+        } finally { job.cancel() }
     }
 }

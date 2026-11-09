@@ -179,6 +179,16 @@ public final class LensUploadClientTest {
         } finally { client.cancel(); io.shutdownNow(); }
     }
 
+    @Test public void completedUploadDoesNotLeaveItsDeadlineThreadRunning() throws Exception {
+        upload(new LensUploadClient(cookies, null, url -> new FakeConnection()));
+        List<Thread> deadlines = Thread.getAllStackTraces().keySet().stream()
+                .filter(thread -> thread.getName().equals("TaplusBridge-Lens-upload-timeout")).toList();
+        for (Thread thread : deadlines) {
+            thread.join(5_000);
+            assertFalse("A finished upload must release its idle deadline thread", thread.isAlive());
+        }
+    }
+
     @Test public void socketTimeoutAndOversizedResponsesAreExplicitFailures() throws Exception {
         LensUploadClient timeout = new LensUploadClient(cookies, null, url -> new FakeConnection() {
             @Override public int getResponseCode() throws IOException { throw new SocketTimeoutException("test"); }

@@ -42,7 +42,7 @@ import static org.junit.Assert.*;
 public final class RuntimeServerAndroidTest {
     static final int HOST_UID=21001, MODULE_UID=21002;
     static final String TARGET="com.example.reader", SOURCE="com.tencent.mm", URL="https://configured.example/content/1?q=kept";
-    Context context;SharedPreferences stored;RuntimeServer server;FakePackages packages;ConfigStore config;
+    Context context;SharedPreferences stored;RuntimeServer server;ConfigStore config;
     @Before public void setup(){
         context=RuntimeEnvironment.getApplication();
         for(String name:List.of("config",RuleRepository.PREFS,"framework_test"))context.getSharedPreferences(name,0).edit().clear().commit();
@@ -52,7 +52,7 @@ public final class RuntimeServerAndroidTest {
         install(BridgeContract.APP_PACKAGE,MODULE_UID,false,"1",1);
         install(SOURCE,22001,true,"1",1);install(TARGET,22002,false,"1",1);
         stored=context.getSharedPreferences("framework_test",0);publish();
-        packages=new FakePackages();server=new RuntimeServer(context,new Handler(Looper.getMainLooper()),()->stored,packages,s->{});
+        server=new RuntimeServer(context,new Handler(Looper.getMainLooper()),()->stored,s->{});
         foreground(SOURCE);
     }
     void publish(){stored=context.getSharedPreferences("framework_test",0);stored.edit().putString(RuntimeSnapshot.KEY,RuntimeSnapshot.from(context)).commit();}
@@ -69,11 +69,9 @@ public final class RuntimeServerAndroidTest {
         ((org.robolectric.shadows.ShadowKeyguardManager)org.robolectric.shadow.api.Shadow.extract(context.getSystemService(KeyguardManager.class))).setKeyguardLocked(false);
     }
     Bundle request(){Bundle b=new Bundle();b.putString("url",URL);b.putString("source",SOURCE);b.putBoolean("ephemeral",true);return b;}
-    Intent marker(String token){return new Intent(RuntimeClient.OPEN).setPackage("android").putExtra("system_token",token);}
-    String prepared(){String token=server.handle(HOST_UID,"prepare",request()).getString("system_token");assertNotNull(token);return token;}
     @Test public void configurationLoadReportsTheEffectiveTapSwitchWithoutRecordingSnapshotContents(){
         List<String> events=new ArrayList<>();
-        server=new RuntimeServer(context,new Handler(Looper.getMainLooper()),()->stored,packages,events::add);
+        server=new RuntimeServer(context,new Handler(Looper.getMainLooper()),()->stored,events::add);
         config.saveSourceScope(SourceScopePolicy.Mode.BLACKLIST,List.of(),List.of(),false,true);publish();
         server.sourceCaptureConfiguration();server.sourceCaptureConfiguration();
         String prefix="runtime config stage=loaded build="+io.github.yudigaga.taplusbridge.BuildConfig.VERSION_CODE;
@@ -83,63 +81,19 @@ public final class RuntimeServerAndroidTest {
         assertTrue(events.stream().noneMatch(s->s.contains("configured.example") || s.contains("owner_configuration") || s.contains("nonce=")));
     }
 
-    @Test public void frozenModuleStillResolvesFromFrameworkConfiguration(){
-        Bundle response=server.handle(HOST_UID,"resolve",request());assertEquals(TARGET,response.getString("target"));
-        assertFalse(new ConfigStore(context).rules().isEmpty());
-    }
-    @Test public void cloudAdapterRoutingUsesOnlyTheSharedSwitchWhenModulePreferencesAreInaccessible() {
-        String cloud = "com.mfcloudcalculate.networkdisk";
-        String link = "https://12345.share.123pan.cn/123pan/KeepCase-Key";
-        install(cloud, 22003, false, "3.3.5", 3247);
-        new RuleRepository(context).saveManualRule(-1, "*", "share.123pan.cn", cloud, "none", "user rule");
-        Context framework = new ContextWrapper(context) {
-            @Override public Context getApplicationContext() { return this; }
-            @Override public SharedPreferences getSharedPreferences(String name, int mode) {
-                throw new AssertionError("Framework must not read module private preferences: " + name);
-            }
-        };
-        for (boolean adapter : new boolean[]{true, false}) {
-            config.setCloudLinkHandoffEnabled(adapter); publish();
-            context.getSharedPreferences("config", 0).edit().putBoolean(ConfigStore.CLOUD_LINK_HANDOFF_KEY, !adapter).commit();
-            List<LaunchPlanner.Plan> opened = new ArrayList<>();
-            SystemPackageOps operations = new SystemPackageOps() {
-                @Override public boolean ready() { return true; }
-                @Override public void thawAndOpen(LaunchPlanner.Plan plan, java.util.function.BooleanSupplier allowed) {
-                    if (allowed.getAsBoolean()) opened.add(plan);
-                }
-            };
-            RuntimeServer isolated = new RuntimeServer(framework, new Handler(Looper.getMainLooper()), () -> stored, operations, s -> {});
-            Bundle request = new Bundle(); request.putString("url", link); request.putString("source", SOURCE);
-            request.putBoolean("ephemeral", true);
-            String token = isolated.handle(HOST_UID, "prepare", request).getString("system_token");
-            assertNotNull(token); assertTrue(isolated.intercept(BridgeContract.HOST_PACKAGE, HOST_UID, 0, marker(token)));
-            org.robolectric.shadows.ShadowLooper mainLoop = org.robolectric.shadow.api.Shadow.extract(Looper.getMainLooper());
-            mainLoop.idle();
-            assertEquals(1, opened.size());
-            assertEquals(adapter ? "pan" : "https", opened.get(0).target().getData().getScheme());
-            if (!adapter) assertEquals(link, opened.get(0).target().getDataString());
-        }
-    }
-    @Test public void changingTheCloudAdapterRevokesAlreadyPreparedRuntimeTickets() {
-        String token = prepared(); config.setCloudLinkHandoffEnabled(false); publish();
-        server.intercept(BridgeContract.HOST_PACKAGE, HOST_UID, 0, marker(token));
-        org.robolectric.shadows.ShadowLooper mainLoop = org.robolectric.shadow.api.Shadow.extract(Looper.getMainLooper());
-        mainLoop.idle();
-        assertTrue(packages.opened.isEmpty());
-    }
     @Test public void unauthorizedCallersAndOtherProfilesCannotReadConfigurationOrCreateLaunches(){
         for(int uid:new int[]{22001,121001,1000,0})assertEquals("unauthorized",server.handle(uid,"resolve",request()).getString("reason"));
         assertEquals("unauthorized",server.handle(MODULE_UID,"prepare",request()).getString("reason"));
     }
-    @Test public void ownerCanVerifyTheExactSnapshotBeforeFreezing(){
+    @Test public void ownerCanVerifyTheExactSystemConfiguration(){
         Bundle status=server.handle(MODULE_UID,"status",null);assertTrue(status.getBoolean("ready"));
         assertEquals(RuntimeSnapshot.parse(stored.getString(RuntimeSnapshot.KEY,null)).identity,status.getString("identity"));
     }
 
-    @Test public void recognitionChannelsAreHostOnlyAndIndependentOfFrozenRoutingAvailability()throws Exception {
+    @Test public void recognitionChannelsAreHostOnly()throws Exception {
         String channels="{\"native\":false,\"assist\":true,\"ocr\":false,\"server\":true,\"segment\":false,\"clipboard\":true}";
         context.getSharedPreferences("config",0).edit().putString("recognition_channels",channels).commit();
-        config.setIndependentEnabled(false);publish();
+        publish();
         Bundle response=server.handle(HOST_UID,"recognition_channels",null);
         assertNotNull(response.getString("channels"));
         assertFalse(new JSONObject(response.getString("channels")).getBoolean("native"));
@@ -164,7 +118,7 @@ public final class RuntimeServerAndroidTest {
     }
     private RecordingDragContext recordDragServices() {
         RecordingDragContext recording=new RecordingDragContext(context);
-        server=new RuntimeServer(recording,new Handler(Looper.getMainLooper()),()->stored,packages,s->{});return recording;
+        server=new RuntimeServer(recording,new Handler(Looper.getMainLooper()),()->stored,s->{});return recording;
     }
     static final class RecordingDragContext extends ContextWrapper {
         final List<Intent> services=new ArrayList<>();
@@ -237,10 +191,10 @@ public final class RuntimeServerAndroidTest {
 
     @Test public void physicalDragConfigurationDoesNotRequireScreenshotLinkProbeOrManagedSources() {
         assertNull(server.dragConfiguration());
-        enableDrag(); config.setIndependentEnabled(false); publish();
+        enableDrag();  publish();
         RuntimeSnapshot current = server.dragConfiguration();
         assertNotNull(current); assertTrue(current.drag.enabled); assertFalse(current.scopeCapture);
-        assertFalse(current.scopeLinkProbe); assertFalse(current.sourceScope.managed); assertFalse(current.independent);
+        assertFalse(current.scopeLinkProbe); assertFalse(current.sourceScope.managed);
         assertEquals(RuntimeSnapshot.parse(stored.getString(RuntimeSnapshot.KEY, null)).identity, current.identity);
         assertNull(server.sourceCaptureConfiguration());
     }
@@ -409,104 +363,17 @@ public final class RuntimeServerAndroidTest {
         assertEquals("disabled",server.handle(HOST_UID,"drag_choose",dragChoiceRequest()).getString("reason"));
         assertTrue(recording.activities.isEmpty());assertTrue(recording.services.isEmpty());
     }
-    @Test public void launchTicketStaysInSystemMemoryAndDoesNotPointToModuleActivity(){
-        String token=prepared();assertTrue(server.intercept(BridgeContract.HOST_PACKAGE,HOST_UID,-2,marker(token)));
-        ((org.robolectric.shadows.ShadowLooper)org.robolectric.shadow.api.Shadow.extract(Looper.getMainLooper())).idle();assertEquals(List.of(TARGET),packages.opened);
-        assertTrue(server.intercept(BridgeContract.HOST_PACKAGE,HOST_UID,0,marker(token)));
-        ((org.robolectric.shadows.ShadowLooper)org.robolectric.shadow.api.Shadow.extract(Looper.getMainLooper())).idle();assertEquals(1,packages.opened.size());
-        assertFalse(context.getSharedPreferences("framework_test",0).getAll().toString().contains(URL));
-    }
-    @Test public void launchTicketReusesThePlanResolvedDuringPrepare(){
-        List<String> events=new ArrayList<>();
-        server=new RuntimeServer(context,new Handler(Looper.getMainLooper()),()->stored,packages,events::add);
-        String token=prepared();
-        assertEquals(1,events.stream().filter(line->line.contains("runtime perf stage=route_plan ")).count());
-        server.intercept(BridgeContract.HOST_PACKAGE,HOST_UID,0,marker(token));
-        ((org.robolectric.shadows.ShadowLooper)org.robolectric.shadow.api.Shadow.extract(Looper.getMainLooper())).idle();
-        assertEquals(1,events.stream().filter(line->line.contains("runtime perf stage=route_plan ")).count());
-        assertEquals(List.of(TARGET),packages.opened);
-    }
     @Test public void snapshotParsingIsReusedButFrameworkEditsAreReadImmediately(){
         List<String> events=new ArrayList<>();
-        server=new RuntimeServer(context,new Handler(Looper.getMainLooper()),()->stored,packages,events::add);
-        assertEquals(TARGET,server.handle(HOST_UID,"resolve",request()).getString("target"));
+        server=new RuntimeServer(context,new Handler(Looper.getMainLooper()),()->stored,events::add);
+        assertNotNull(server.handle(HOST_UID,"source_scope",null).getString("policy"));
         events.clear();
-        assertEquals(TARGET,server.handle(HOST_UID,"resolve",request()).getString("target"));
+        assertNotNull(server.handle(HOST_UID,"source_scope",null).getString("policy"));
         assertFalse(events.stream().anyMatch(line->line.contains("runtime perf stage=snapshot_read ")));
         config.setEnabled(false);publish();events.clear();
-        assertEquals("disabled",server.handle(HOST_UID,"resolve",request()).getString("reason"));
+        assertNotNull(server.handle(HOST_UID,"source_scope",null).getString("policy"));
         assertTrue(events.stream().anyMatch(line->line.contains("runtime perf stage=snapshot_read ")
                 && line.contains("outcome=parsed")));
-    }
-    @Test public void stockHostRequestCodeZeroActuallyDispatchesTheFrozenTarget()throws Exception {
-        java.util.List<Intent> opened=new java.util.ArrayList<>();
-        int originalUid=android.os.Process.myUid();
-        try {
-            org.robolectric.shadows.ShadowProcess.setUid(1000);
-            SystemPackageOps actual=new SystemPackageOps(context,(intent,user)->opened.add(new Intent(intent)));
-            var pm=(org.robolectric.shadows.ShadowPackageManager)org.robolectric.shadow.api.Shadow.extract(context.getPackageManager());
-            android.content.pm.ActivityInfo activity=new android.content.pm.ActivityInfo();activity.packageName=TARGET;activity.name=TARGET+".Link";
-            activity.applicationInfo=context.getPackageManager().getApplicationInfo(TARGET,android.content.pm.PackageManager.MATCH_DISABLED_COMPONENTS);
-            activity.enabled=true;activity.exported=true;pm.addOrUpdateActivity(activity);
-            var filter=new android.content.IntentFilter(Intent.ACTION_VIEW);filter.addCategory(Intent.CATEGORY_DEFAULT);filter.addDataScheme("https");
-            pm.addIntentFilterForActivity(new ComponentName(TARGET,activity.name),filter);
-            server=new RuntimeServer(context,new Handler(Looper.getMainLooper()),()->stored,actual,s->{});
-            String token=prepared();
-            assertTrue(RuntimeLaunchEntry.dispatch(server,BridgeContract.HOST_PACKAGE,HOST_UID,-2,marker(token),null,0,null));
-            ((org.robolectric.shadows.ShadowLooper)org.robolectric.shadow.api.Shadow.extract(Looper.getMainLooper())).idle();
-            assertTrue(context.getPackageManager().getApplicationInfo(TARGET,0).enabled);
-            assertFalse(context.getPackageManager().getApplicationInfo(BridgeContract.APP_PACKAGE,android.content.pm.PackageManager.MATCH_DISABLED_COMPONENTS).enabled);
-            assertEquals(1,opened.size());assertEquals(URL,opened.get(0).getDataString());assertEquals(TARGET,opened.get(0).getPackage());
-        }finally{org.robolectric.shadows.ShadowProcess.setUid(originalUid);}
-    }
-    @Test public void actualResultRequestIsNotClaimedAndDoesNotConsumeATicket(){
-        String token=prepared();
-        assertFalse(RuntimeLaunchEntry.dispatch(server,BridgeContract.HOST_PACKAGE,HOST_UID,0,marker(token),new Object(),0,null));
-        assertTrue(RuntimeLaunchEntry.dispatch(server,BridgeContract.HOST_PACKAGE,HOST_UID,0,marker(token),null,0,null));
-        ((org.robolectric.shadows.ShadowLooper)org.robolectric.shadow.api.Shadow.extract(Looper.getMainLooper())).idle();
-        assertEquals(1,packages.opened.size());
-    }
-    @Test public void entryPolicyNeverClaimsAnOrdinaryOrUnauthorizedLaunch(){
-        String token=prepared();
-        assertFalse(RuntimeLaunchEntry.dispatch(server,BridgeContract.HOST_PACKAGE,HOST_UID,0,new Intent(Intent.ACTION_VIEW,android.net.Uri.parse(URL)),null,0,null));
-        assertFalse(RuntimeLaunchEntry.dispatch(server,"com.example.other",22001,0,marker(token),null,0,null));
-        assertTrue(RuntimeLaunchEntry.dispatch(server,BridgeContract.HOST_PACKAGE,HOST_UID,0,marker(token),null,0,null));
-        ((org.robolectric.shadows.ShadowLooper)org.robolectric.shadow.api.Shadow.extract(Looper.getMainLooper())).idle();
-        assertEquals(1,packages.opened.size());
-    }
-    @Test public void ticketCannotBeUsedByAnotherCaller(){
-        String token=prepared();assertFalse(server.intercept(BridgeContract.HOST_PACKAGE,22001,0,marker(token)));
-        assertTrue(server.intercept(BridgeContract.HOST_PACKAGE,HOST_UID,0,marker(token)));
-        ((org.robolectric.shadows.ShadowLooper)org.robolectric.shadow.api.Shadow.extract(Looper.getMainLooper())).idle();assertEquals(1,packages.opened.size());
-    }
-    @Test public void disablingOrEditingConfigurationCancelsAlreadyPreparedLaunch(){
-        String token=prepared();config.setEnabled(false);publish();
-        server.intercept(BridgeContract.HOST_PACKAGE,HOST_UID,0,marker(token));((org.robolectric.shadows.ShadowLooper)org.robolectric.shadow.api.Shadow.extract(Looper.getMainLooper())).idle();
-        assertTrue(packages.opened.isEmpty());assertEquals("disabled",server.handle(HOST_UID,"prepare",request()).getString("reason"));
-    }
-    @Test public void expiredTicketNeverOpensLate(){
-        String token=prepared();ShadowSystemClock.advanceBy(Duration.ofSeconds(21));
-        server.intercept(BridgeContract.HOST_PACKAGE,HOST_UID,0,marker(token));((org.robolectric.shadows.ShadowLooper)org.robolectric.shadow.api.Shadow.extract(Looper.getMainLooper())).idle();assertTrue(packages.opened.isEmpty());
-    }
-    @Test public void changedForegroundAndLockedScreenRejectOpening(){
-        String token=prepared();foreground("com.example.other");server.intercept(BridgeContract.HOST_PACKAGE,HOST_UID,0,marker(token));
-        ((org.robolectric.shadows.ShadowLooper)org.robolectric.shadow.api.Shadow.extract(Looper.getMainLooper())).idle();assertTrue(packages.opened.isEmpty());
-        foreground(SOURCE);token=prepared();((org.robolectric.shadows.ShadowKeyguardManager)org.robolectric.shadow.api.Shadow.extract(context.getSystemService(KeyguardManager.class))).setKeyguardLocked(true);
-        server.intercept(BridgeContract.HOST_PACKAGE,HOST_UID,0,marker(token));((org.robolectric.shadows.ShadowLooper)org.robolectric.shadow.api.Shadow.extract(Looper.getMainLooper())).idle();assertTrue(packages.opened.isEmpty());
-    }
-    @Test public void clipboardUnknownSourcePinsTheForegroundAtClickTime(){
-        Bundle data=request();data.remove("source");String token=server.handle(HOST_UID,"prepare",data).getString("system_token");assertNotNull(token);
-        server.intercept(BridgeContract.HOST_PACKAGE,HOST_UID,0,marker(token));
-        ((org.robolectric.shadows.ShadowLooper)org.robolectric.shadow.api.Shadow.extract(Looper.getMainLooper())).idle();
-        assertEquals(1,packages.opened.size());
-    }
-    @Test public void workProfileOrAnotherDisplayCannotAuthorizeOwnerLaunch()throws Exception {
-        String token=prepared();ActivityManager.RunningTaskInfo task=new ActivityManager.RunningTaskInfo();task.topActivity=new ComponentName(SOURCE,SOURCE+".Main");
-        task.getClass().getField("userId").setInt(task,10);
-        ((org.robolectric.shadows.ShadowActivityManager)org.robolectric.shadow.api.Shadow.extract(context.getSystemService(ActivityManager.class))).setTasks(List.of(task));
-        server.intercept(BridgeContract.HOST_PACKAGE,HOST_UID,0,marker(token));
-        ((org.robolectric.shadows.ShadowLooper)org.robolectric.shadow.api.Shadow.extract(Looper.getMainLooper())).idle();
-        assertTrue(packages.opened.isEmpty());
     }
     @Test public void captureTicketRequiresMatchingNonceUserAndOneTake(){
         config.setScopeLinkProbeEnabled(true);publish();
@@ -549,7 +416,7 @@ public final class RuntimeServerAndroidTest {
         Bundle origin=new Bundle();origin.putString("source",SOURCE);
         String nonce=server.handle(HOST_UID,"probe_arm",origin).getString("nonce");
         Bundle data=new Bundle();data.putString("nonce",nonce);server.systemCall(0,"capture_take",data);
-        assertTrue(server.captureValid(nonce,0));config.setIndependentEnabled(false);publish();assertFalse(server.captureValid(nonce,0));
+        assertTrue(server.captureValid(nonce,0));config.setCaptureEnabled(false);publish();assertFalse(server.captureValid(nonce,0));
     }
     @Test public void disablingSupplementalTapRevokesAnArmedRuntimeProbe() {
         config.setScopeLinkProbeEnabled(true); publish();
@@ -563,28 +430,21 @@ public final class RuntimeServerAndroidTest {
         assertNull(server.handle(HOST_UID, "probe_arm", request).getString("nonce"));
     }
     @Test public void configurationSurvivesRuntimeObjectRestartWithoutProvider(){
-        server=new RuntimeServer(context,new Handler(Looper.getMainLooper()),()->stored,packages,s->{});
-        assertEquals(TARGET,server.handle(HOST_UID,"resolve",request()).getString("target"));
+        server=new RuntimeServer(context,new Handler(Looper.getMainLooper()),()->stored,s->{});
+        assertNotNull(server.handle(HOST_UID,"source_scope",null).getString("policy"));
     }
     @Test public void corruptMissingOrOldBuildSnapshotsNeverUseDefaults(){
         String raw=stored.getString(RuntimeSnapshot.KEY,null);
         for(String value:List.of("broken",raw.replace("\"build\":"+io.github.yudigaga.taplusbridge.BuildConfig.VERSION_CODE,"\"build\":1"))){
-            stored.edit().putString(RuntimeSnapshot.KEY,value).commit();assertEquals("runtime_unavailable",server.handle(HOST_UID,"resolve",request()).getString("reason"));
+            stored.edit().putString(RuntimeSnapshot.KEY,value).commit();assertEquals("runtime_unavailable",server.handle(HOST_UID,"source_scope",null).getString("reason"));
         }
     }
-    @Test public void independentSwitchRevokesFrozenRuntime(){
-        config.setIndependentEnabled(false);publish();assertEquals("runtime_unavailable",server.handle(HOST_UID,"resolve",request()).getString("reason"));
-    }
-    @Test public void uninstallIsNotTreatedAsFreezing(){
+    @Test public void uninstalledModuleCannotProvideSystemConfiguration(){
         ((org.robolectric.shadows.ShadowPackageManager)org.robolectric.shadow.api.Shadow.extract(context.getPackageManager())).removePackage(BridgeContract.APP_PACKAGE);
-        assertEquals("runtime_unavailable",server.handle(HOST_UID,"resolve",request()).getString("reason"));
-    }
-    @Test public void noModuleOrHostTargetCanBeThawedFromRules(){
-        new RuleRepository(context).replaceManualRules(List.of(new io.github.yudigaga.taplusbridge.rules.LinkRuleEntry("*","configured.example",BridgeContract.APP_PACKAGE,"manual","none","")));
-        publish();assertNull(server.handle(HOST_UID,"prepare",request()).getString("system_token"));
+        assertEquals("runtime_unavailable",server.handle(HOST_UID,"source_scope",null).getString("reason"));
     }
 
-    @Test public void frozenModuleStatusPublishesTheAuthenticatedSnapshotInsteadOfLiveOrCallerSuppliedSelections()throws Exception {
+    @Test public void systemStatusPublishesTheAuthenticatedSnapshotInsteadOfLiveOrCallerSuppliedSelections()throws Exception {
         assertTrue(config.saveSourceScope(SourceScopePolicy.Mode.BLACKLIST,List.of(SOURCE),List.of()));
         publish();
         String expectedIdentity=RuntimeSnapshot.parse(stored.getString(RuntimeSnapshot.KEY,null)).identity;
@@ -635,6 +495,8 @@ public final class RuntimeServerAndroidTest {
 
         JSONObject legacy=new JSONObject(stored.getString(RuntimeSnapshot.KEY,null));
         legacy.remove(ConfigStore.CLOUD_LINK_HANDOFF_KEY);
+        legacy.remove("routing_identity");
+        legacy.put("native",true).put("independent",true).put("mode","ROOT").put("rules",new JSONArray());
         legacy.put("schema",1);legacy.remove(SourceScopePolicy.KEY);legacy.remove(ConfigStore.SCOPE_CAPTURE_KEY);legacy.remove(ConfigStore.SCOPE_LINK_PROBE_KEY);
         legacy.remove(DragSettings.KEY);legacy.remove(io.github.yudigaga.taplusbridge.config.RecognitionChannels.KEY);
         assertEquals(10,legacy.length());
@@ -644,9 +506,9 @@ public final class RuntimeServerAndroidTest {
         assertEquals(previous,Settings.Global.getString(context.getContentResolver(),SourceScopePublisher.KEY));
     }
 
-    @Test public void sourceScopeWorksWhenIndependentLinkRoutingIsDisabled()throws Exception {
+    @Test public void sourceScopeWorksWithoutSystemLinkRouting()throws Exception {
         assertTrue(config.saveSourceScope(SourceScopePolicy.Mode.BLACKLIST,List.of(SOURCE),List.of()));
-        config.setIndependentEnabled(false);publish();
+        publish();
 
         Bundle scope=server.handle(HOST_UID,"source_scope",null);
 
@@ -654,7 +516,7 @@ public final class RuntimeServerAndroidTest {
         assertFalse(SourceScopePolicy.parse(scope.getString("policy")).allows(SOURCE));
         assertTrue(server.handle(MODULE_UID,"status",null).getBoolean("scope_ready"));
         assertEquals(List.of(SOURCE),globalSourceBlacklist());
-        assertEquals("runtime_unavailable",server.handle(HOST_UID,"resolve",request()).getString("reason"));
+        assertEquals("unsupported_request",server.handle(HOST_UID,"resolve",request()).getString("reason"));
     }
 
     @Test public void unverifiedSnapshotsCannotPublishSourceScope()throws Exception {
@@ -705,11 +567,11 @@ public final class RuntimeServerAndroidTest {
         assertEquals(RuntimeSnapshot.parse(stored.getString(RuntimeSnapshot.KEY,null)).identity,capture.lastConfig.identity);
         String previous=capture.lastConfig.identity;
         assertTrue(config.saveSourceScope(SourceScopePolicy.Mode.WHITELIST,List.of(TARGET),List.of(SOURCE)));
-        config.setIndependentEnabled(false);publish();server.handle(HOST_UID,"scope_capture_take",injected);
+        publish();server.handle(HOST_UID,"scope_capture_take",injected);
         assertNotEquals(previous,capture.lastConfig.identity);
         assertEquals(SourceScopePolicy.Mode.WHITELIST,capture.lastConfig.sourceScope.mode);
         assertEquals(java.util.Set.of(SOURCE),capture.lastConfig.sourceScope.whitelist);
-        assertFalse(capture.lastConfig.independent);
+
         config.setEnabled(false);publish();
         assertTrue(server.handle(HOST_UID,"scope_capture_take",injected).isEmpty());
         assertEquals(2,capture.takes);
@@ -739,8 +601,8 @@ public final class RuntimeServerAndroidTest {
         publish();assertNotNull(server.sourceCaptureConfiguration());assertNotNull(server.sourceContentConfiguration());
         assertFalse(server.sourceCaptureConfiguration().scopeCapture);assertFalse(server.sourceCaptureConfiguration().scopeLinkProbe);
         assertTrue(config.saveSourceScope(SourceScopePolicy.Mode.BLACKLIST,List.of(),List.of(),true));
-        config.setIndependentEnabled(false);publish();
-        RuntimeSnapshot accepted=server.sourceCaptureConfiguration();assertNotNull(accepted);assertFalse(accepted.independent);
+        publish();
+        RuntimeSnapshot accepted=server.sourceCaptureConfiguration();assertNotNull(accepted);
         assertTrue(accepted.scopeCapture);
         assertTrue(config.saveSourceScope(SourceScopePolicy.Mode.BLACKLIST,List.of(),List.of(),false));
         publish();assertNotNull(server.sourceCaptureConfiguration());
@@ -812,9 +674,4 @@ public final class RuntimeServerAndroidTest {
         List<String> result=new ArrayList<>();for(int i=0;i<array.length();i++)result.add(array.getString(i));return result;
     }
 
-    static final class FakePackages extends SystemPackageOps {
-        final List<String> opened=new ArrayList<>();
-        public boolean ready(){return true;}
-        public void thawAndOpen(LaunchPlanner.Plan plan,java.util.function.BooleanSupplier allowed){if(allowed.getAsBoolean())opened.add(plan.targetPackage());}
-    }
 }

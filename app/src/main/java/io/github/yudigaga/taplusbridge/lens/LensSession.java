@@ -30,12 +30,14 @@ import android.webkit.WebResourceResponse;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
+import io.github.yudigaga.taplusbridge.runtime.ModuleProcessLifecycle;
 import java.io.File;
 import java.io.IOException;
 import java.util.Locale;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Matcher;
@@ -45,10 +47,9 @@ import java.util.regex.Pattern;
 final class LensSession {
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
     private static final String TAG = "TaplusBridge-Lens";
-    private static final ExecutorService IO = Executors.newSingleThreadExecutor(r -> {
-        Thread t = new Thread(r, "TaplusBridge-Lens-image"); t.setDaemon(true); return t;
-    });
     private static LensSession active;
+    private final ExecutorService worker = imageWorker();
+    private final ModuleProcessLifecycle.Lease workLease = ModuleProcessLifecycle.acquire();
     private final Context context;
     private final Bundle request;
     private final ILensCallback callback;
@@ -71,6 +72,15 @@ final class LensSession {
     private SurfaceControlViewHost browserHost;
     private FrameLayout browserContainer;
 
+    private static ExecutorService imageWorker() {
+        ThreadPoolExecutor executor = new ThreadPoolExecutor(1, 1, 3, TimeUnit.SECONDS,
+                new LinkedBlockingQueue<>(), task -> {
+                    Thread thread = new Thread(task, "TaplusBridge-Lens-image"); thread.setDaemon(true); return thread;
+                });
+        executor.allowCoreThreadTimeOut(true);
+        return executor;
+    }
+
     private LensSession(Context context, ParcelFileDescriptor image, Bundle request, ILensCallback callback) {
         this.context = context.getApplicationContext(); this.incoming = image;
         this.request = request; this.callback = callback;
@@ -85,7 +95,7 @@ final class LensSession {
         session.send("loading", "正在准备当前图片");
         if (session.done) return;
         MAIN.postDelayed(session.timeout, 120_000);
-        IO.execute(session::prepareImage);
+        session.worker.execute(session::prepareImage);
     }
 
     static void cancel(String requestId) {
@@ -258,7 +268,7 @@ final class LensSession {
         LensUploadClient submitted = uploader;
         send("loading", "正在自动上传当前图片并搜索…");
         if (done) return;
-        IO.execute(() -> {
+        worker.execute(() -> {
             android.util.Log.i(TAG, "upload_started");
             LensUploadClient.Result result = submitted.upload(image, mime, width, height, Locale.getDefault(), () -> done);
             android.util.Log.i(TAG, "upload_state=" + result.status + " http=" + result.httpStatus
@@ -530,19 +540,22 @@ final class LensSession {
     private void complete() {
         if (done) return;
         done = true; if (active == this) active = null;
-        MAIN.removeCallbacks(timeout); MAIN.removeCallbacks(poll);
-        if (uploader != null) uploader.cancel();
-        try { callback.asBinder().unlinkToDeath(death, 0); } catch (java.util.NoSuchElementException ignored) { }
-        if (interactionIntent != null) { interactionIntent.cancel(); interactionIntent = null; }
-        if (sessionViewerIntent != null) { sessionViewerIntent.cancel(); sessionViewerIntent = null; }
-        LensService.close(incoming); incoming = null;
-        releaseBrowser();
-        if (web != null) {
-            if (web.getParent() instanceof ViewGroup old) old.removeView(web);
-            web.stopLoading(); web.destroy(); web = null;
-        }
-        if (imageFile != null) imageFile.delete(); imageFile = null;
-        if (interaction != null) { LensInteractionActivity activity = interaction; interaction = null; activity.finish(); }
-        android.util.Log.i(TAG, "cleanup generation=" + generation);
+        worker.shutdownNow();
+        try {
+            MAIN.removeCallbacks(timeout); MAIN.removeCallbacks(poll);
+            if (uploader != null) { uploader.cancel(); uploader = null; }
+            try { callback.asBinder().unlinkToDeath(death, 0); } catch (java.util.NoSuchElementException ignored) { }
+            if (interactionIntent != null) { interactionIntent.cancel(); interactionIntent = null; }
+            if (sessionViewerIntent != null) { sessionViewerIntent.cancel(); sessionViewerIntent = null; }
+            LensService.close(incoming); incoming = null;
+            releaseBrowser();
+            if (web != null) {
+                if (web.getParent() instanceof ViewGroup old) old.removeView(web);
+                web.stopLoading(); web.destroy(); web = null;
+            }
+            if (imageFile != null) imageFile.delete(); imageFile = null;
+            if (interaction != null) { LensInteractionActivity activity = interaction; interaction = null; activity.finish(); }
+            android.util.Log.i(TAG, "cleanup generation=" + generation);
+        } finally { workLease.close(); }
     }
 }

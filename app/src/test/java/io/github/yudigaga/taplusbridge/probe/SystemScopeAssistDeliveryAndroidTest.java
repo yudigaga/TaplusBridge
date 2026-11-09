@@ -27,7 +27,6 @@ import io.github.yudigaga.taplusbridge.hook.HostPolicy;
 import io.github.yudigaga.taplusbridge.hook.ScopeCapturePayload;
 import io.github.yudigaga.taplusbridge.runtime.RuntimeServer;
 import io.github.yudigaga.taplusbridge.runtime.RuntimeSnapshot;
-import io.github.yudigaga.taplusbridge.runtime.SystemPackageOps;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.List;
@@ -100,7 +99,7 @@ public final class SystemScopeAssistDeliveryAndroidTest {
         host.applicationInfo.uid = HOST_UID; host.applicationInfo.enabled = true;
         ((ShadowPackageManager) Shadow.extract(context.getPackageManager())).installPackage(host);
         Handler worker = new Handler(Looper.getMainLooper());
-        runtime = new RuntimeServer(context, worker, () -> stored, new SystemPackageOps() {}, ignored -> {});
+        runtime = new RuntimeServer(context, worker, () -> stored, ignored -> {});
         physical = new PhysicalTouchState();
         atms = new ScopeCaptureWindowAndroidTest.Atms();
         var main = new ScopeCaptureWindowAndroidTest.Window(); main.mActivityRecord.main = main;

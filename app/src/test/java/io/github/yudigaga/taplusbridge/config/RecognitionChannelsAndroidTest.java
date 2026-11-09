@@ -89,12 +89,12 @@ public final class RecognitionChannelsAndroidTest {
     @Test public void snapshotCarriesIndependentChoicesAndLegacyFiveKeepsAllSourcesEnabled()throws Exception {
         invoke(config,"setRecognitionChannel",new Class<?>[]{channelType(),boolean.class},channel("SERVER"),false);
         String raw=RuntimeSnapshot.from(context);
-        assertEquals(7,new JSONObject(raw).getInt("schema"));
+        assertEquals(8,new JSONObject(raw).getInt("schema"));
         assertFalse(new JSONObject(raw).getJSONObject(KEY).getBoolean("server"));
         RuntimeSnapshot snapshot=RuntimeSnapshot.parse(raw);
         Object choices=RuntimeSnapshot.class.getField("channels").get(snapshot);
         assertFalse(enabled(choices,"SERVER"));assertTrue(enabled(choices,"OCR"));
-        JSONObject legacy=new JSONObject(raw).put("schema",5);legacy.remove(KEY);
+        JSONObject legacy=legacySnapshot(raw).put("schema",5);legacy.remove(KEY);
         legacy.remove(ConfigStore.CLOUD_LINK_HANDOFF_KEY);
         Object old=RuntimeSnapshot.class.getField("channels").get(RuntimeSnapshot.parse(legacy.toString()));
         for(String name:List.of("NATIVE","ASSIST","OCR","SERVER","SEGMENT","CLIPBOARD"))assertTrue(enabled(old,name));
@@ -103,7 +103,7 @@ public final class RecognitionChannelsAndroidTest {
     }
 
     @Test public void schemaSixRequiresExactlySixStrictBooleanChannelChoices()throws Exception {
-        JSONObject current=new JSONObject(RuntimeSnapshot.from(context)).put("schema",6).put(KEY,new JSONObject(ALL));
+        JSONObject current=legacySnapshot(RuntimeSnapshot.from(context)).put("schema",6).put(KEY,new JSONObject(ALL));
         current.remove(ConfigStore.CLOUD_LINK_HANDOFF_KEY);
         RuntimeSnapshot.parse(current.toString());
         JSONObject missing=new JSONObject(current.toString());missing.remove(KEY);
@@ -114,6 +114,12 @@ public final class RecognitionChannelsAndroidTest {
         }
         String unversioned=new JSONObject(current.toString()).put("schema",5).toString();
         assertThrows(IllegalArgumentException.class,()->RuntimeSnapshot.parse(unversioned));
+    }
+
+    private static JSONObject legacySnapshot(String raw) throws Exception {
+        JSONObject data=new JSONObject(raw);data.remove("routing_identity");
+        return data.put("native",true).put("independent",false).put("mode","ROOT")
+                .put("rules",new org.json.JSONArray());
     }
 
     private static Class<?> type() {

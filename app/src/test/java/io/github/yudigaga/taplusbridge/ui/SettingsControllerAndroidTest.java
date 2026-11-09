@@ -82,6 +82,27 @@ public final class SettingsControllerAndroidTest {
         if (!owner.get().isDestroyed()) owner.pause().stop().destroy();
     }
 
+    @Test public void settingsJobsHoldTheProcessOnlyWhileTheirWorkIsRunning() throws Exception {
+        Class<?> lifecycle=io.github.yudigaga.taplusbridge.runtime.ModuleProcessLifecycle.class;
+        Method install=lifecycle.getDeclaredMethod("installForTest",android.os.Handler.class,Runnable.class);install.setAccessible(true);
+        Method count=lifecycle.getDeclaredMethod("activeLeaseCountForTest");count.setAccessible(true);
+        Method reset=lifecycle.getDeclaredMethod("resetForTest");reset.setAccessible(true);
+        install.invoke(null,new android.os.Handler(Looper.getMainLooper()),(Runnable)()->{});
+        try {
+            controller.close();worker=new QueuedExecutor();AtomicInteger duringWork=new AtomicInteger();
+            controller=new SettingsController(owner.get(),worker,()->{
+                try { duringWork.set((Integer)count.invoke(null)); }
+                catch(Exception failure){throw new AssertionError(failure);}
+                return ThawEngine.thaw(context,null,ThawEngine.Mode.ROOT);
+            });
+            controller.probeRoot(ignored->{});
+            assertEquals("Queued work has no hold to leak if cancelled",0,((Integer)count.invoke(null)).intValue());
+            worker.runNext();
+            assertEquals("An active settings request must survive page backgrounding",1,duringWork.get());
+            assertEquals("Completed settings work releases its hold",0,((Integer)count.invoke(null)).intValue());
+        } finally { reset.invoke(null); }
+    }
+
     @Test public void theCloudAdapterSwitchUpdatesTheSnapshotAndCannotBeSavedAfterClosing() {
         assertTrue(controller.snapshot().cloudLinkHandoffEnabled);
         controller.setCloudLinkHandoffEnabled(false);

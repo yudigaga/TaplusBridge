@@ -32,6 +32,7 @@ import io.github.yudigaga.taplusbridge.config.ConfigStore;
 import io.github.yudigaga.taplusbridge.config.DragSettings;
 import io.github.yudigaga.taplusbridge.hook.HostPolicy;
 import io.github.yudigaga.taplusbridge.runtime.RuntimeClient;
+import io.github.yudigaga.taplusbridge.runtime.ModuleProcessLifecycle;
 import io.github.yudigaga.taplusbridge.ui.TransitActivity;
 import io.github.yudigaga.taplusbridge.ui.DragMenuUi;
 import io.github.yudigaga.taplusbridge.recognition.RouteLink;
@@ -59,6 +60,7 @@ public final class DragActivity extends ComponentActivity {
     private DragPayload payload;
     private DragAndDropPermissions permissions;
     private Future<?> readTask;
+    private ModuleProcessLifecycle.Lease readLease;
     private DropView target;
     private boolean dropped, destroyed, reading;
     private int generation;
@@ -129,24 +131,30 @@ public final class DragActivity extends ComponentActivity {
     private void read(ClipData data, String action) {
         reading = true; target.busy = true; target.invalidate();
         int expected = ++generation;
-        readTask = IO.submit(() -> {
+        ModuleProcessLifecycle.Lease lease = ModuleProcessLifecycle.acquire(15_000); readLease = lease;
+        try { readTask = IO.submit(() -> {
             DragPayload result = null; String error = null;
             try { result = DragPayload.read(getApplicationContext(), data, source, cancelled); }
             catch (IOException | RuntimeException unavailable) { error = unavailable.getMessage(); }
             DragPayload ready = result; String message = error;
-            main.post(() -> {
-                releasePermissions();
-                if (destroyed || isFinishing() || generation != expected) { if (ready != null) ready.close(); return; }
-                reading = false;
-                if (ready == null) { fail(message == null ? "无法读取拖拽内容" : message); return; }
-                payload = ready; target.busy = false;
-                if (!new ConfigStore(this).getDragSettings().enabled) { finish(); return; }
-                handoff(action, true);
-            });
-        });
+            if (!main.post(() -> {
+                try {
+                    releasePermissions();
+                    if (destroyed || isFinishing() || generation != expected) { if (ready != null) ready.close(); return; }
+                    reading = false;
+                    if (ready == null) { fail(message == null ? "无法读取拖拽内容" : message); return; }
+                    payload = ready; target.busy = false;
+                    if (!new ConfigStore(this).getDragSettings().enabled) { finish(); return; }
+                    handoff(action, true);
+                } finally { lease.close(); if (readLease == lease) readLease = null; }
+            })) { if (ready != null) ready.close(); lease.close(); }
+        }); } catch (RuntimeException unavailable) {
+            lease.close(); readLease = null; releasePermissions(); fail("无法读取拖拽内容，请重试"); return;
+        }
         main.postDelayed(() -> {
             if (!destroyed && generation == expected && reading && !isFinishing()) {
                 ++generation; cancelled.cancel(); if (readTask != null) readTask.cancel(true);
+                if (readLease != null) { readLease.close(); readLease = null; }
                 releasePermissions(); fail("读取拖拽内容超时，请重试");
             }
         }, 12_000);
@@ -488,6 +496,7 @@ public final class DragActivity extends ComponentActivity {
     @Override protected void onDestroy() {
         destroyed = true; ++generation; cancelled.cancel();
         if (readTask != null) readTask.cancel(true);
+        if (readLease != null) { readLease.close(); readLease = null; }
         if (target != null) target.dispose();
         releasePermissions(); if (payload != null) { payload.close(); payload = null; }
         super.onDestroy();

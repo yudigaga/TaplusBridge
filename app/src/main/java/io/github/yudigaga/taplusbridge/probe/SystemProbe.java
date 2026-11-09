@@ -243,15 +243,6 @@ public final class SystemProbe {
         module.hook(entry).setId("taplusbridge:invisible-probe-binder")
                 .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).intercept(chain -> {
                     if (atmsInstance == null) atmsInstance = chain.getThisObject();
-                    if(io.github.yudigaga.taplusbridge.runtime.RuntimeLaunchEntry.dispatch(runtime,(String)chain.getArg(1),
-                            Binder.getCallingUid(),(Integer)chain.getArg(11),(Intent)chain.getArg(3),
-                            chain.getArg(5),(Integer)chain.getArg(7),chain.getArg(9))) {
-                        try {
-                            Bundle options=(Bundle)chain.getArg(10);
-                            if(options!=null){Object decoded=optionsFromBundle.invoke(null,options);if(decoded!=null)optionsAbort.invoke(decoded);}
-                        }catch(ReflectiveOperationException|RuntimeException unavailable){module.log(5,TAG,"Runtime options cancellation limited");}
-                        return 0;
-                    }
                     int callerUid = Binder.getCallingUid();
                     long identity = Binder.clearCallingIdentity();
                     boolean consumed;
@@ -337,12 +328,12 @@ public final class SystemProbe {
                 java.util.function.Consumer<String> runtimeLogger=message->module.log(4,TAG,message);
                 var candidate=new io.github.yudigaga.taplusbridge.runtime.RuntimeServer(context,worker,
                         ()->module.getRemotePreferences(io.github.yudigaga.taplusbridge.runtime.RuntimeSnapshot.GROUP),
-                        new io.github.yudigaga.taplusbridge.runtime.SystemPackageOps(context,runtimeLogger),runtimeLogger);
+                        runtimeLogger);
                 candidate.setSourceCapture(scopeCapture);
                 candidate.setDragGestures(longPressDrag);
                 candidate.register();runtime=candidate;
-            }catch(ReflectiveOperationException|RuntimeException unavailable){
-                module.log(5,TAG,"Frozen runtime unavailable: "+unavailable.getClass().getSimpleName());
+            }catch(RuntimeException unavailable){
+                module.log(5,TAG,"System configuration bridge unavailable: "+unavailable.getClass().getSimpleName());
             }
             InputAdapter adapter = new InputAdapter(context, physical, pointEcho);
             if (scopeCapture != null && linkLaunchReady && scopeCapture.linkProbe() == null) {

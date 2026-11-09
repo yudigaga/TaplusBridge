@@ -23,7 +23,6 @@ import io.github.yudigaga.taplusbridge.config.SourceScopePolicy;
 import io.github.yudigaga.taplusbridge.hook.HostPolicy;
 import io.github.yudigaga.taplusbridge.runtime.RuntimeServer;
 import io.github.yudigaga.taplusbridge.runtime.RuntimeSnapshot;
-import io.github.yudigaga.taplusbridge.runtime.SystemPackageOps;
 import java.lang.reflect.Method;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -93,7 +92,7 @@ public final class SystemScopeImageDeliveryAndroidTest {
         host.applicationInfo.uid = 22002;
         host.applicationInfo.enabled = true;
         ((ShadowPackageManager) Shadow.extract(context.getPackageManager())).installPackage(host);
-        runtime = new RuntimeServer(context, worker, () -> stored, new SystemPackageOps() {}, ignored -> {});
+        runtime = new RuntimeServer(context, worker, () -> stored, ignored -> {});
         physical = new PhysicalTouchState();
         long released = SystemClock.uptimeMillis();
         physical.event(0, 1, released, released, MotionEvent.ACTION_UP, released);

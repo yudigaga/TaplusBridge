@@ -7,18 +7,21 @@ import android.os.Looper;
 import io.github.libxposed.service.XposedService;
 import io.github.libxposed.service.XposedServiceHelper;
 import io.github.yudigaga.taplusbridge.rules.RuleRepository;
-import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
-/** Publish complete rule/config identities to the framework; never a transient empty fallback. */
+/** Publish complete system configuration identities and wait for their acknowledgement. */
 public final class RuntimePublisher {
     private static volatile RuntimePublisher instance;
     private final Context app;
     private final Handler main=new Handler(Looper.getMainLooper());
-    private final java.util.concurrent.ExecutorService worker=Executors.newSingleThreadExecutor(r->{Thread t=new Thread(r,"TaplusBridge-config-sync");t.setDaemon(true);return t;});
+    private final ThreadPoolExecutor worker=createWorker();
     private final AtomicLong generation=new AtomicLong();
+    private ModuleProcessLifecycle.Lease publicationLease;
     private volatile XposedService service;
-    private volatile String message="等待框架连接，暂不可冻结本体";
+    private volatile String message="等待框架连接，系统尚未确认配置";
     private final SharedPreferences config,rules;
     private final SharedPreferences.OnSharedPreferenceChangeListener changed=(p,k)->schedule();
     private RuntimePublisher(Context context){
@@ -26,7 +29,7 @@ public final class RuntimePublisher {
         config.registerOnSharedPreferenceChangeListener(changed);rules.registerOnSharedPreferenceChangeListener(changed);
         XposedServiceHelper.registerListener(new XposedServiceHelper.OnServiceListener(){
             public synchronized void onServiceBind(XposedService value){service=value;schedule();}
-            public synchronized void onServiceDied(XposedService value){if(service==value){generation.incrementAndGet();service=null;message="框架连接已断开，系统尚未确认配置";}}
+            public synchronized void onServiceDied(XposedService value){if(service==value){cancelPublication();service=null;message="框架连接已断开，系统尚未确认配置";}}
         });
     }
     public static synchronized void start(Context context){if(instance==null)try{instance=new RuntimePublisher(context);}catch(RuntimeException unavailable){android.util.Log.w("TaplusBridge","runtime sync unavailable: "+unavailable.getClass().getSimpleName());}}
@@ -36,20 +39,36 @@ public final class RuntimePublisher {
         start(context);RuntimePublisher active=instance;
         if(active!=null){
             active.message="本体已保存，等待系统同步";
-            long expected=active.generation.incrementAndGet();
+            long expected=active.beginPublication();
             active.worker.submit(()->active.publish(expected));
         }
     }
-    public static String status(){RuntimePublisher active=instance;return active==null?"等待框架连接，暂不可冻结本体":active.message;}
+    public static String status(){RuntimePublisher active=instance;return active==null?"等待框架连接，系统尚未确认配置":active.message;}
     private void schedule(){
         message="配置已更改，等待系统同步";
-        long expected=generation.incrementAndGet();main.postDelayed(()->{if(expected==generation.get())worker.submit(()->publish(expected));},100);
+        long expected=beginPublication();main.postDelayed(()->{if(expected==generation.get())worker.submit(()->publish(expected));},100);
+    }
+    private static ThreadPoolExecutor createWorker() {
+        ThreadPoolExecutor executor=new ThreadPoolExecutor(1,1,1,TimeUnit.SECONDS,new LinkedBlockingQueue<>(),r->{
+            Thread thread=new Thread(r,"TaplusBridge-config-sync");thread.setDaemon(true);return thread;
+        });
+        executor.allowCoreThreadTimeOut(true);return executor;
+    }
+    private synchronized long beginPublication() {
+        long expected=generation.incrementAndGet();
+        closeLease();publicationLease=ModuleProcessLifecycle.acquire(60_000);
+        return expected;
+    }
+    private synchronized void cancelPublication() { generation.incrementAndGet();closeLease(); }
+    private synchronized void finish(long expected) { if(expected==generation.get())closeLease(); }
+    private void closeLease() {
+        if(publicationLease!=null){publicationLease.close();publicationLease=null;}
     }
     private void publish(long expected){publish(expected,0);}
     private void publish(long expected,int attempt){
         if(expected!=generation.get())return;
         XposedService current=service;
-        if(android.os.Process.myUid()/100000!=0){message="独立运行仅支持主用户，系统尚未确认配置";return;}
+        if(android.os.Process.myUid()/100000!=0){message="系统配置仅支持主用户，系统尚未确认配置";finish(expected);return;}
         if(current==null){
             message=attempt<5?"本体已保存，等待框架连接；系统尚未确认":"本体已保存，系统尚未确认；请连接框架后手动重试";
             retry(expected,attempt);return;
@@ -75,6 +94,7 @@ public final class RuntimePublisher {
         if(attempt<5)main.postDelayed(()->{
             if(expected==generation.get())worker.submit(()->publish(expected,attempt+1));
         },250L<<attempt);
+        else finish(expected);
     }
     static void store(SharedPreferences target,String raw){
         RuntimeSnapshot.parse(raw);
@@ -92,11 +112,12 @@ public final class RuntimePublisher {
                 && (!snapshot.scopeCapture || status.getBoolean("scope_capture_ready"))
                 && (!snapshot.scopeLinkProbe || status.getBoolean("scope_link_probe_ready")))
         {
-            message=snapshot.independent?"系统已确认配置，可冻结本体":"系统已确认配置，独立流转已关闭";
+            message="系统已确认配置";
             configurationEvent("confirmed",snapshot);
+            finish(expected);
         }
         else if(attempt<5)main.postDelayed(()->worker.submit(()->confirm(expected,snapshot,attempt+1)),250L<<attempt);
-        else message="配置已保存，系统尚未就绪；更新后请重启再同步";
+        else {message="配置已保存，系统尚未就绪；更新后请重启再同步";finish(expected);}
     }
     private static void configurationEvent(String stage,RuntimeSnapshot snapshot){
         android.util.Log.i("TaplusBridge","runtime config stage="+stage+" build="+snapshot.build
