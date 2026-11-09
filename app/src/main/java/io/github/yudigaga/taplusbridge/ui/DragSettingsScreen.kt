@@ -64,7 +64,8 @@ import top.yukonga.miuix.kmp.preference.SwitchPreference
     }
     DisposableEffect(controller, context) {
         val preferences = context.getSharedPreferences("config", 0)
-        val listener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
+        val handler = android.os.Handler(android.os.Looper.getMainLooper())
+        val refreshAfterSave = Runnable {
             linkProbe = controller.scopeLinkProbeEnabled()
             channels = controller.recognitionChannels()
             screenshot = controller.scopeCaptureEnabled()
@@ -74,8 +75,15 @@ import top.yukonga.miuix.kmp.preference.SwitchPreference
             enhancement = current.recognitionEnabled
             chatCards = current.captureEnabled
         }
+        val listener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
+            handler.removeCallbacks(refreshAfterSave)
+            handler.post(refreshAfterSave)
+        }
         preferences.registerOnSharedPreferenceChangeListener(listener)
-        onDispose { preferences.unregisterOnSharedPreferenceChangeListener(listener) }
+        onDispose {
+            preferences.unregisterOnSharedPreferenceChangeListener(listener)
+            handler.removeCallbacksAndMessages(null)
+        }
     }
     fun changeRecognition(change: () -> Unit) {
         try {

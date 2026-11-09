@@ -61,6 +61,33 @@ public final class ScopeCaptureStoreAndroidTest {
         }
     }
 
+    @Test public void clearErasesTheQueuedProducerPixelsBeforeItsWorkerCanStart() throws Exception {
+        var writer = (java.util.concurrent.ExecutorService) org.robolectric.util.ReflectionHelpers.getField(store, "writer");
+        var entered = new java.util.concurrent.CountDownLatch(1);
+        var release = new java.util.concurrent.CountDownLatch(1);
+        writer.execute(() -> {
+            entered.countDown();
+            try { release.await(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+        });
+        assertTrue(entered.await(2, java.util.concurrent.TimeUnit.SECONDS));
+        RuntimeSnapshot accepted = snapshot();
+        String nonce = store.issue(OWNER, accepted, metadata(), PNG);
+        var field = ScopeCaptureStore.class.getDeclaredField("entry"); field.setAccessible(true);
+        Object entry = field.get(store);
+        var png = entry.getClass().getDeclaredMethod("png"); png.setAccessible(true);
+        byte[] retained = (byte[]) png.invoke(entry);
+        Bundle capture = null;
+        try {
+            capture = store.take(OWNER, request(nonce), accepted); assertFalse(capture.isEmpty());
+            store.clear();
+            assertArrayEquals("cancellation must release queued pixel data, even before the writer runs",
+                    new byte[retained.length], retained);
+        } finally {
+            release.countDown(); writer.submit(() -> {}).get(2, java.util.concurrent.TimeUnit.SECONDS);
+            if (capture != null && capture.get("fd") instanceof ParcelFileDescriptor fd) fd.close();
+        }
+    }
+
     @Test(timeout = 20_000) public void realDescriptorTransfersOneImmutablePngAndMetadataCopyExactlyOnce() throws Exception {
         Bundle data = metadata(); byte[] image = PNG.clone();
         RuntimeSnapshot accepted = snapshot(); String nonce = store.issue(OWNER, accepted, data, image);

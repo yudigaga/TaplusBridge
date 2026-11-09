@@ -143,6 +143,40 @@ public final class HostLongPressDragAndroidTest {
         apply.invoke(observer,held,wire);assertEquals(text,type.getDeclaredField("text").get(held));
     }
 
+    @Test public void repeatedSourceTextAvoidsPolicyIpcWhileNovelTextReadsLivePolicy() throws Exception {
+        Context context = RuntimeEnvironment.getApplication();
+        RecordingImportProvider provider = Robolectric.buildContentProvider(RecordingImportProvider.class)
+                .create(BridgeContract.AUTHORITY).get();
+        org.robolectric.shadows.ShadowContentResolver.registerProviderInternal(BridgeContract.AUTHORITY, provider);
+        var observer = new HostLongPressDrag(null, null, (a, b, c, d) -> {});
+        var type = Class.forName(HostLongPressDrag.class.getName() + "$Held");
+        var constructor = type.getDeclaredConstructor(Context.class, Object.class, Object.class,
+                String.class, Bitmap.class, HostLongPressDrag.Lease.class); constructor.setAccessible(true);
+        Object held = constructor.newInstance(context, new Object(), result(), "原生标题", null,
+                HostLongPressDrag.lease(state("holding"), SOURCE, TOKEN, IDENTITY));
+        var apply = HostLongPressDrag.class.getDeclaredMethod("applySourceText", type, Bundle.class); apply.setAccessible(true);
+        Field text = type.getDeclaredField("text");
+        Bundle response = new Bundle(); response.putString("source_text", "触点附近的真实完整正文");
+        apply.invoke(observer, held, response);
+        assertEquals("原生标题\n触点附近的真实完整正文", text.get(held));
+        assertEquals(1, provider.policyReads);
+        for (int i = 0; i < 25; i++) apply.invoke(observer, held, response);
+        for (String invalid : new String[]{"", " ", "x".repeat(ScopeCapturePayload.MAX_CONTENT_LENGTH + 1)}) {
+            response.putString("source_text", invalid); apply.invoke(observer, held, response);
+        }
+        assertEquals("duplicate and invalid content must not query the Provider", 1, provider.policyReads);
+
+        response.putString("source_text", "新出现的正文");
+        provider.channels = RecognitionChannels.disabled();
+        apply.invoke(observer, held, response);
+        assertEquals(2, provider.policyReads);
+        assertEquals("原生标题\n触点附近的真实完整正文", text.get(held));
+        provider.channels = RecognitionChannels.defaults();
+        apply.invoke(observer, held, response);
+        assertEquals(3, provider.policyReads);
+        assertEquals("原生标题\n触点附近的真实完整正文\n新出现的正文", text.get(held));
+    }
+
     private void assertFallbackProbeAfterRelease(Object nativePick) throws Exception {
         Context context = RuntimeEnvironment.getApplication(); Object service = new Object();
         HostLongPressDrag observer = new HostLongPressDrag(null, null, (a, b, c, d) -> {});
@@ -521,6 +555,120 @@ public final class HostLongPressDragAndroidTest {
         } finally { observer.close(service); }
     }
 
+    @Test public void copyAndTranslateImportTextImmediatelyEvenWhenTheCardLinkProbeIsEnabled() throws Exception {
+        for (String action : new String[]{"copy", "translate"}) {
+            Context context = RuntimeEnvironment.getApplication(); Object service = new Object();
+            RecordingImportProvider provider = Robolectric.buildContentProvider(RecordingImportProvider.class)
+                    .create(BridgeContract.AUTHORITY).get();
+            org.robolectric.shadows.ShadowContentResolver.registerProviderInternal(BridgeContract.AUTHORITY, provider);
+            HostLongPressDrag observer = new HostLongPressDrag(null, null, (a, b, c, d) -> {});
+            Bundle response = preparedState(); response.putString("state", "released");
+            response.putLong("drag_at", SystemClock.elapsedRealtime());
+            response.putString("direction", "right"); response.putString("action", action);
+            var type = Class.forName(HostLongPressDrag.class.getName() + "$Held");
+            var constructor = type.getDeclaredConstructor(Context.class, Object.class, Object.class,
+                    String.class, Bitmap.class, HostLongPressDrag.Lease.class); constructor.setAccessible(true);
+            var lease = HostLongPressDrag.lease(response, SOURCE, TOKEN, IDENTITY);
+            Object held = constructor.newInstance(context, service, null, "直接处理的原文", null, lease);
+            Field current = HostLongPressDrag.class.getDeclaredField("current"); current.setAccessible(true); current.set(observer, held);
+            var process = HostLongPressDrag.class.getDeclaredMethod("process", type, HostLongPressDrag.Lease.class);
+            process.setAccessible(true);
+            try {
+                process.invoke(observer, held, lease);
+                assertEquals(action + " must not wait for a card URL", "直接处理的原文", provider.importText);
+                assertFalse(type.getDeclaredField("systemLinkRequested").getBoolean(held));
+            } finally { observer.close(service); }
+        }
+    }
+
+    @Test public void nativeCardGeometryDoesNotDelaySharingWhenTheLinkProbeIsDisabled() throws Exception {
+        Context context = RuntimeEnvironment.getApplication(); Object service = new Object();
+        RecordingImportProvider provider = Robolectric.buildContentProvider(RecordingImportProvider.class)
+                .create(BridgeContract.AUTHORITY).get();
+        org.robolectric.shadows.ShadowContentResolver.registerProviderInternal(BridgeContract.AUTHORITY, provider);
+        HostLongPressDrag observer = new HostLongPressDrag(null, null, (a, b, c, d) -> {});
+        NativeResult pick = result(); Bundle content = new Bundle();
+        content.putParcelable("view_rect", new android.graphics.Rect(0, 0, 200, 100));
+        pick.jobs.put("text_pick", Map.of("pick_mode", content));
+        Bundle response = preparedState(); response.putString("state", "released");
+        response.putLong("drag_at", SystemClock.elapsedRealtime()); response.putBoolean("link_probe", false);
+        response.putString("direction", "right"); response.putString("action", "share");
+        var type = Class.forName(HostLongPressDrag.class.getName() + "$Held");
+        var constructor = type.getDeclaredConstructor(Context.class, Object.class, Object.class,
+                String.class, Bitmap.class, HostLongPressDrag.Lease.class); constructor.setAccessible(true);
+        var lease = HostLongPressDrag.lease(response, SOURCE, TOKEN, IDENTITY);
+        Object held = constructor.newInstance(context, service, pick, "直接分享的原文", null, lease);
+        assertTrue(type.getDeclaredField("nativeProbeAvailable").getBoolean(held));
+        Field current = HostLongPressDrag.class.getDeclaredField("current"); current.setAccessible(true); current.set(observer, held);
+        var process = HostLongPressDrag.class.getDeclaredMethod("process", type, HostLongPressDrag.Lease.class);
+        process.setAccessible(true);
+        try {
+            process.invoke(observer, held, lease);
+            assertEquals("native geometry cannot enable a disabled probe", "直接分享的原文", provider.importText);
+            assertFalse(type.getDeclaredField("systemLinkRequested").getBoolean(held));
+        } finally { observer.close(service); }
+    }
+
+    @Test public void completedNativeProbeEndsShareWaitAndOtherPicksCannotEndIt() throws Exception {
+        Context context = RuntimeEnvironment.getApplication(); Object service = new Object();
+        RecordingImportProvider provider = Robolectric.buildContentProvider(RecordingImportProvider.class)
+                .create(BridgeContract.AUTHORITY).get();
+        org.robolectric.shadows.ShadowContentResolver.registerProviderInternal(BridgeContract.AUTHORITY, provider);
+        HostLongPressDrag observer = new HostLongPressDrag(null, null, (a, b, c, d) -> {});
+        NativeResult pick = result(); Bundle content = new Bundle();
+        content.putParcelable("view_rect", new android.graphics.Rect(0, 0, 200, 100));
+        pick.jobs.put("text_pick", Map.of("pick_mode", content));
+        Bundle response = preparedState(); response.putString("state", "released");
+        response.putLong("drag_at", SystemClock.elapsedRealtime());
+        response.putString("direction", "right"); response.putString("action", "share");
+        var type = Class.forName(HostLongPressDrag.class.getName() + "$Held");
+        var constructor = type.getDeclaredConstructor(Context.class, Object.class, Object.class,
+                String.class, Bitmap.class, HostLongPressDrag.Lease.class); constructor.setAccessible(true);
+        var lease = HostLongPressDrag.lease(response, SOURCE, TOKEN, IDENTITY);
+        Object held = constructor.newInstance(context, service, pick, "分享原文", null, lease);
+        Field current = HostLongPressDrag.class.getDeclaredField("current"); current.setAccessible(true); current.set(observer, held);
+        var process = HostLongPressDrag.class.getDeclaredMethod("process", type, HostLongPressDrag.Lease.class);
+        process.setAccessible(true);
+        try {
+            var completed = HostLongPressDrag.class.getDeclaredMethod("nativeProbeCompleted", Object.class, Object.class);
+            completed.setAccessible(true);
+            completed.invoke(observer, new Object(), pick);
+            completed.invoke(observer, service, result());
+            process.invoke(observer, held, lease);
+            assertNull("an in-flight probe keeps the late URL grace", provider.importText);
+            response.putBoolean("link_complete", true);
+            process.invoke(observer, held, HostLongPressDrag.lease(response, SOURCE, TOKEN, IDENTITY));
+            assertNull("A completed system fallback cannot finish a native probe that took ownership", provider.importText);
+            completed.invoke(observer, service, pick);
+            process.invoke(observer, held, lease);
+            assertEquals("a completed probe with no URL must not wait out the grace", "分享原文", provider.importText);
+        } finally { observer.close(service); }
+    }
+
+    @Test public void completedSystemLinkProbeDoesNotDelaySharing() throws Exception {
+        Context context = RuntimeEnvironment.getApplication(); Object service = new Object();
+        RecordingImportProvider provider = Robolectric.buildContentProvider(RecordingImportProvider.class)
+                .create(BridgeContract.AUTHORITY).get();
+        org.robolectric.shadows.ShadowContentResolver.registerProviderInternal(BridgeContract.AUTHORITY, provider);
+        HostLongPressDrag observer = new HostLongPressDrag(null, null, (a, b, c, d) -> {});
+        Bundle response = preparedState(); response.putString("state", "released");
+        response.putLong("drag_at", SystemClock.elapsedRealtime()); response.putBoolean("link_complete", true);
+        response.putString("direction", "right"); response.putString("action", "share");
+        var type = Class.forName(HostLongPressDrag.class.getName() + "$Held");
+        var constructor = type.getDeclaredConstructor(Context.class, Object.class, Object.class,
+                String.class, Bitmap.class, HostLongPressDrag.Lease.class); constructor.setAccessible(true);
+        var lease = HostLongPressDrag.lease(response, SOURCE, TOKEN, IDENTITY);
+        Object held = constructor.newInstance(context, service, null, "分享原文", null, lease);
+        Field current = HostLongPressDrag.class.getDeclaredField("current"); current.setAccessible(true); current.set(observer, held);
+        var process = HostLongPressDrag.class.getDeclaredMethod("process", type, HostLongPressDrag.Lease.class);
+        process.setAccessible(true);
+        try {
+            process.invoke(observer, held, lease);
+            assertEquals("a finished fallback cannot supply another URL", "分享原文", provider.importText);
+            assertFalse(type.getDeclaredField("systemLinkRequested").getBoolean(held));
+        } finally { observer.close(service); }
+    }
+
     @Test public void lateTextPickCannotReplaceThePreparedImageDuringDelivery() throws Exception {
         assertMixedImageDelivery(true);
     }
@@ -607,6 +755,104 @@ public final class HostLongPressDragAndroidTest {
         assertArrayEquals(new byte[]{1, 2, 3}, bytes.toByteArray());
     }
 
+    @Test public void slowBinderCoalescesPendingMovesAndPreservesPointerChangesAndTerminalOrder() throws Exception {
+        Context context = RuntimeEnvironment.getApplication(); Object service = new Object();
+        HostLongPressDrag observer = new HostLongPressDrag(null, null, (a, b, c, d) -> {});
+        var type = Class.forName(HostLongPressDrag.class.getName() + "$Held");
+        var constructor = type.getDeclaredConstructor(Context.class, Object.class, Object.class,
+                String.class, Bitmap.class, HostLongPressDrag.Lease.class); constructor.setAccessible(true);
+        Object held = constructor.newInstance(context, service, null, null, null,
+                HostLongPressDrag.lease(state("holding"), SOURCE, TOKEN, IDENTITY));
+        Field current = HostLongPressDrag.class.getDeclaredField("current"); current.setAccessible(true); current.set(observer, held);
+        type.getDeclaredField("maskActive").setBoolean(held, true);
+        var maskTouch = HostLongPressDrag.class.getDeclaredMethod("maskTouch", type, android.view.MotionEvent.class);
+        maskTouch.setAccessible(true);
+        var entered = new java.util.concurrent.CountDownLatch(1);
+        var unblock = new java.util.concurrent.CountDownLatch(1);
+        var actions = new java.util.concurrent.CopyOnWriteArrayList<Integer>();
+        var xs = new java.util.concurrent.CopyOnWriteArrayList<Float>();
+        Class<?> bridgeType = Class.forName("io.github.yudigaga.taplusbridge.runtime.IRuntimeBridge");
+        Object remote = Proxy.newProxyInstance(bridgeType.getClassLoader(), new Class<?>[]{bridgeType}, (target, method, args) -> {
+            if (!"call".equals(method.getName())) return null;
+            if (!"drag_gesture_update".equals(args[0])) return Bundle.EMPTY;
+            Bundle request = (Bundle) args[1]; actions.add(request.getInt("action")); xs.add(request.getFloat("x"));
+            if (actions.size() == 1) { entered.countDown(); unblock.await(3, java.util.concurrent.TimeUnit.SECONDS); }
+            return Bundle.EMPTY;
+        });
+        var install = Class.forName("io.github.yudigaga.taplusbridge.runtime.RuntimeClient").getDeclaredMethod("testBridge", bridgeType);
+        install.setAccessible(true); install.invoke(null, remote);
+        var worker = (java.util.concurrent.ScheduledExecutorService) org.robolectric.util.ReflectionHelpers.getField(observer, "worker");
+        try {
+            sendMaskEvent(maskTouch, observer, held, android.view.MotionEvent.ACTION_MOVE, 300);
+            assertTrue(entered.await(2, java.util.concurrent.TimeUnit.SECONDS));
+            for (int x = 301; x <= 400; x++) sendMaskEvent(maskTouch, observer, held, android.view.MotionEvent.ACTION_MOVE, x);
+            sendMaskEvent(maskTouch, observer, held, android.view.MotionEvent.ACTION_POINTER_DOWN, 401);
+            for (int x = 402; x <= 500; x++) sendMaskEvent(maskTouch, observer, held, android.view.MotionEvent.ACTION_MOVE, x);
+            sendMaskEvent(maskTouch, observer, held, android.view.MotionEvent.ACTION_UP, 501);
+            unblock.countDown();
+            // A drain may reschedule itself, so wait for the terminal event rather than a queue marker.
+            long until = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(3);
+            while ((actions.isEmpty() || actions.get(actions.size()-1) != android.view.MotionEvent.ACTION_UP
+                    || xs.size() != actions.size()) && System.nanoTime() < until) Thread.sleep(1);
+            assertEquals(List.of(android.view.MotionEvent.ACTION_MOVE, android.view.MotionEvent.ACTION_MOVE,
+                    android.view.MotionEvent.ACTION_POINTER_DOWN, android.view.MotionEvent.ACTION_MOVE,
+                    android.view.MotionEvent.ACTION_UP), actions);
+            assertEquals(List.of(300f, 400f, 401f, 500f, 501f), xs);
+        } finally { unblock.countDown(); observer.close(service); installBridge(null); worker.shutdownNow(); }
+    }
+
+    @Test public void slowBinderPreservesTheLatestEdgeWaypointBeforeAnInwardRelease() throws Exception {
+        Context context = RuntimeEnvironment.getApplication(); Object service = new Object();
+        HostLongPressDrag observer = new HostLongPressDrag(null, null, (a, b, c, d) -> {});
+        var type = Class.forName(HostLongPressDrag.class.getName() + "$Held");
+        var constructor = type.getDeclaredConstructor(Context.class, Object.class, Object.class,
+                String.class, Bitmap.class, HostLongPressDrag.Lease.class); constructor.setAccessible(true);
+        Object held = constructor.newInstance(context, service, null, null, null,
+                HostLongPressDrag.lease(state("holding"), SOURCE, TOKEN, IDENTITY));
+        Field current = HostLongPressDrag.class.getDeclaredField("current"); current.setAccessible(true); current.set(observer, held);
+        type.getDeclaredField("maskActive").setBoolean(held, true);
+        var maskTouch = HostLongPressDrag.class.getDeclaredMethod("maskTouch", type, android.view.MotionEvent.class);
+        maskTouch.setAccessible(true);
+        var entered = new java.util.concurrent.CountDownLatch(1);
+        var unblock = new java.util.concurrent.CountDownLatch(1);
+        var actions = new java.util.concurrent.CopyOnWriteArrayList<Integer>();
+        var xs = new java.util.concurrent.CopyOnWriteArrayList<Float>();
+        Class<?> bridgeType = Class.forName("io.github.yudigaga.taplusbridge.runtime.IRuntimeBridge");
+        Object remote = Proxy.newProxyInstance(bridgeType.getClassLoader(), new Class<?>[]{bridgeType}, (target, method, args) -> {
+            if (!"call".equals(method.getName())) return null;
+            if (!"drag_gesture_update".equals(args[0])) return Bundle.EMPTY;
+            Bundle request = (Bundle) args[1]; actions.add(request.getInt("action")); xs.add(request.getFloat("x"));
+            if (actions.size() == 1) { entered.countDown(); unblock.await(3, java.util.concurrent.TimeUnit.SECONDS); }
+            return Bundle.EMPTY;
+        });
+        var install = Class.forName("io.github.yudigaga.taplusbridge.runtime.RuntimeClient").getDeclaredMethod("testBridge", bridgeType);
+        install.setAccessible(true); install.invoke(null, remote);
+        var worker = (java.util.concurrent.ScheduledExecutorService) org.robolectric.util.ReflectionHelpers.getField(observer, "worker");
+        try {
+            sendMaskEvent(maskTouch, observer, held, android.view.MotionEvent.ACTION_MOVE, 300);
+            assertTrue(entered.await(2, java.util.concurrent.TimeUnit.SECONDS));
+            sendMaskEvent(maskTouch, observer, held, android.view.MotionEvent.ACTION_MOVE, 1);
+            sendMaskEvent(maskTouch, observer, held, android.view.MotionEvent.ACTION_MOVE, 400);
+            sendMaskEvent(maskTouch, observer, held, android.view.MotionEvent.ACTION_MOVE, 1070);
+            for (int x = 601; x <= 700; x++) sendMaskEvent(maskTouch, observer, held, android.view.MotionEvent.ACTION_MOVE, x);
+            sendMaskEvent(maskTouch, observer, held, android.view.MotionEvent.ACTION_UP, 600);
+            unblock.countDown();
+            // A drain may reschedule itself, so wait for the terminal event rather than a queue marker.
+            long until = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(3);
+            while ((actions.isEmpty() || actions.get(actions.size()-1) != android.view.MotionEvent.ACTION_UP
+                    || xs.size() != actions.size()) && System.nanoTime() < until) Thread.sleep(1);
+            assertEquals(List.of(android.view.MotionEvent.ACTION_MOVE, android.view.MotionEvent.ACTION_MOVE,
+                    android.view.MotionEvent.ACTION_MOVE, android.view.MotionEvent.ACTION_UP), actions);
+            assertEquals(List.of(300f, 1070f, 700f, 600f), xs);
+        } finally { unblock.countDown(); observer.close(service); installBridge(null); worker.shutdownNow(); }
+    }
+
+    private static void sendMaskEvent(java.lang.reflect.Method method, HostLongPressDrag observer,
+                                      Object held, int action, float x) throws Exception {
+        var event = android.view.MotionEvent.obtain(1, 1, action, x, 60, 0);
+        try { method.invoke(observer, held, event); } finally { event.recycle(); }
+    }
+
     private static Bundle state(String status) {
         Bundle state = new Bundle(); state.putString("token", TOKEN); state.putString("source", SOURCE);
         state.putString("identity", IDENTITY); state.putString("state", status);
@@ -621,11 +867,14 @@ public final class HostLongPressDragAndroidTest {
     public static final class RecordingImportProvider extends ContentProvider {
         String importText;
         boolean importImage;
+        int policyReads;
+        RecognitionChannels channels = RecognitionChannels.defaults();
         @Override public boolean onCreate() { return true; }
         @Override public Bundle call(String method, String arg, Bundle extras) {
             if (RecognitionChannels.KEY.equals(method)) {
+                policyReads++;
                 Bundle policy=new Bundle();policy.putString("identity","a".repeat(64));policy.putBoolean("active",true);
-                policy.putString("channels",RecognitionChannels.defaults().toJson());return policy;
+                policy.putString("channels",channels.toJson());return policy;
             }
             if (!"drag_import".equals(method)) return Bundle.EMPTY;
             importText = extras.getString("text");

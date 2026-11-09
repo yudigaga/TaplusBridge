@@ -23,6 +23,7 @@ import io.github.yudigaga.taplusbridge.probe.PhysicalTouchState;
 import io.github.yudigaga.taplusbridge.probe.ProbeContract;
 import io.github.yudigaga.taplusbridge.runtime.RuntimeServer;
 import io.github.yudigaga.taplusbridge.runtime.RuntimeSnapshot;
+import io.github.yudigaga.taplusbridge.runtime.CaptureIo;
 import io.github.yudigaga.taplusbridge.capture.IntentObservation;
 import java.security.SecureRandom;
 import java.io.ByteArrayOutputStream;
@@ -44,10 +45,33 @@ public final class SystemLongPressDrag implements RuntimeServer.DragGestures {
     private final Supplier<RuntimeServer> runtime;
     private final ScopeCaptureWindow windows;
     private final PhysicalTouchState physical;
-    private final ExecutorService writer = Executors.newSingleThreadExecutor(task -> {
+    private final java.util.concurrent.ThreadPoolExecutor writer = new java.util.concurrent.ThreadPoolExecutor(
+            1, 1, 0, java.util.concurrent.TimeUnit.MILLISECONDS, new java.util.concurrent.ArrayBlockingQueue<>(1), task -> {
         Thread thread = new Thread(task, "TaplusBridge-drag-capture"); thread.setDaemon(true); return thread;
     });
     private Run current;
+    private record InputState(Run owner, int device, long downAt, boolean released) {}
+    private final java.util.concurrent.atomic.AtomicReference<InputState> input = new java.util.concurrent.atomic.AtomicReference<>();
+
+    private void publishInput() {
+        Run run = current;
+        if (run == null || !run.transferred) { input.set(null); return; }
+        InputState previous = input.get();
+        InputState next = new InputState(run, run.gesture.device(), run.gesture.downAt(), run.gesture.released());
+        if (!run.inputRevoked) {
+            input.compareAndSet(previous, next);
+            if (run.inputRevoked) input.compareAndSet(next, null);
+        }
+    }
+
+    private void replaceCurrent(Run replacement) {
+        Run previous = current;
+        current = replacement;
+        if (previous != null && previous != replacement && previous.captureWrite != null) {
+            writer.remove(previous.captureWrite); previous.captureWrite.close(); previous.captureWrite = null;
+        }
+        publishInput();
+    }
     private Runnable directedRelease;
     private CardLinks cardLinks;
     private volatile io.github.yudigaga.taplusbridge.probe.SystemAssistContent assistContent;
@@ -77,9 +101,12 @@ public final class SystemLongPressDrag implements RuntimeServer.DragGestures {
         String lastEdge;
         String cardLink;
         boolean linkRequested;
+        boolean linkComplete;
         boolean nativeUrlAvailable;
         boolean consumed;
         boolean transferred;
+        volatile boolean inputRevoked;
+        CaptureIo.Write captureWrite;
         boolean sourceMovedBeforeTransfer;
         boolean dragFeedbackSent;
         boolean prepareStarted;
@@ -132,22 +159,30 @@ public final class SystemLongPressDrag implements RuntimeServer.DragGestures {
         worker.post(() -> event(display, device, down, at, action, count, x, y, exclusive));
     }
 
-    public synchronized boolean transferredPointer(int display, int device, long downAt, int action) {
-        Run run = current;
-        if (run == null || !run.transferred) return false;
-        boolean sameStream = shouldIgnoreTransferredPointer(true, display, run.gesture.device(), device,
-                run.gesture.downAt(), downAt, run.gesture.released(), action);
+    public boolean transferredPointer(int display, int device, long downAt, int action) {
+        InputState state = input.get();
+        if (state == null || state.owner().inputRevoked) return false;
+        boolean sameStream = shouldIgnoreTransferredPointer(true, display, state.device(), device,
+                state.downAt(), downAt, state.released(), action);
         if (sameStream) return true;
-        if (shouldResetTransferredOnDown(true, 0, run.gesture.device(), run.gesture.downAt(),
-                display, device, downAt, action)) {
-            current = null;
-            log("orphaned_takeover_reset reason=new_physical_down");
+        if (shouldResetTransferredOnDown(true, 0, state.device(), state.downAt(), display, device, downAt, action)) {
+            // Revoke the owner even if an update concurrently replaced its immutable input snapshot.
+            state.owner().inputRevoked = true;
+            input.compareAndSet(state, null);
+            worker.post(() -> {
+                synchronized (this) {
+                    if (current == state.owner()) {
+                        replaceCurrent(null);
+                        log("orphaned_takeover_reset reason=new_physical_down");
+                    }
+                }
+            });
         }
         return false;
     }
 
-    public synchronized boolean transferred() {
-        return current != null && current.transferred;
+    public boolean transferred() {
+        InputState state = input.get(); return state != null && !state.owner().inputRevoked;
     }
 
     static boolean shouldIgnoreTransferredPointer(boolean transferred, int display, int gestureDevice,
@@ -170,10 +205,10 @@ public final class SystemLongPressDrag implements RuntimeServer.DragGestures {
                     if (sameStream) return;
                     if (!shouldResetTransferredOnDown(true, 0, active.gesture.device(), active.gesture.downAt(),
                             display, device, down, action)) return;
-                    current = null;
+                    replaceCurrent(null);
                     log("orphaned_takeover_reset reason=new_physical_down");
                 }
-                current = null;
+                replaceCurrent(null);
                 RuntimeSnapshot config = configuration(); Context system = context.get();
                 if (!exclusive || display != 0 || count != 1 || device < 0 || config == null
                         || !unlocked(system) || DragGestureGate.suppressLongPress()
@@ -196,9 +231,9 @@ public final class SystemLongPressDrag implements RuntimeServer.DragGestures {
                 long began = nowElapsed - Math.max(0, nowUptime - down);
                 var stages = LongPressStageSchedule.fromDown(began, timeout,
                         config.drag.recognitionDelayMillis, config.drag.dragDelayMillis);
-                current = new Run(target, config, new LongPressDirection(down, device, x, y, timeout, slop, threshold),
+                replaceCurrent(new Run(target, config, new LongPressDirection(down, device, x, y, timeout, slop, threshold),
                         began, stages, Math.max(slop * 2, 24 * metrics.density), slop,
-                        metrics.widthPixels, metrics.heightPixels, metrics.density);
+                        metrics.widthPixels, metrics.heightPixels, metrics.density));
                 Run pending = current;
                 var content = assistContent;
                 if (content != null && config.recognition) content.arm(target, config, down, began, stages.recognitionAt(), device);
@@ -231,7 +266,7 @@ public final class SystemLongPressDrag implements RuntimeServer.DragGestures {
                 }
             }
         } catch (ReflectiveOperationException | RuntimeException failed) {
-            current = null;
+            replaceCurrent(null);
             // Normal touches on menus or protected windows are not eligible candidates.
         }
         }
@@ -306,12 +341,13 @@ public final class SystemLongPressDrag implements RuntimeServer.DragGestures {
                     byte[] png = output.toByteArray();
                     if (png.length <= 0) throw new IllegalStateException("capture_encode");
                     pipe = ParcelFileDescriptor.createPipe();
-                    ParcelFileDescriptor writing = pipe[1];
-                    writer.execute(() -> {
-                        try (var stream = new ParcelFileDescriptor.AutoCloseOutputStream(writing)) { stream.write(png); }
-                        catch (IOException ignored) { }
-                        finally { java.util.Arrays.fill(png, (byte) 0); }
-                    });
+                    CaptureIo.Write sending = new CaptureIo.Write(new ParcelFileDescriptor.AutoCloseOutputStream(pipe[1]), png);
+                    synchronized (this) {
+                        if (current != run) { sending.close(); return Bundle.EMPTY; }
+                        run.captureWrite = sending;
+                        writer.execute(sending);
+                    }
+                    CaptureIo.expireReadEnd(pipe[0]);
                     capture.putString("kind", "image"); capture.putInt("bytes", png.length);
                     capture.putParcelable("fd", pipe[0]);
                 } catch (ReflectiveOperationException | IOException | RuntimeException unavailable) {
@@ -392,6 +428,7 @@ public final class SystemLongPressDrag implements RuntimeServer.DragGestures {
         }
         catch (android.content.pm.PackageManager.NameNotFoundException changed) { return Bundle.EMPTY; }
         catch (ReflectiveOperationException | RuntimeException changed) { return Bundle.EMPTY; }
+        if (run.inputRevoked) return Bundle.EMPTY;
         if (run.token == null) {
             ensureToken(run);
             log("armed");
@@ -426,15 +463,15 @@ public final class SystemLongPressDrag implements RuntimeServer.DragGestures {
         try {
             validateAfterPick(run);
         } catch (ReflectiveOperationException unavailable) {
-            current = null;
+            replaceCurrent(null);
             String reason = "drag_source_changed".equals(unavailable.getMessage())
                     ? "source_changed" : "source_validation_failed";
             logTakeoverFailure(reason); return cancelled();
         } catch (IllegalStateException rejected) {
-            current = null; logTakeoverFailure(ScopeCaptureWindow.diagnosticWindowReason(rejected.getMessage()));
+            replaceCurrent(null); logTakeoverFailure(ScopeCaptureWindow.diagnosticWindowReason(rejected.getMessage()));
             return cancelled();
         } catch (RuntimeException unavailable) {
-            current = null; logTakeoverFailure("source_validation_failed"); return cancelled();
+            replaceCurrent(null); logTakeoverFailure("source_validation_failed"); return cancelled();
         }
         ScopeCaptureWindow.TransferResult transfer;
         try {
@@ -442,14 +479,15 @@ public final class SystemLongPressDrag implements RuntimeServer.DragGestures {
             transfer = windows.transferTouchToMaskDetailed(atms.get(), run.target, hostUid,
                     DragSettings.MASK_WINDOW_PREFIX + token);
         } catch (android.content.pm.PackageManager.NameNotFoundException unavailable) {
-            current = null; logTakeoverFailure("host_package_missing"); return cancelled();
+            replaceCurrent(null); logTakeoverFailure("host_package_missing"); return cancelled();
         } catch (RuntimeException unavailable) {
-            current = null; logTakeoverFailure("system_runtime_failure"); return cancelled();
+            replaceCurrent(null); logTakeoverFailure("system_runtime_failure"); return cancelled();
         }
         if (!transfer.transferred) {
-            current = null; logTakeoverFailure(transfer.reason); return cancelled();
+            replaceCurrent(null); logTakeoverFailure(transfer.reason); return cancelled();
         }
         run.transferred = true;
+        publishInput();
         DragGestureGate.beginPhysical(0, run.gesture.device(), run.gesture.downAt());
         if (shouldSendDragFeedback(true, run.dragFeedbackSent)) {
             run.dragFeedbackSent = true;
@@ -468,7 +506,7 @@ public final class SystemLongPressDrag implements RuntimeServer.DragGestures {
         if (request == null || request.size() != 5 || !(request.get("token") instanceof String token)
                 || !(request.get("action") instanceof Integer action) || !(request.get("pointers") instanceof Integer count)
                 || !(request.get("x") instanceof Float x) || !(request.get("y") instanceof Float y)
-                || run == null || !token.equals(run.token) || !run.transferred
+                || run == null || !token.equals(run.token) || !run.transferred || run.inputRevoked
                 || run.gesture.released() || !Float.isFinite(x) || !Float.isFinite(y)) return cancelled();
         if (action == MotionEvent.ACTION_UP)
             DragGestureGate.releaseTransferred();
@@ -487,7 +525,11 @@ public final class SystemLongPressDrag implements RuntimeServer.DragGestures {
                 kick = true;
             }
         }
-        result = state(run);
+        publishInput();
+        if (action == MotionEvent.ACTION_MOVE) {
+            run.direction(); // Records a visited edge even when no poll occurs before an inward release.
+            result = new Bundle(); result.putString("state", "holding");
+        } else result = state(run);
         }
         if (kick) notifyDirectedRelease();
         return result;
@@ -511,13 +553,13 @@ public final class SystemLongPressDrag implements RuntimeServer.DragGestures {
 
     private boolean valid(Run run, RuntimeSnapshot config) {
         long now = SystemClock.elapsedRealtime();
-        return run != null && config != null && config.enabled && config.drag.enabled && config.user == 0
+        return run != null && !run.inputRevoked && config != null && config.enabled && config.drag.enabled && config.user == 0
                 && run.config.identity.equals(config.identity) && config.sourceScope.allows(run.target.source)
                 && run.gesture.valid() && unlocked(context.get())
                 && (!DragGestureGate.suppressLongPress() || run.transferred)
                 && now >= run.began && (run.gesture.released()
                     ? now >= run.releasedAt && now - run.releasedAt < RELEASE_GRACE_MILLIS
-                    : now - run.began <= 30_000);
+                    : now - run.began <= 30_000) && !run.inputRevoked;
     }
 
     static boolean shouldSendDragFeedback(boolean transferAccepted, boolean alreadySent) {
@@ -533,6 +575,7 @@ public final class SystemLongPressDrag implements RuntimeServer.DragGestures {
                 throw new ReflectiveOperationException("drag_source_changed");
             int uid = context.get().getPackageManager().getApplicationInfo(HostPolicy.HOST_PACKAGE, 0).uid;
             windows.validateBehindHost(atms.get(), run.target, uid);
+            if (run.inputRevoked) throw new ReflectiveOperationException("drag_source_changed");
         } catch (android.content.pm.PackageManager.NameNotFoundException unavailable) {
             throw new ReflectiveOperationException(unavailable);
         }
@@ -558,6 +601,7 @@ public final class SystemLongPressDrag implements RuntimeServer.DragGestures {
         result.putLong("recognition_at", run.stages.recognitionAt());
         result.putLong("drag_at", run.stages.dragAt());
         result.putBoolean("link_probe", run.config.scopeLinkProbe);
+        result.putBoolean("link_complete", run.linkComplete);
         return result;
     }
 
@@ -602,7 +646,7 @@ public final class SystemLongPressDrag implements RuntimeServer.DragGestures {
 
     private void cancelRun(Run run, String reason) {
         if (current != run) return;
-        current = null;
+        replaceCurrent(null);
         log(reason);
     }
 
@@ -630,12 +674,15 @@ public final class SystemLongPressDrag implements RuntimeServer.DragGestures {
         try {
             links.captureFromGesture(run.target, run.config, run.gesture.downAt(), run.stages.recognitionAt(), run.releasedAt, url -> {
                 synchronized (SystemLongPressDrag.this) {
-                    if (current != run || !io.github.yudigaga.taplusbridge.recognition.RouteLink.valid(url)) return;
-                    run.cardLink = url;
-                    log("card_link");
+                    if (current != run || run.linkComplete) return;
+                    run.linkComplete = true;
+                    if (io.github.yudigaga.taplusbridge.recognition.RouteLink.valid(url)) {
+                        run.cardLink = url;
+                        log("card_link");
+                    }
                 }
             });
-        } catch (RuntimeException unavailable) { log("card_link_failed"); }
+        } catch (RuntimeException unavailable) { run.linkComplete = true; log("card_link_failed"); }
     }
 
     private static final class BoundedPng extends ByteArrayOutputStream {

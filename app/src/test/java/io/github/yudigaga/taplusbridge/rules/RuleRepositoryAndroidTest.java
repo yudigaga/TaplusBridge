@@ -6,6 +6,8 @@ import java.io.IOException;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Proxy;
 import java.util.List;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.Before;
 import org.junit.Test;
@@ -37,6 +39,57 @@ public final class RuleRepositoryAndroidTest {
         repository = new RuleRepository(context, client);
     }
     private void manual() { repository.saveManualRule(-1, "com.tencent.mm", "manual.example", "com.example.manual", "none", "我的规则"); }
+
+    @Test public void unchangedStorageReusesValidatedRulesAcrossRepositoryInstances() {
+        manual();
+        List<LinkRuleEntry> online = repository.onlineRules(), effective = repository.effectiveRules();
+        List<LinkRuleEntry> manual = repository.manualRules();
+        for (int i = 0; i < 5; i++) {
+            RuleRepository reopened = new RuleRepository(context);
+            assertSame("Unchanged online bytes must not be parsed again", online, reopened.onlineRules());
+            assertSame("Unchanged manual bytes must not be parsed again", manual, reopened.manualRules());
+            assertSame("Unchanged routes must not be merged and validated again", effective, reopened.effectiveRules());
+        }
+        repository.setOnlineUpdatesEnabled(true);
+        assertSame("Update permission does not alter accepted routes", effective, repository.effectiveRules());
+        try { manual.clear(); fail("Cached manual rules must be immutable"); }
+        catch (UnsupportedOperationException expected) { }
+        try { effective.clear(); fail("Cached effective rules must be immutable"); }
+        catch (UnsupportedOperationException expected) { }
+        assertEquals(33, repository.effectiveRules().size());
+    }
+
+    @Test public void directPreferenceChangesImmediatelyInvalidateWarmedRoutes() {
+        assertTrue(repository.refreshOnline().success);
+        List<LinkRuleEntry> accepted = repository.effectiveRules(); assertEquals(1, accepted.size());
+        SharedPreferences storage = context.getSharedPreferences(RuleRepository.PREFS, Context.MODE_PRIVATE);
+        storage.edit().putStringSet("disabled_targets", Set.of("com.example.reader")).commit();
+        assertTrue(repository.effectiveRules().isEmpty());
+        storage.edit().putStringSet("disabled_targets", Set.of()).commit();
+        assertEquals(accepted, repository.effectiveRules());
+        storage.edit().putString("manual", "broken").commit();
+        assertTrue(repository.effectiveRules().isEmpty());
+        storage.edit().putString("manual", "[]").putString("disabled_targets", "wrong type").commit();
+        assertTrue(repository.effectiveRules().isEmpty());
+        storage.edit().remove("disabled_targets").putString("highest_sha256", "invalid").commit();
+        assertTrue(repository.effectiveRules().isEmpty()); assertFalse(repository.refreshOnline().success);
+    }
+
+    @Test public void unavailablePreferenceSnapshotNeverReturnsWarmedRoutes() {
+        SharedPreferences actual = context.getSharedPreferences(RuleRepository.PREFS, Context.MODE_PRIVATE);
+        AtomicBoolean unavailable = new AtomicBoolean();
+        SharedPreferences storage = (SharedPreferences) Proxy.newProxyInstance(SharedPreferences.class.getClassLoader(),
+                new Class<?>[] {SharedPreferences.class}, (proxy, method, args) -> {
+                    if (unavailable.get() && "getAll".equals(method.getName())) throw new IllegalStateException("unavailable");
+                    return FailingCommits.invoke(method, actual, args);
+                });
+        RuleRepository checked = new RuleRepository(context, client, storage);
+        assertEquals(32, checked.effectiveRules().size());
+        unavailable.set(true);
+        assertTrue(checked.effectiveRules().isEmpty()); assertTrue(checked.onlineRules().isEmpty());
+        unavailable.set(false);
+        assertEquals(32, checked.effectiveRules().size());
+    }
 
     @Test public void firstUseVerifiesBundledOnlineBaselineWithoutNetworkOrLegacyMigration() {
         RuleRepository.OnlineState state = repository.onlineState();

@@ -27,5 +27,7 @@ jobs:
         run: '"$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-37.0" "build-tools;36.0.0"'
       - name: Run Android unit tests and Release lint
         run: bash ./gradlew --no-daemon :app:testDebugUnitTest :app:lintRelease
-      - name: Run diagnostic tool tests
+      - name: Run archive reader tests
+        run: python3 -m unittest discover -s tools -p 'test_*.py'
+      - name: Run diagnostic metadata and validation tests
         run: python3 -m unittest discover -s tools/tests -p 'test_*.py'

@@ -26,6 +26,8 @@ public final class RuleReadCounter implements AutoCloseable {
                 SharedPreferences actual = super.getSharedPreferences(name, mode);
                 return (SharedPreferences) Proxy.newProxyInstance(RuleReadCounter.class.getClassLoader(),
                         new Class<?>[]{SharedPreferences.class}, (proxy, method, arguments) -> {
+                            if (Looper.myLooper() == Looper.getMainLooper() && method.getName().equals("getAll"))
+                                reads.merge(name + ":snapshot", 1, Integer::sum);
                             if (Looper.myLooper() == Looper.getMainLooper()
                                     && (method.getName().equals("getString") || method.getName().equals("getBoolean"))
                                     && arguments != null && arguments.length > 0) {
@@ -40,7 +42,7 @@ public final class RuleReadCounter implements AutoCloseable {
         ReflectionHelpers.setField(application, "mBase", counted);
     }
 
-    public int ruleSnapshots() { return reads.getOrDefault(RuleRepository.PREFS + ":manual", 0); }
+    public int ruleSnapshots() { return reads.getOrDefault(RuleRepository.PREFS + ":snapshot", 0); }
     public int switchReads(String key) { return reads.getOrDefault("config:" + key, 0); }
     @Override public void close() { ReflectionHelpers.setField(application, "mBase", original); }
 }

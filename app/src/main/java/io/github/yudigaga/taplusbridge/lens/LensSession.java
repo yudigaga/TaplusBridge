@@ -115,17 +115,20 @@ final class LensSession {
     private void prepareImage() {
         File prepared = null;
         try {
+            if (done) return;
             Bundle enabled = context.getContentResolver().call(
                     Uri.parse("content://" + LensContract.PACKAGE + ".bridge"), "lens_config", null, null);
+            if (done) return;
             if (enabled == null || !enabled.getBoolean("enabled")) throw new IOException("lens_disabled");
             File directory = new File(context.getCacheDir(), "lens");
             if (!directory.isDirectory() && !directory.mkdirs()) throw new IOException("cache_unavailable");
-            File[] stale = directory.listFiles();
-            if (stale != null) for (File file : stale) if (file.isFile()) file.delete();
+            // A cancelled worker may resume after a newer session has prepared its image.
+            // Each session owns only its selected file; never purge the shared cache directory.
             String mime = request.getString("mime_type");
             prepared = File.createTempFile("selected-", "image/png".equals(mime) ? ".png"
                     : "image/webp".equals(mime) ? ".webp" : ".jpg", directory);
             BitmapFactory.Options bounds = LensImageStore.copyVerified(incoming, prepared, request, () -> done);
+            if (done) { prepared.delete(); return; }
             android.util.Log.i(TAG, "image_ready width=" + bounds.outWidth + " height=" + bounds.outHeight
                     + " bytes=" + prepared.length());
             File ready = prepared;

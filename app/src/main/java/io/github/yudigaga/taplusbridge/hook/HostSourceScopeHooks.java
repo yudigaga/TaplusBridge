@@ -33,7 +33,7 @@ public final class HostSourceScopeHooks {
     private final Handler worker;
     private volatile SourceScopePolicy cached;
     private boolean registered;
-    private final ThreadLocal<Boolean> presentationGate = ThreadLocal.withInitial(() -> false);
+    private final PresentationPolicy presentationPolicy = new PresentationPolicy();
     private final Runnable refresh = this::refresh;
     private void refresh() {
         try {
@@ -129,7 +129,7 @@ public final class HostSourceScopeHooks {
                 .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).intercept(chain -> {
                     Context context = (Context) chain.getArg(0);
                     if (!supported(context)) return chain.proceed();
-                    presentationGate.set(true);
+                    presentationPolicy.gateReached();
                     String source = (String) chain.getArg(1);
                     try {
                         SourceScopePolicy policy = policy(context);
@@ -151,10 +151,9 @@ public final class HostSourceScopeHooks {
                 "initPresentationType", false, boolean.class, loader.loadClass("miui.contentcatcher.sdk.ClientCatcherResult"));
         module.hook(presentation).setId("taplusbridge:source-scope-presentation")
                 .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).intercept(chain -> {
-                    boolean previous = presentationGate.get(); presentationGate.set(false);
-                    try {
+                    try (AutoCloseable invocation = presentationPolicy.begin()) {
                         Object result = chain.proceed();
-                        boolean reached = presentationGate.get();
+                        boolean reached = presentationPolicy.reached();
                         try {
                             if (chain.getThisObject() instanceof Context context && supported(context)) {
                                 SourceScopePolicy policy = policy(context);
@@ -164,11 +163,15 @@ public final class HostSourceScopeHooks {
                             }
                         } catch (ReflectiveOperationException | RuntimeException failure) { report(failure); }
                         return result;
-                    } finally { presentationGate.set(previous); }
+                    }
                 });
     }
 
     private SourceScopePolicy policy(Context context) {
+        return presentationPolicy.read(() -> readPolicy(context));
+    }
+
+    private SourceScopePolicy readPolicy(Context context) {
         boolean liveReadFailed = false;
         try {
             if (android.os.Process.myUid() / 100000 == 0 && !BridgeTransport.moduleUnavailable(context)) {

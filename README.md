@@ -1,8 +1,10 @@
 # taplusbridge
 
-当前正式版：**0.15.42 / 74**。
+当前正式版：**0.15.43 / 75**。
 
-0.15.42 在「概览 → 运行与授权」增加「隐藏模块应用图标」，默认关闭。隐藏后可从 LSPosed 的模块设置进入并恢复图标，模块保持启用。见 [0.15.42 更新说明](docs/release-notes-0.15.42-release.md)。
+0.15.43 改善长按识别与拖动响应，修复设置保存失败后的配置一致性，补齐截图管道时限、Lens 旧任务取消及设置列表按需缓存。见 [0.15.43 更新说明](docs/release-notes-0.15.43-release.md)。
+
+可在「概览 → 运行与授权」隐藏模块应用图标，隐藏后从 LSPosed 的模块设置进入并恢复图标；模块保持启用。
 
 剪贴板网页/磁力/ed2k使用本地规则入口，下载链接支持多选和按目标分组。115批量选好后一次直达离线添加入口，默认用户已登录。使用和验证边界见 [0.15.39更新说明](docs/2026-11-06-release-0.15.39-direct-batch.md)。
 
@@ -110,7 +112,7 @@
 
 需要 JDK 21、Android SDK 37 和 Gradle Wrapper。Release 构建需要本机 `keystore.properties`，其中设置 `storeFile`、`storePassword`、`keyAlias` 和 `keyPassword`。签名文件和属性不提交到仓库。
 
-0.15.42／74 的 Release 继续启用 R8 代码裁剪、优化和混淆，使用 Android 默认优化规则及 `app/proguard-rules.pro` 的外部入口保留规则。每次交付应一并归档本次构建的 `mapping.txt`，用于还原崩溃堆栈。
+0.15.43／75 的 Release 继续启用 R8 代码裁剪、优化和混淆，使用 Android 默认优化规则及 `app/proguard-rules.pro` 的外部入口保留规则。每次交付应一并归档本次构建的 `mapping.txt`，用于还原崩溃堆栈。
 
 ```powershell
 .\gradlew.bat :app:lintRelease :app:assembleRelease
@@ -122,6 +124,7 @@
 
 ```powershell
 .\gradlew.bat :app:testDebugUnitTest :app:lintRelease
+python -m unittest discover -s tools -p 'test_*.py'
 python -m unittest discover -s tools/tests -p 'test_*.py'
 ```
 

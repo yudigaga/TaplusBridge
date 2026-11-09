@@ -154,7 +154,7 @@ public final class LinkChoiceActivityAndroidTest {
             Method group = LinkChoiceActivity.class.getDeclaredMethod("downloads", List.class); group.setAccessible(true);
             group.invoke(controller.get(), links);
             // One current-configuration authorization, then one shared grouping snapshot.
-            assertEquals(2, reads.ruleSnapshots());
+            assertEquals(6, reads.ruleSnapshots()); // Constructor state/validation plus effective snapshot for each authorization/grouping read.
             assertEquals(2, reads.switchReads("enabled")); assertEquals(2, reads.switchReads("native"));
             assertEquals(2, reads.switchReads(ConfigStore.CLOUD_LINK_HANDOFF_KEY));
             assertNull(((ShadowActivity) Shadow.extract(controller.get())).getNextStartedActivity());

@@ -136,6 +136,11 @@ public final class HostDragHooks {
         if (hooks != null) hooks.longPress.offerRecognizedLinks(service, result, links);
     }
 
+    static void nativeProbeCompleted(Object service, Object result) {
+        HostDragHooks hooks = installed;
+        if (hooks != null) hooks.longPress.nativeProbeCompleted(service, result);
+    }
+
     public static boolean dismissPreviewForLinkProbe(Object service, Object result, String source) {
         HostDragHooks hooks = installed;
         return hooks == null || hooks.longPress.dismissPreviewForLinkProbe(service, result, source);

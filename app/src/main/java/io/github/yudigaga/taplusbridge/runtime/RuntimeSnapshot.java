@@ -24,6 +24,9 @@ public final class RuntimeSnapshot {
     public final RecognitionChannels channels;
     public final String identity;
     private final String raw;
+    private record RoutingIdentity(boolean nativeEnabled, String mode, boolean cloudLinkHandoff,
+                                   java.util.List<io.github.yudigaga.taplusbridge.rules.LinkRuleEntry> rules, String digest) { }
+    private static RoutingIdentity routingCache;
     private RuntimeSnapshot(String raw,int user,int build,boolean enabled,boolean recognition,boolean capture,
                             SourceScopePolicy sourceScope,boolean scopeCapture,boolean scopeLinkProbe,
                             DragSettings drag,RecognitionChannels channels) {
@@ -32,6 +35,9 @@ public final class RuntimeSnapshot {
         this.drag=drag;this.channels=channels;this.identity=digest(raw);
     }
     public static String from(Context context) {
+        return ConfigStore.readCommitted(() -> fromCommitted(context));
+    }
+    private static String fromCommitted(Context context) {
         ConfigStore config=new ConfigStore(context);
         try {
             JSONObject data=new JSONObject();data.put("schema",SCHEMA);data.put("user",android.os.Process.myUid()/100000);
@@ -47,13 +53,22 @@ public final class RuntimeSnapshot {
         }catch(org.json.JSONException failure){throw new IllegalStateException("configuration_invalid");}
     }
     /** Ordinary app tickets also depend on routing choices, without publishing their rule contents. */
-    private static String routingIdentity(Context context,ConfigStore config) throws org.json.JSONException {
+    private static synchronized String routingIdentity(Context context,ConfigStore config) throws org.json.JSONException {
+        boolean nativeEnabled = config.nativeEnabled(), cloudLinkHandoff = config.cloudLinkHandoffEnabled();
+        String mode = config.mode().name();
+        var effective = new RuleRepository(context).effectiveRules();
+        RoutingIdentity cached = routingCache;
+        if (cached != null && cached.nativeEnabled == nativeEnabled && cached.mode.equals(mode)
+                && cached.cloudLinkHandoff == cloudLinkHandoff && cached.rules.equals(effective)) return cached.digest;
         JSONObject routing=new JSONObject();
-        routing.put("native",config.nativeEnabled());routing.put("mode",config.mode().name());
-        routing.put(ConfigStore.CLOUD_LINK_HANDOFF_KEY,config.cloudLinkHandoffEnabled());
+        routing.put("native",nativeEnabled);routing.put("mode",mode);
+        routing.put(ConfigStore.CLOUD_LINK_HANDOFF_KEY,cloudLinkHandoff);
         JSONArray rules=new JSONArray();
-        for(String rule:ScopedRuleResolver.encode(new RuleRepository(context).effectiveRules()))rules.put(rule);
-        routing.put("rules",rules);return digest(routing.toString());
+        for(String rule:ScopedRuleResolver.encode(effective))rules.put(rule);
+        routing.put("rules",rules);
+        String identity = digest(routing.toString());
+        routingCache = new RoutingIdentity(nativeEnabled, mode, cloudLinkHandoff, effective, identity);
+        return identity;
     }
     public static RuntimeSnapshot parse(String raw) {
         try {

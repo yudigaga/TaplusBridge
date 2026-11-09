@@ -13,6 +13,7 @@ import android.os.SystemClock;
 import io.github.libxposed.service.XposedService;
 import io.github.libxposed.service.XposedServiceHelper;
 import io.github.yudigaga.taplusbridge.config.ConfigStore;
+import io.github.yudigaga.taplusbridge.config.PreferenceCommitContext;
 import io.github.yudigaga.taplusbridge.rules.RuleRepository;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationHandler;
@@ -26,7 +27,10 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.After;
 import org.junit.Before;
@@ -128,6 +132,48 @@ public final class RuntimePublisherSaveAndroidTest {
                 framework.snapshot().scopeLinkProbe);
         assertEquals("The test must not advance the main looper to publish", before, SystemClock.uptimeMillis());
         assertEquals(RuntimeSnapshot.parse(RuntimeSnapshot.from(context)).identity, framework.snapshot().identity);
+    }
+
+    @Test public void concurrentPublicationWaitsForRejectedLocalCommitAndNeverStoresItsChoice() throws Exception {
+        assertConcurrentLocalCommitPublication(false);
+    }
+
+    @Test public void concurrentPublicationWaitsForSuccessfulLocalCommitBeforeStoringItsChoice() throws Exception {
+        assertConcurrentLocalCommitPublication(true);
+    }
+
+    private void assertConcurrentLocalCommitPublication(boolean succeeds) throws Exception {
+        PreferenceCommitContext committing = new PreferenceCommitContext(context);
+        ConfigStore pending = new ConfigStore(committing);
+        committing.reject = !succeeds;
+        committing.memoryChanged = new CountDownLatch(1);
+        committing.releaseCommit = new CountDownLatch(1);
+        ExecutorService writer = Executors.newSingleThreadExecutor();
+        try {
+            Future<?> saved = writer.submit(() -> {
+                if (succeeds) pending.setScopeLinkProbeEnabled(false);
+                else assertThrows(IllegalStateException.class, () -> pending.setScopeLinkProbeEnabled(false));
+            });
+            assertTrue(committing.memoryChanged.await(5, TimeUnit.SECONDS));
+            // Real preference callbacks may enqueue publication before commit() reports its outcome.
+            ShadowLooper.idleMainLooper(100, TimeUnit.MILLISECONDS);
+            publishSavedSettings();
+            Future<?> published = worker.submit(() -> {});
+            assertThrows("Remote publication cannot pass an unresolved local commit", TimeoutException.class,
+                    () -> published.get(100, TimeUnit.MILLISECONDS));
+            assertEquals("The rejected or unconfirmed OFF choice must not reach the framework", 0, framework.updateAttempts.get());
+            committing.releaseCommit.countDown();
+            saved.get(5, TimeUnit.SECONDS);
+            published.get(5, TimeUnit.SECONDS);
+            advanceMainAndWorker(100);
+            assertEquals(!succeeds, framework.snapshot().scopeLinkProbe);
+            if (!succeeds) assertFalse("Rollback notifications must not revive the rejected choice",
+                    framework.writtenProbeChoices.contains(Boolean.FALSE));
+        } finally {
+            committing.releaseCommit.countDown();
+            writer.shutdownNow();
+            assertTrue(writer.awaitTermination(5, TimeUnit.SECONDS));
+        }
     }
 
     @Test public void latestOffChoiceSupersedesAnOlderQueuedPublish() throws Exception {

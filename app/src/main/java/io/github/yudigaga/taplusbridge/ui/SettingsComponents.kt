@@ -108,6 +108,16 @@ internal object SettingsIcons {
     }
 }
 
+@Composable internal fun AppIcon(controller: SettingsController, app: SettingsController.AppEntry?, modifier: Modifier = Modifier) {
+    var drawable by remember(controller, app) { mutableStateOf<Drawable?>(null) }
+    DisposableEffect(controller, app) {
+        var active = true
+        val request = if (app != null) controller.loadAppIcon(app.packageName) { if (active) drawable = it } else null
+        onDispose { active = false; request?.cancel(true) }
+    }
+    AppIcon(drawable, modifier)
+}
+
 @Composable internal fun MessageDialog(title: String, message: String, dismiss: () -> Unit) {
     val bodyHeight = LocalWindowInfo.current.containerDpSize.height * .48f
     OverlayDialog(show = true, title = title, onDismissRequest = dismiss) {

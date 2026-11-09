@@ -162,6 +162,107 @@ public final class SystemLongPressDragPrepareAndroidTest {
         physical.markReleasedElapsed(SystemClock.elapsedRealtime());
     }
 
+    @Test public void aNewPhysicalDownRevokesAnUpdateWaitingForDeviceValidation() throws Exception {
+        ready(); Bundle proof = request(); transferToMask();
+        maskPointer(proof, MotionEvent.ACTION_MOVE, 1070, 200);
+        var entered = new java.util.concurrent.CountDownLatch(1);
+        var unblock = new java.util.concurrent.CountDownLatch(1);
+        Context base = context;
+        context = new ContextWrapper(base) {
+            @Override public Object getSystemService(String name) {
+                if (Context.KEYGUARD_SERVICE.equals(name)) {
+                    entered.countDown();
+                    try { unblock.await(3, java.util.concurrent.TimeUnit.SECONDS); }
+                    catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+                }
+                return super.getSystemService(name);
+            }
+        };
+        Bundle event = new Bundle(proof); event.putInt("action", MotionEvent.ACTION_MOVE); event.putInt("pointers", 1);
+        event.putFloat("x", 600); event.putFloat("y", 200);
+        RuntimeSnapshot configuration = runtime.dragConfiguration();
+        var result = new java.util.concurrent.atomic.AtomicReference<Bundle>();
+        Thread validator = new Thread(() -> result.set(drag.update(event, configuration))); validator.setDaemon(true);
+        try {
+            validator.start(); assertTrue(entered.await(2, java.util.concurrent.TimeUnit.SECONDS));
+            assertFalse(drag.transferredPointer(0, 0, down + 1, MotionEvent.ACTION_DOWN));
+            assertFalse(drag.transferred());
+            unblock.countDown(); validator.join(2000); assertFalse(validator.isAlive());
+            assertEquals("cancelled", result.get().getString("state"));
+        } finally { unblock.countDown(); validator.join(2000); context = base; }
+    }
+
+    @Test public void aNewPhysicalDownRevokesConsumeWaitingForWindowValidation() throws Exception {
+        ready(); Bundle proof = request(); transferToMask();
+        maskPointer(proof, MotionEvent.ACTION_MOVE, 1070, 200); physicalRelease();
+        maskPointer(proof, MotionEvent.ACTION_UP, 1070, 200);
+        var entered = new java.util.concurrent.CountDownLatch(1);
+        var unblock = new java.util.concurrent.CountDownLatch(1);
+        Context base = context;
+        context = new ContextWrapper(base) {
+            @Override public Object getSystemService(String name) {
+                if (Context.ACTIVITY_SERVICE.equals(name)) {
+                    entered.countDown();
+                    try { unblock.await(3, java.util.concurrent.TimeUnit.SECONDS); }
+                    catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+                }
+                return super.getSystemService(name);
+            }
+        };
+        Bundle consume = new Bundle(proof); consume.putString("source", SOURCE); consume.putString("direction", "right");
+        RuntimeSnapshot configuration = runtime.dragConfiguration();
+        var result = new java.util.concurrent.atomic.AtomicReference<Bundle>();
+        Thread validator = new Thread(() -> result.set(drag.consume(consume, configuration))); validator.setDaemon(true);
+        try {
+            validator.start(); assertTrue(entered.await(2, java.util.concurrent.TimeUnit.SECONDS));
+            assertFalse(drag.transferredPointer(0, 0, down + 1, MotionEvent.ACTION_DOWN));
+            unblock.countDown(); validator.join(2000); assertFalse(validator.isAlive());
+            assertFalse("a revoked lease must not authorize delivery after slow validation", result.get().getBoolean("accepted"));
+        } finally { unblock.countDown(); validator.join(2000); context = base; }
+    }
+
+    @Test public void edgeMoveThenInwardUpRetainsTheLastVisitedEdgeWithoutAPoll() throws Exception {
+        ready(); Bundle proof = request(); transferToMask();
+        assertEquals("holding", maskPointer(proof, MotionEvent.ACTION_MOVE, 1070, 200).getString("state"));
+        physicalRelease();
+        Bundle released = maskPointer(proof, MotionEvent.ACTION_UP, 600, 200);
+        assertEquals("released", released.getString("state"));
+        assertEquals("right", released.getString("direction"));
+        assertEquals("translate", released.getString("action"));
+    }
+
+    @Test public void authenticatedMoveReturnsOnlyTheMinimalAcknowledgment() throws Exception {
+        ready(); Bundle proof = request(); transferToMask();
+        Bundle response = maskPointer(proof, MotionEvent.ACTION_MOVE, 1070, 200);
+        assertEquals(java.util.Set.of("state"), response.keySet());
+        assertEquals("holding", response.getString("state"));
+        Bundle bad = new Bundle(proof); bad.putString("token", "z".repeat(43));
+        assertEquals("cancelled", maskPointer(bad, MotionEvent.ACTION_MOVE, 1070, 200).getString("state"));
+    }
+
+    @Test public void inputClassificationNeverWaitsForTheGestureValidatorMonitor() throws Exception {
+        var locked = new java.util.concurrent.CountDownLatch(1);
+        var unlock = new java.util.concurrent.CountDownLatch(1);
+        var classified = new java.util.concurrent.CountDownLatch(1);
+        Thread validator = new Thread(() -> {
+            synchronized (drag) {
+                locked.countDown();
+                try { unlock.await(); } catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); }
+            }
+        });
+        Thread input = new Thread(() -> {
+            drag.transferredPointer(0, 0, down, MotionEvent.ACTION_MOVE);
+            drag.transferred(); classified.countDown();
+        });
+        validator.setDaemon(true); input.setDaemon(true); validator.start();
+        assertTrue(locked.await(2, java.util.concurrent.TimeUnit.SECONDS));
+        try {
+            input.start();
+            assertTrue("the physical input callback must not wait for settings/WMS validation",
+                    classified.await(300, java.util.concurrent.TimeUnit.MILLISECONDS));
+        } finally { unlock.countDown(); validator.join(2000); input.join(2000); }
+    }
+
     @Test public void downWithoutMoveOrNativeContentPreparesExactlyOnceAtRecognitionDeadline() {
         ShadowLooper.idleMainLooper(199, java.util.concurrent.TimeUnit.MILLISECONDS); assertTrue(starts.isEmpty());
         ShadowLooper.idleMainLooper(1, java.util.concurrent.TimeUnit.MILLISECONDS); assertEquals(1, starts.size());
@@ -268,6 +369,33 @@ public final class SystemLongPressDragPrepareAndroidTest {
         assertFalse(drag.fingerReleasedForLink());
         assertFalse(runtime.handle(HOST_UID, "drag_gesture_link", proof).getBoolean("accepted"));
         assertEquals(0, links[0]);
+    }
+
+    @Test public void completedEmptyLinkProbeStopsWaitingAndOldCompletionCannotFinishTheNextGesture() throws Exception {
+        assertTrue(settings.saveSourceScope(SourceScopePolicy.Mode.BLACKLIST, List.of(), List.of(), false, true)); publish();
+        List<java.util.function.Consumer<String>> callbacks = new ArrayList<>();
+        drag.setCardLinks((target, configuration, completed) -> callbacks.add(completed));
+        pointer(MotionEvent.ACTION_DOWN, 50, 200); ready(); Bundle proof = request();
+        transferToMask(); maskPointer(proof, MotionEvent.ACTION_MOVE, 1070, 200); physicalRelease();
+        maskPointer(proof, MotionEvent.ACTION_UP, 1070, 200);
+        assertTrue(runtime.handle(HOST_UID, "drag_gesture_link", proof).getBoolean("accepted"));
+        assertFalse(drag.poll(proof, runtime.dragConfiguration()).getBoolean("link_complete"));
+        callbacks.get(0).accept(null);
+        Bundle finished = drag.poll(proof, runtime.dragConfiguration());
+        assertTrue("An empty completed probe must not spend the remaining 6.5 second grace waiting", finished.getBoolean("link_complete"));
+        assertNull(finished.getString("card_link"));
+
+        pointer(MotionEvent.ACTION_DOWN, 50, 200); ready(); Bundle newer = request();
+        transferToMask(); maskPointer(newer, MotionEvent.ACTION_MOVE, 1070, 200); physicalRelease();
+        maskPointer(newer, MotionEvent.ACTION_UP, 1070, 200);
+        assertTrue(runtime.handle(HOST_UID, "drag_gesture_link", newer).getBoolean("accepted"));
+        callbacks.get(0).accept("https://example.com/stale");
+        Bundle pending = drag.poll(newer, runtime.dragConfiguration());
+        assertFalse(pending.getBoolean("link_complete")); assertNull(pending.getString("card_link"));
+        callbacks.get(1).accept("https://example.com/current");
+        Bundle complete = drag.poll(newer, runtime.dragConfiguration());
+        assertTrue(complete.getBoolean("link_complete"));
+        assertEquals("https://example.com/current", complete.getString("card_link"));
     }
 
     @Test public void nativePreTransferJitterWithinTouchSlopKeepsTheOriginalSourcePointStable() {

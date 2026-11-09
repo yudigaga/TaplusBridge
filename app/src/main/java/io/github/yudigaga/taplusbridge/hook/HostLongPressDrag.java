@@ -21,8 +21,10 @@ import io.github.yudigaga.taplusbridge.config.RecognitionChannels;
 import io.github.yudigaga.taplusbridge.config.RecognitionChannels.Channel;
 import io.github.yudigaga.taplusbridge.capture.IntentObservation;
 import io.github.yudigaga.taplusbridge.drag.RainbowDragView;
+import io.github.yudigaga.taplusbridge.drag.EdgeDragTarget;
 import io.github.yudigaga.taplusbridge.runtime.BridgeTransport;
 import io.github.yudigaga.taplusbridge.runtime.RuntimeClient;
+import io.github.yudigaga.taplusbridge.runtime.CaptureIo;
 import io.github.yudigaga.taplusbridge.probe.ProbeContract;
 import io.github.yudigaga.taplusbridge.recognition.LinkExtractor;
 import java.io.File;
@@ -53,6 +55,25 @@ final class HostLongPressDrag {
         Thread t = new Thread(r, "TaplusBridge-long-press-drag"); t.setDaemon(true); return t;
     });
     private volatile Held current;
+    private Preparation preparing;
+
+    private static final class Preparation {
+        final Object service;
+        final String token;
+        private java.io.InputStream input;
+        private boolean closed;
+        Preparation(Object service, String token) { this.service = service; this.token = token; }
+        boolean attach(java.io.InputStream stream) {
+            synchronized (this) { if (!closed) { input = stream; return true; } }
+            try { stream.close(); } catch (IOException ignored) { }
+            return false;
+        }
+        void close() {
+            java.io.InputStream stream;
+            synchronized (this) { closed = true; stream = input; input = null; }
+            if (stream != null) try { stream.close(); } catch (IOException ignored) { }
+        }
+    }
     private volatile StageDeadline lastStageDeadline;
 
     static final class StageDeadline {
@@ -78,12 +99,15 @@ final class HostLongPressDrag {
         String text;
         Bitmap image;
         final String source, token, identity;
+        final float originX, originY, width, height, density;
         RainbowDragView preview;
         WindowManager windows;
         WindowManager.LayoutParams layout;
         boolean previewFailed;
         boolean maskActive;
         boolean transferPending;
+        final java.util.ArrayDeque<Bundle> touches = new java.util.ArrayDeque<>();
+        boolean touchDrainScheduled, touchEnded;
         volatile boolean overlayRequested;
         volatile boolean imported;
         volatile boolean linkGraceUsed;
@@ -92,12 +116,15 @@ final class HostLongPressDrag {
         volatile boolean systemLinkRequested;
         boolean canonicalPayload;
         boolean nativeProbeAvailable;
+        volatile boolean nativeProbeFinished;
         List<String> recognizedLinks = List.of();
         Held(Context context, Object service, Object result, String text, Bitmap image, Lease lease) {
             this.began = SystemClock.elapsedRealtime(); this.context = context;
             this.service = service; this.nativePick = result; this.result = result; this.text = text; this.image = image;
             this.recognitionAt = lease.recognitionAt();
             source = lease.source; token = lease.token; identity = lease.identity;
+            originX = lease.originX(); originY = lease.originY(); width = lease.width();
+            height = lease.height(); density = lease.density();
             canonicalPayload = result == null;
             nativeProbeAvailable = nativeProbeGeometry(result);
         }
@@ -106,7 +133,7 @@ final class HostLongPressDrag {
     record Lease(String token, String source, String identity, String state, float x, float y,
                  float originX, float originY, String direction, String action,
                  float width, float height, float density, Map<String, String> actions, boolean dragging,
-                 String cardLink, long nativeAt, long recognitionAt, long dragAt, boolean linkProbe) {
+                 String cardLink, long nativeAt, long recognitionAt, long dragAt, boolean linkProbe, boolean linkComplete) {
         boolean recognitionReady(long now) { return now >= recognitionAt; }
         boolean dragReady(long now) { return now >= dragAt; }
     }
@@ -137,11 +164,17 @@ final class HostLongPressDrag {
         acceptPrepared(context, service, response, token);
     }
 
-    synchronized boolean acceptPrepared(Context context, Object service, Bundle response, String expectedToken) {
+    boolean acceptPrepared(Context context, Object service, Bundle response, String expectedToken) {
         Bitmap image = null;
         Bundle capture = null;
+        Preparation pending = null;
         try {
             if (context == null || service == null || response == null || !validToken(expectedToken)) return false;
+            pending = new Preparation(service, expectedToken);
+            synchronized (this) {
+                if (preparing != null) preparing.close();
+                preparing = pending;
+            }
             Lease lease = lease(response, response.getString("source"), expectedToken, null);
             if (lease == null || !"holding".equals(lease.state())
                     || !lease.recognitionReady(SystemClock.elapsedRealtime())) return false;
@@ -150,29 +183,47 @@ final class HostLongPressDrag {
             if (!lease.source().equals(metadata.source()) || lease.originX() != metadata.x()
                     || lease.originY() != metadata.y() || lease.width() != metadata.width()
                     || lease.height() != metadata.height()) return false;
+            java.io.InputStream input = null;
             if ("image".equals(metadata.kind())) {
                 if (!(capture.get("fd") instanceof ParcelFileDescriptor descriptor)) return false;
-                try (var input = new ParcelFileDescriptor.AutoCloseInputStream(descriptor)) {
-                    image = ScopeCapturePayload.decode(ScopeCapturePayload.read(input, metadata.bytes()));
-                }
+                input = new ParcelFileDescriptor.AutoCloseInputStream(descriptor);
+                if (!pending.attach(input)) return false;
             } else if (!"resume".equals(metadata.kind())) return false;
-            if (current != null && current.token.equals(lease.token())) {
-                applySourceText(current, response);
-                if (current.image == null && image != null) {
-                    current.image = image; image = null; current.canonicalPayload = true;
+            // Read, decode and live-lease validation can block; none may hold the gesture monitor.
+            if (input != null) {
+                byte[] png = CaptureIo.read(input, metadata.bytes(), CaptureIo.TIMEOUT_MILLIS);
+                try { image = ScopeCapturePayload.decode(png); }
+                finally { java.util.Arrays.fill(png, (byte) 0); }
+            }
+            Bundle request = new Bundle(); request.putString("token", lease.token());
+            Bundle latest = RuntimeClient.call(context, "drag_gesture_poll", request);
+            Lease confirmed = lease(latest, lease.source(), lease.token(), lease.identity());
+            if (confirmed == null || "cancelled".equals(confirmed.state())) return false;
+            synchronized (this) {
+                if (preparing != pending) return false;
+                preparing = null;
+                if (current != null && current.token.equals(lease.token())) {
+                    if (current.service != service || !current.identity.equals(lease.identity())
+                            || !current.source.equals(lease.source())) return false;
+                    applySourceText(current, latest);
+                    if (current.image == null && image != null) {
+                        current.image = image; image = null; current.canonicalPayload = true;
+                    }
+                    return true;
                 }
+                Held prepared = new Held(context, service, null, null, image, confirmed);
+                applySourceText(prepared, latest);
+                Held previous = current; current = prepared; image = null;
+                if (previous != null) release(previous);
+                event("prepared", null);
+                worker.execute(() -> process(prepared, confirmed));
                 return true;
             }
-            Held prepared = new Held(context, service, null, null, image, lease);
-            applySourceText(prepared, response);
-            Held previous = current; current = prepared; image = null;
-            if (previous != null) release(previous);
-            event("prepared", null);
-            worker.execute(() -> process(prepared, lease));
-            return true;
         } catch (IOException | RuntimeException invalid) {
             event("prepare_failed", invalid.getClass().getSimpleName()); return false;
         } finally {
+            synchronized (this) { if (preparing == pending) preparing = null; }
+            if (pending != null) pending.close();
             if (image != null && !image.isRecycled()) image.recycle();
             if (capture != null && capture.get("fd") instanceof ParcelFileDescriptor descriptor)
                 try { descriptor.close(); } catch (IOException ignored) { }
@@ -198,6 +249,9 @@ final class HostLongPressDrag {
             Lease lease = lease(RuntimeClient.call(context, "drag_gesture_claim", request), source, null, null);
             if (lease == null || "cancelled".equals(lease.state))
                 return false;
+            if (preparing != null && !preparing.token.equals(lease.token())) {
+                preparing.close(); preparing = null;
+            }
             lastStageDeadline = new StageDeadline(service, result, lease.recognitionAt(),
                     SystemClock.elapsedRealtime() + TIMEOUT);
             if (current != null && current.token.equals(lease.token)) {
@@ -228,6 +282,7 @@ final class HostLongPressDrag {
     }
 
     synchronized void close(Object service) {
+        if (preparing != null && preparing.service == service) { preparing.close(); preparing = null; }
         Held held = current;
         if (held == null || held.service != service) return;
         current = null; release(held);
@@ -256,8 +311,10 @@ final class HostLongPressDrag {
         if ("released".equals(lease.state)) {
             if (lease.direction == null || "none".equals(lease.action)) discard(held);
             else {
-                held.text = withCardLink(held.text, lease.cardLink());
-                if ((held.nativeProbeAvailable || lease.linkProbe()) && needsCatcherLink(lease.action(), held.text)) {
+                synchronized (this) { held.text = withCardLink(held.text, lease.cardLink()); }
+                boolean linkComplete = held.nativeProbeAvailable ? held.nativeProbeFinished : lease.linkComplete();
+                if (lease.linkProbe() && !linkComplete
+                        && needsCatcherLink(lease.action(), held.text)) {
                     if (held.linkWaitUntil == 0) held.linkWaitUntil = linkWaitDeadline(SystemClock.elapsedRealtime());
                     if (!held.nativeProbeAvailable && lease.linkProbe() && !held.systemLinkRequested) {
                         held.systemLinkRequested = true;
@@ -306,7 +363,7 @@ final class HostLongPressDrag {
 
     /** A title-only callback is not the card link. Rules and browser leave the catcher alone until one arrives. */
     static boolean needsCatcherLink(String action, String text) {
-        if ("none".equals(action) || "lens".equals(action)) return false;
+        if ("none".equals(action) || "lens".equals(action) || "copy".equals(action) || "translate".equals(action)) return false;
         return LinkExtractor.extract(text == null ? "" : text).isEmpty();
     }
 
@@ -363,6 +420,13 @@ final class HostLongPressDrag {
         held.text = withRecognizedLinks(held.text, held.recognizedLinks);
         if (held.preview != null) held.preview.updateCaption(held.text);
         event("links_attached", null);
+    }
+
+    synchronized void nativeProbeCompleted(Object service, Object result) {
+        Held held = current;
+        if (held == null || held.imported || held.service != service
+                || (held.nativePick != result && held.result != result)) return;
+        held.nativeProbeFinished = true;
     }
 
     boolean dismissPreviewForLinkProbe(Object service, Object result, String source) {
@@ -446,8 +510,8 @@ final class HostLongPressDrag {
 
     private synchronized void applySourceText(Held held, Bundle response) {
         if (held.imported || response == null || !(response.get("source_text") instanceof String next)
-                || !RecognitionPolicy.read(held.context).enabled(Channel.ASSIST)
-                || !ScopeCapturePayload.validContent(next) || Objects.equals(held.text, next)) return;
+                || !ScopeCapturePayload.validContent(next) || held.text != null && held.text.contains(next)
+                || !RecognitionPolicy.read(held.context).enabled(Channel.ASSIST)) return;
         if (held.text == null || held.text.isBlank()) held.text = next;
         else {
             String merged = withRecognizedLinks(held.text, LinkExtractor.extract(next));
@@ -464,6 +528,9 @@ final class HostLongPressDrag {
 
     private synchronized boolean finish(Held held) {
         if (!owns(held)) return false;
+        if (preparing != null && preparing.token.equals(held.token)) {
+            preparing.close(); preparing = null;
+        }
         current = null;
         release(held);
         return true;
@@ -472,6 +539,7 @@ final class HostLongPressDrag {
     private void discard(Held held) { if (finish(held)) event("cancelled", null); }
 
     private void release(Held held) {
+        synchronized (held.touches) { held.touches.clear(); held.touchEnded = true; }
         main.post(() -> removePreview(held));
         // The same worker serializes encoding and disposal, so native cancellation cannot recycle an in-use snapshot.
         worker.execute(() -> { if (held.image != null && !held.image.isRecycled()) held.image.recycle(); });
@@ -649,7 +717,41 @@ final class HostLongPressDrag {
         Bundle request = new Bundle(); request.putString("token", held.token); request.putInt("action", action);
         request.putInt("pointers", event.getPointerCount()); request.putFloat("x", event.getRawX());
         request.putFloat("y", event.getRawY());
-        worker.execute(() -> { if (owns(held)) RuntimeClient.call(held.context, "drag_gesture_update", request); });
+        synchronized (held.touches) {
+            if (held.touchEnded || !owns(held)) return;
+            if (action == MotionEvent.ACTION_MOVE) {
+                boolean edge = touchesEdge(held, request);
+                Bundle previous = held.touches.peekLast();
+                // Keep only the latest edge waypoint and current position for this MOVE suffix.
+                while (previous != null && previous.getInt("action") == MotionEvent.ACTION_MOVE
+                        && previous.getInt("pointers") == event.getPointerCount()) {
+                    if (!edge && touchesEdge(held, previous)) break;
+                    held.touches.removeLast(); previous = held.touches.peekLast();
+                }
+            }
+            held.touches.addLast(request);
+            if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) held.touchEnded = true;
+            if (held.touchDrainScheduled) return;
+            held.touchDrainScheduled = true;
+        }
+        worker.execute(() -> drainTouch(held));
+    }
+
+    private static boolean touchesEdge(Held held, Bundle request) {
+        return EdgeDragTarget.at(request.getFloat("x"), request.getFloat("y"), held.originX, held.originY,
+                held.width, held.height, held.density).touching() != null;
+    }
+
+    private void drainTouch(Held held) {
+        Bundle request;
+        synchronized (held.touches) {
+            if (!owns(held)) { held.touches.clear(); held.touchDrainScheduled = false; return; }
+            request = held.touches.pollFirst();
+            if (request == null) { held.touchDrainScheduled = false; return; }
+        }
+        if (owns(held)) RuntimeClient.call(held.context, "drag_gesture_update", request);
+        // Reschedule one drain so polls and cancellation can run between Binder calls.
+        worker.execute(() -> drainTouch(held));
     }
 
     private static void removePreview(Held held) {
@@ -700,7 +802,8 @@ final class HostLongPressDrag {
             } else if (!DragSettings.DIRECTIONS.contains(direction) || !DragSettings.ACTIONS.contains(action)) return null;
             return new Lease(token, source, identity, state, x, y, originX, originY, direction, action,
                     width, height, density, Map.copyOf(actions), response.getBoolean("dragging"),
-                    response.getString("card_link"), nativeAt, recognitionAt, dragAt, response.getBoolean("link_probe"));
+                    response.getString("card_link"), nativeAt, recognitionAt, dragAt, response.getBoolean("link_probe"),
+                    response.getBoolean("link_complete"));
         } catch (RuntimeException invalid) { return null; }
     }
 

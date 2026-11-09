@@ -4,6 +4,8 @@ import android.app.Activity;
 import android.content.Context;
 import android.content.ComponentName;
 import android.content.Intent;
+import android.content.BroadcastReceiver;
+import android.content.IntentFilter;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
@@ -72,6 +74,24 @@ public final class SettingsController implements AutoCloseable {
     private long appsGeneration;
     private long onlineGeneration;
     private long authorizationGeneration;
+    private List<AppEntry> cachedApplications;
+    private Consumer<List<AppEntry>> applicationsCallback;
+    private boolean applicationsLoading, observingApplications;
+    private Runnable applicationsChanged;
+    private final android.util.LruCache<String, Drawable> applicationIcons = new android.util.LruCache<>(64);
+    private final Runnable deliverApplications = this::deliverCachedApplications;
+    private final BroadcastReceiver packageChanges = new BroadcastReceiver() {
+        @Override public void onReceive(Context ignored, Intent intent) {
+            Runnable changed;
+            synchronized (lifecycleLock) {
+                if (closed) return;
+                appsGeneration++; cachedApplications = null; applicationIcons.evictAll();
+                changed = applicationsChanged;
+                if (applicationsCallback != null && !applicationsLoading) scanApplications();
+            }
+            if (changed != null) changed.run();
+        }
+    };
 
     interface ShizukuAuthorization {
         boolean granted();
@@ -360,10 +380,9 @@ public final class SettingsController implements AutoCloseable {
 
     public static final class AppEntry {
         public final String label, packageName;
-        public final Drawable icon;
         public final boolean enabled;
-        private AppEntry(String label, String packageName, Drawable icon, boolean enabled) {
-            this.label = label; this.packageName = packageName; this.icon = icon; this.enabled = enabled;
+        private AppEntry(String label, String packageName, boolean enabled) {
+            this.label = label; this.packageName = packageName; this.enabled = enabled;
         }
     }
 
@@ -405,19 +424,21 @@ public final class SettingsController implements AutoCloseable {
 
     /** Call off the UI thread for a full installed-app picker. Includes installed disabled/hidden apps. */
     public List<AppEntry> installedApps() {
+        List<AppEntry> result = scanInstalledApplications();
+        return result == null ? List.of() : result;
+    }
+    private List<AppEntry> scanInstalledApplications() {
         PackageManager pm = context.getPackageManager();
         List<AppEntry> result = new ArrayList<>();
         List<ApplicationInfo> applications;
         try { applications = pm.getInstalledApplications(APP_FLAGS); }
-        catch (RuntimeException unavailable) { return result; }
+        catch (RuntimeException unavailable) { return null; }
         for (ApplicationInfo app : applications) {
             if ((app.flags & ApplicationInfo.FLAG_INSTALLED) == 0) continue;
             String label;
             try { label = pm.getApplicationLabel(app).toString(); }
             catch (RuntimeException unavailable) { label = app.packageName; }
-            Drawable icon = null;
-            try { icon = pm.getApplicationIcon(app); } catch (RuntimeException unavailable) { }
-            result.add(new AppEntry(label, app.packageName, icon, app.enabled));
+            result.add(new AppEntry(label, app.packageName, app.enabled));
         }
         Collator collator = Collator.getInstance();
         result.sort((left, right) -> {
@@ -483,12 +504,84 @@ public final class SettingsController implements AutoCloseable {
 
     public void loadInstalledApps(Consumer<List<AppEntry>> callback) {
         Objects.requireNonNull(callback, "callback");
-        final long request;
-        synchronized (lifecycleLock) { requireOpenLocked(); request = ++appsGeneration; }
-        submit(() -> installedApps(), value -> {
-            synchronized (lifecycleLock) { if (request != appsGeneration) return; }
-            callback.accept(value);
+        synchronized (lifecycleLock) {
+            requireOpenLocked(); observeApplications(); applicationsCallback = callback;
+            if (cachedApplications != null) {
+                main.removeCallbacks(deliverApplications); main.post(deliverApplications);
+            } else if (!applicationsLoading) scanApplications();
+        }
+    }
+    private void observeApplications() {
+        if (observingApplications) return;
+        IntentFilter filter = new IntentFilter(Intent.ACTION_PACKAGE_ADDED);
+        filter.addAction(Intent.ACTION_PACKAGE_REMOVED); filter.addAction(Intent.ACTION_PACKAGE_CHANGED);
+        filter.addAction(Intent.ACTION_PACKAGE_REPLACED); filter.addDataScheme("package");
+        if (android.os.Build.VERSION.SDK_INT >= 33)
+            context.registerReceiver(packageChanges, filter, Context.RECEIVER_NOT_EXPORTED);
+        else context.registerReceiver(packageChanges, filter);
+        observingApplications = true;
+    }
+    public void setApplicationsChanged(Runnable listener) {
+        synchronized (lifecycleLock) {
+            if (closed && listener == null) return;
+            requireOpenLocked(); applicationsChanged = listener;
+        }
+    }
+    private void scanApplications() {
+        applicationsLoading = true;
+        long request = appsGeneration;
+        submit(this::scanInstalledApplications, value -> {
+            Consumer<List<AppEntry>> callback;
+            List<AppEntry> result = value == null ? List.of() : List.copyOf(value);
+            synchronized (lifecycleLock) {
+                applicationsLoading = false;
+                if (request != appsGeneration) {
+                    if (applicationsCallback != null) scanApplications();
+                    return;
+                }
+                cachedApplications = value == null ? null : result;
+                callback = applicationsCallback; applicationsCallback = null;
+            }
+            if (callback != null) callback.accept(result);
         });
+    }
+    private void deliverCachedApplications() {
+        Consumer<List<AppEntry>> callback; List<AppEntry> value;
+        synchronized (lifecycleLock) {
+            if (closed || cachedApplications == null) return;
+            callback = applicationsCallback; applicationsCallback = null; value = cachedApplications;
+        }
+        Activity owner = activity.get();
+        if (callback != null && owner != null && !owner.isFinishing() && !owner.isDestroyed()) callback.accept(value);
+    }
+    public Future<?> loadAppIcon(String packageName, Consumer<Drawable> callback) {
+        Objects.requireNonNull(callback, "callback");
+        final long request; Drawable cached;
+        synchronized (lifecycleLock) {
+            requireOpenLocked(); observeApplications(); request = appsGeneration;
+            cached = applicationIcons.get(packageName);
+        }
+        Consumer<Drawable> deliver = icon -> {
+            synchronized (lifecycleLock) { if (closed || request != appsGeneration) return; }
+            Activity owner = activity.get();
+            if (owner != null && !owner.isFinishing() && !owner.isDestroyed()) callback.accept(icon);
+        };
+        if (cached != null) { main.post(() -> deliver.accept(cached)); return null; }
+        return submit(() -> {
+            synchronized (lifecycleLock) {
+                if (closed || request != appsGeneration) return null;
+                Drawable known = applicationIcons.get(packageName); if (known != null) return known;
+            }
+            Drawable icon = null;
+            try {
+                PackageManager pm = context.getPackageManager();
+                icon = pm.getApplicationIcon(pm.getApplicationInfo(packageName, APP_FLAGS));
+            } catch (PackageManager.NameNotFoundException | RuntimeException unavailable) { }
+            synchronized (lifecycleLock) {
+                if (!closed && request == appsGeneration && icon != null) applicationIcons.put(packageName, icon);
+            }
+            return icon;
+        }, deliver);
     }
     public void probeRoot(Consumer<ThawEngine.Result> callback) {
         Objects.requireNonNull(callback, "callback");
@@ -499,13 +592,13 @@ public final class SettingsController implements AutoCloseable {
             callback.accept(value);
         });
     }
-    private <T> void submit(Supplier<T> task, Consumer<T> callback) {
+    private <T> Future<?> submit(Supplier<T> task, Consumer<T> callback) {
         synchronized (lifecycleLock) {
             requireOpenLocked();
             long acceptedGeneration = generation;
             pending.removeIf(Future::isDone);
             try {
-                pending.add(worker.submit(() -> {
+                Future<?> submitted = worker.submit(() -> {
                     try (ModuleProcessLifecycle.Lease ignored = ModuleProcessLifecycle.acquire()) {
                         T value = task.get();
                         main.post(() -> {
@@ -514,7 +607,9 @@ public final class SettingsController implements AutoCloseable {
                             if (owner != null && !owner.isFinishing() && !owner.isDestroyed()) callback.accept(value);
                         });
                     }
-                }));
+                });
+                pending.add(submitted);
+                return submitted;
             } catch (RejectedExecutionException unavailable) { throw new IllegalStateException("页面任务已结束，请重新打开页面"); }
         }
     }
@@ -523,6 +618,9 @@ public final class SettingsController implements AutoCloseable {
         synchronized (lifecycleLock) {
             if (closed) return; closed = true; generation++; rootGeneration++; appsGeneration++; onlineGeneration++;
             authorizationGeneration++; authorizationRefresh = null;
+            applicationsCallback = null; applicationsChanged = null; cachedApplications = null;
+            applicationIcons.evictAll();
+            if (observingApplications) { context.unregisterReceiver(packageChanges); observingApplications = false; }
             removeAuthorization = observingAuthorization; observingAuthorization = false;
             for (Future<?> future : pending) future.cancel(true);
             pending.clear(); worker.shutdownNow(); main.removeCallbacksAndMessages(null); activity.clear();

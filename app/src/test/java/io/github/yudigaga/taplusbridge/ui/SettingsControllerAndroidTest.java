@@ -246,6 +246,7 @@ public final class SettingsControllerAndroidTest {
         assertTrue(CaptureBroker.validNonce(nonce));
         SharedPreferences preferences = context.getSharedPreferences("config", Context.MODE_PRIVATE);
         List<String> observed = new ArrayList<>();
+        String confirmedBeforeSave = new ConfigStore(context).sourceScope().encode() + "|" + new ConfigStore(context).scopeCaptureEnabled();
         SharedPreferences.OnSharedPreferenceChangeListener listener = (ignored, key) -> observed.add(
                 new ConfigStore(context).sourceScope().encode() + "|" + new ConfigStore(context).scopeCaptureEnabled());
         preferences.registerOnSharedPreferenceChangeListener(listener);
@@ -257,7 +258,8 @@ public final class SettingsControllerAndroidTest {
         assertEquals(SourceScopePolicy.Mode.WHITELIST, restored.sourceScope().mode);
         assertEquals(Set.of(WECHAT), restored.sourceScope().blacklist); assertEquals(Set.of(BILI), restored.sourceScope().whitelist);
         assertFalse(observed.isEmpty());
-        for (String value : observed) assertEquals(restored.sourceScope().encode() + "|true", value);
+        // Android notifies before commit returns; readers keep the confirmed pair until its disk result is known.
+        for (String value : observed) assertEquals(confirmedBeforeSave, value);
         assertEquals("捕获已取消", CaptureBroker.status(context)); assertTrue(CaptureBroker.take(context, nonce).isEmpty());
         controller.saveSourceScope(SourceScopePolicy.Mode.BLACKLIST, List.of(WECHAT), List.of(BILI));
         assertTrue(new ConfigStore(context).scopeCaptureEnabled());
@@ -422,6 +424,94 @@ public final class SettingsControllerAndroidTest {
         main.idle(); assertEquals(1, callbacks.get());
         controller.probeRoot(result -> callbacks.incrementAndGet()); worker.runNext();
         controller.close(); main.idle(); assertEquals(1, callbacks.get()); assertTrue(worker.isShutdown());
+    }
+
+    @Test public void installedAppRequestsShareOneScanAndCachedResults() {
+        install("com.example.cached", "Cached", true);
+        AtomicInteger obsolete = new AtomicInteger(), latest = new AtomicInteger();
+        controller.loadInstalledApps(entries -> obsolete.incrementAndGet());
+        controller.loadInstalledApps(entries -> latest.incrementAndGet());
+        assertEquals("Repeated page requests must share one installed-app scan", 1, worker.jobs.size());
+        worker.runNext(); main.idle();
+        assertEquals(0, obsolete.get()); assertEquals(1, latest.get());
+        controller.loadInstalledApps(entries -> {
+            assertTrue(entries.stream().anyMatch(app -> app.packageName.equals("com.example.cached")));
+            latest.incrementAndGet();
+        });
+        assertTrue("Returning to an unchanged page must reuse its application list", worker.jobs.isEmpty());
+        main.idle(); assertEquals(2, latest.get());
+    }
+
+    @Test public void packageChangesInvalidateCachedApplicationsAndCannotDeliverAnOldScan() {
+        install("com.example.before", "Before", true);
+        List<List<SettingsController.AppEntry>> delivered = new ArrayList<>();
+        controller.loadInstalledApps(delivered::add);
+        install("com.example.after", "After", false);
+        context.sendBroadcast(new Intent(Intent.ACTION_PACKAGE_ADDED,
+                android.net.Uri.parse("package:com.example.after")));
+        worker.runNext();
+        main.idle();
+        assertTrue("A queued result from before the package change must be discarded", delivered.isEmpty());
+        assertEquals("One replacement scan must serve the waiting page", 1, worker.jobs.size());
+        worker.runNext(); main.idle();
+        assertEquals(1, delivered.size());
+        assertTrue(delivered.get(0).stream().anyMatch(app -> app.packageName.equals("com.example.after") && !app.enabled));
+        controller.loadInstalledApps(delivered::add); main.idle();
+        assertTrue(worker.jobs.isEmpty()); assertEquals(2, delivered.size());
+        controller.close();
+        context.sendBroadcast(new Intent(Intent.ACTION_PACKAGE_CHANGED,
+                android.net.Uri.parse("package:com.example.after")));
+        main.idle(); assertTrue(worker.jobs.isEmpty());
+    }
+
+    @Test @Config(shadows = IconCountingPackageManager.class)
+    public void installedScanLoadsOnlyTextAndVisibleIconsAreCachedAndInvalidated() throws Exception {
+        IconCountingPackageManager.icons.set(0);
+        install("com.example.visible", "Visible", false);
+        controller.loadInstalledApps(entries -> {}); worker.runNext(); main.idle();
+        assertEquals("Scanning app labels must not decode every installed icon", 0, IconCountingPackageManager.icons.get());
+        Method load = SettingsController.class.getMethod("loadAppIcon", String.class, java.util.function.Consumer.class);
+        List<android.graphics.drawable.Drawable> images = new ArrayList<>();
+        load.invoke(controller, "com.example.visible", (java.util.function.Consumer<android.graphics.drawable.Drawable>) images::add);
+        worker.runNext(); main.idle();
+        assertEquals(1, images.size()); assertNotNull(images.get(0));
+        load.invoke(controller, "com.example.visible", (java.util.function.Consumer<android.graphics.drawable.Drawable>) images::add);
+        main.idle();
+        assertEquals(1, IconCountingPackageManager.icons.get()); assertEquals(2, images.size());
+        context.sendBroadcast(new Intent(Intent.ACTION_PACKAGE_CHANGED,
+                android.net.Uri.parse("package:com.example.visible")));
+        main.idle();
+        load.invoke(controller, "com.example.visible", (java.util.function.Consumer<android.graphics.drawable.Drawable>) images::add);
+        worker.runNext(); main.idle();
+        assertEquals(2, IconCountingPackageManager.icons.get());
+    }
+
+    @org.robolectric.annotation.Implements(className = "android.app.ApplicationPackageManager")
+    public static final class IconCountingPackageManager extends org.robolectric.shadows.ShadowApplicationPackageManager {
+        static final AtomicInteger icons = new AtomicInteger();
+        @org.robolectric.annotation.Implementation
+        protected android.graphics.drawable.Drawable getApplicationIcon(ApplicationInfo app) {
+            icons.incrementAndGet();
+            return new android.graphics.drawable.ColorDrawable(android.graphics.Color.BLUE);
+        }
+    }
+
+    @Test @Config(shadows = IconCountingPackageManager.class)
+    public void leavingAnIconRowCanCancelItsQueuedDecodeBeforeItRuns() throws Exception {
+        IconCountingPackageManager.icons.set(0);
+        install("com.example.offscreen", "Offscreen", true);
+        AtomicInteger delivered = new AtomicInteger();
+        Method load = SettingsController.class.getMethod("loadAppIcon", String.class, java.util.function.Consumer.class);
+        Object request = load.invoke(controller, "com.example.offscreen",
+                (java.util.function.Consumer<android.graphics.drawable.Drawable>) icon -> delivered.incrementAndGet());
+        assertTrue("An icon row must be able to cancel work when it leaves composition", request instanceof java.util.concurrent.Future<?>);
+        ((java.util.concurrent.Future<?>) request).cancel(true);
+        worker.runNext(); main.idle();
+        assertEquals(0, IconCountingPackageManager.icons.get()); assertEquals(0, delivered.get());
+        load.invoke(controller, "com.example.offscreen",
+                (java.util.function.Consumer<android.graphics.drawable.Drawable>) icon -> delivered.incrementAndGet());
+        worker.runNext(); main.idle();
+        assertEquals(1, IconCountingPackageManager.icons.get()); assertEquals(1, delivered.get());
     }
     @Test public void replacedAndDestroyedPageCallbacksCannotUpdateTheUi() {
         AtomicInteger old = new AtomicInteger(), latest = new AtomicInteger();

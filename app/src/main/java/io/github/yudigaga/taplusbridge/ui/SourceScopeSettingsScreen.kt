@@ -146,7 +146,7 @@ import top.yukonga.miuix.kmp.preference.RadioButtonPreference
                 SettingsCard {
                     CheckboxPreference(title = app.label, summary = app.packageName + if (app.enabled) "" else " · 已停用",
                         checked = true, onCheckedChange = { select(app.packageName, it) },
-                        startAction = { AppIcon(app.icon) }, modifier = Modifier.testTag("source_scope.app.${app.packageName}")
+                        startAction = { AppIcon(controller, app) }, modifier = Modifier.testTag("source_scope.app.${app.packageName}")
                             .semantics { toggleableState = ToggleableState.On })
                 }
             }
@@ -171,7 +171,7 @@ import top.yukonga.miuix.kmp.preference.RadioButtonPreference
                     items(candidates, key = { it.packageName }) { app ->
                         CheckboxPreference(title = app.label, summary = app.packageName + if (app.enabled) "" else " · 已停用",
                             checked = false, onCheckedChange = { select(app.packageName, it) },
-                            startAction = { AppIcon(app.icon) }, modifier = Modifier.testTag("source_scope.candidate.${app.packageName}")
+                            startAction = { AppIcon(controller, app) }, modifier = Modifier.testTag("source_scope.candidate.${app.packageName}")
                                 .semantics { toggleableState = ToggleableState.Off })
                     }
                     if (candidates.isEmpty()) item {

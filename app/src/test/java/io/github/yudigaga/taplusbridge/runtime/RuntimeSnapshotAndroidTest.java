@@ -53,6 +53,27 @@ public final class RuntimeSnapshotAndroidTest {
         RuntimeSnapshot after=RuntimeSnapshot.parse(RuntimeSnapshot.from(context));assertNotEquals(before.identity,after.identity);assertFalse(after.capture);
         RuntimePublisher.store(framework,after.encode());assertEquals(after.identity,RuntimeSnapshot.parse(framework.getString(RuntimeSnapshot.KEY,null)).identity);
     }
+
+    @Test public void unchangedRoutingInputsReuseTheirDigestAndEveryRouteChangeInvalidatesIt() throws Exception {
+        var identity = RuntimeSnapshot.class.getDeclaredMethod("routingIdentity", Context.class, ConfigStore.class);
+        identity.setAccessible(true);
+        String before = (String) identity.invoke(null, context, config);
+        for (int i = 0; i < 25; i++)
+            assertSame("Polling must not re-encode and re-hash unchanged rules", before, identity.invoke(null, context, config));
+        config.setRecognitionChannel(RecognitionChannels.Channel.ASSIST, false);
+        assertSame("Recognition switches do not change routing", before, identity.invoke(null, context, config));
+        assertFalse(RuntimeSnapshot.parse(RuntimeSnapshot.from(context)).channels.enabled(RecognitionChannels.Channel.ASSIST));
+        config.setNativeEnabled(false);
+        String nativeOff = (String) identity.invoke(null, context, config);
+        assertNotEquals(before, nativeOff);
+        config.setCloudLinkHandoffEnabled(false);
+        String cloudOff = (String) identity.invoke(null, context, config);
+        assertNotEquals(nativeOff, cloudOff);
+        new RuleRepository(context).saveManualRule(-1, "", "fresh.example", "com.example.other", "none", "");
+        String changed = (String) identity.invoke(null, context, config);
+        assertNotEquals(cloudOff, changed);
+        assertSame(changed, identity.invoke(null, context, config));
+    }
     @Test public void wrongUserSchemaAndCorruptValueAreRejected(){
         String raw=RuntimeSnapshot.from(context);
         for(String invalid:List.of("invalid",raw.replace("\"user\":0","\"user\":10"),raw.replace("\"schema\":"+RuntimeSnapshot.SCHEMA,"\"schema\":99")))

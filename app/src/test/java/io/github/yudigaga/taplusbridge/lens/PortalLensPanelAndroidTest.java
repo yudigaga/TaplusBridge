@@ -27,6 +27,7 @@ import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -51,6 +52,7 @@ import org.robolectric.RobolectricTestRunner;
 import org.robolectric.Shadows;
 import org.robolectric.annotation.Config;
 import org.robolectric.annotation.LooperMode;
+import org.robolectric.annotation.GraphicsMode;
 import org.robolectric.util.ReflectionHelpers;
 import org.robolectric.util.ReflectionHelpers.ClassParameter;
 import static org.junit.Assert.*;
@@ -147,6 +149,49 @@ public final class PortalLensPanelAndroidTest {
             long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
             while (key.get(request) == null && System.nanoTime() < deadline) Thread.sleep(10);
             assertNotNull("Preparing a new image must not wait for either older thumbnail network request", key.get(request));
+        }
+    }
+
+    @Test @GraphicsMode(GraphicsMode.Mode.NATIVE)
+    public void sameImageRefinementReleasesOldDownloadsAndQueueForCurrentResult() throws Exception {
+        Fixture fixture = new Fixture(); fixture.deliverResults();
+        Bitmap selected = fixture.image.get();
+        try (SlowThumbnailServer server = new SlowThumbnailServer(2)) {
+            fixture.loadThumbnail(server.url()); fixture.loadThumbnail(server.url()); server.awaitRequests();
+            for (int queued = 0; queued < 40; queued++) fixture.loadThumbnail(server.url());
+            fixture.searchInput().setText("new match"); fixture.searchButton().performClick(); fixture.awaitRefinement();
+            Bundle ready = fixture.update("results_ready");
+            ready.putString("result_url", "https://lens.google.com/search?vsrid=fixture&q=new+match");
+            Bundle item = new Bundle(); item.putString("title", "Current result");
+            item.putString("page_url", "https://example.org/current-match");
+            item.putString("thumbnail_url", "data:image/png;base64,"
+                    + "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=");
+            ArrayList<Bundle> items = new ArrayList<>(); items.add(item); ready.putParcelableArrayList("items", items);
+            fixture.deliver(ready); fixture.realizeSheet();
+            ImageView thumbnail = fixture.resultThumbnail(); assertNotNull(thumbnail);
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+            while (thumbnail.getDrawable() == null && System.nanoTime() < deadline) {
+                org.robolectric.shadows.ShadowLooper.shadowMainLooper().idle(); Thread.sleep(10);
+            }
+            assertNotNull("A same-image refinement must remove the old page's 40 queued downloads and render its current thumbnail", thumbnail.getDrawable());
+            assertTrue("Replacing page results must actively disconnect both old downloads", server.awaitDisconnected());
+            assertSame(selected, fixture.image.get()); assertFalse(selected.isRecycled());
+            fixture.resultRow().performClick();
+            assertEquals("The thumbnail refresh must preserve the current source link", "https://example.org/current-match",
+                    ((ShadowWebView) Shadow.extract(fixture.sourceWebView())).getLastLoadedUrl());
+        }
+    }
+
+    @Test public void thumbnailDeadlineDisconnectsBodyThatKeepsDrippingWithinReadTimeout() throws Exception {
+        Fixture fixture = new Fixture(); fixture.deliverResults();
+        try (DrippingThumbnailServer server = new DrippingThumbnailServer()) {
+            ImageView thumbnail = fixture.loadThumbnail(server.url()); server.awaitRequest();
+            assertTrue("A total request deadline must disconnect a body even while each read receives data before the idle timeout",
+                    server.disconnected.await(9, TimeUnit.SECONDS));
+            assertTrue("This fixture must deliver ongoing chunks rather than trigger an idle read timeout", server.chunks.get() >= 3);
+            assertNull("A partial body must never become a thumbnail", thumbnail.getDrawable());
+            assertNotNull("Thumbnail failure must preserve the result link", fixture.resultRow());
+            assertTrue(fixture.current()); assertFalse(fixture.image.get().isRecycled());
         }
     }
 
@@ -646,6 +691,48 @@ public final class PortalLensPanelAndroidTest {
         }
     }
 
+    /** A response which never idles for six seconds and never finishes its chunked body. */
+    private static final class DrippingThumbnailServer implements Closeable {
+        final CountDownLatch requested = new CountDownLatch(1), disconnected = new CountDownLatch(1);
+        final AtomicInteger chunks = new AtomicInteger();
+        final ServerSocket server;
+        final ExecutorService worker = Executors.newSingleThreadExecutor(task -> {
+            Thread thread = new Thread(task, "TaplusBridge-thumbnail-drip-fixture"); thread.setDaemon(true); return thread;
+        });
+        volatile Socket socket;
+        final String address;
+        DrippingThumbnailServer() throws Exception {
+            InetAddress local = Collections.list(NetworkInterface.getNetworkInterfaces()).stream()
+                    .flatMap(network -> Collections.list(network.getInetAddresses()).stream())
+                    .filter(value -> value instanceof Inet4Address && !value.isLoopbackAddress()).findFirst().orElseThrow();
+            server = new ServerSocket(0, 1, local);
+            address = "http://" + local.getHostAddress() + ":" + server.getLocalPort() + "/drip";
+            assertTrue(PortalLensPanel.webUrl(address));
+            worker.execute(() -> {
+                try (Socket accepted = server.accept()) {
+                    socket = accepted; InputStream input = accepted.getInputStream(); int tail = 0, value;
+                    while ((value = input.read()) >= 0) { tail = tail << 8 | value; if (tail == 0x0d0a0d0a) break; }
+                    if (value < 0) return;
+                    accepted.getOutputStream().write("HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+                    accepted.getOutputStream().flush(); requested.countDown();
+                    for (;;) {
+                        accepted.getOutputStream().write(new byte[]{'1', '\r', '\n', 'x', '\r', '\n'});
+                        accepted.getOutputStream().flush(); chunks.incrementAndGet(); Thread.sleep(100);
+                    }
+                } catch (IOException closed) { /* The request deadline must close this socket. */ }
+                catch (InterruptedException stopped) { Thread.currentThread().interrupt(); }
+                finally { disconnected.countDown(); }
+            });
+        }
+        String url() { return address; }
+        void awaitRequest() throws InterruptedException { assertTrue(requested.await(2, TimeUnit.SECONDS)); }
+        @Override public void close() throws IOException {
+            server.close(); Socket current = socket; if (current != null) current.close(); worker.shutdownNow();
+            try { assertTrue(worker.awaitTermination(2, TimeUnit.SECONDS)); }
+            catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new IOException(interrupted); }
+        }
+    }
+
     private final class Fixture {
         final Activity activity = Robolectric.buildActivity(Activity.class).setup().visible().get();
         final AtomicReference<Bitmap> image = new AtomicReference<>(Bitmap.createBitmap(16, 16, Bitmap.Config.ARGB_8888));
@@ -777,10 +864,18 @@ public final class PortalLensPanelAndroidTest {
         Object activeJob() throws Exception {
             Field field = PortalLensPanel.class.getDeclaredField("job"); field.setAccessible(true); return field.get(panel);
         }
-        void loadThumbnail(String address) throws Exception {
+        ImageView loadThumbnail(String address) throws Exception {
             ImageView target = new ImageView(activity); group.addView(target);
             Method method = PortalLensPanel.class.getDeclaredMethod("loadThumbnail", ImageView.class, String.class, job.getClass());
-            method.setAccessible(true); method.invoke(panel, target, address, job);
+            method.setAccessible(true); method.invoke(panel, target, address, job); return target;
+        }
+        ImageView resultThumbnail() throws Exception { return thumbnailIn(resultRow()); }
+        ImageView thumbnailIn(View root) {
+            if (root instanceof ImageView image) return image;
+            if (root instanceof android.view.ViewGroup parent) for (int i = 0; i < parent.getChildCount(); i++) {
+                ImageView result = thumbnailIn(parent.getChildAt(i)); if (result != null) return result;
+            }
+            return null;
         }
         WebView sourceWebView() throws Exception {
             Field field = PortalLensPanel.class.getDeclaredField("sourceWebView"); field.setAccessible(true); return (WebView) field.get(panel);

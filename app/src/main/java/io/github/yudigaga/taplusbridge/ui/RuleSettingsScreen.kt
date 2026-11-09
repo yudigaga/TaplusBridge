@@ -134,7 +134,7 @@ import java.nio.charset.CodingErrorAction
                     SettingsCard {
                         ArrowPreference(title = "目标应用", summary = appMap[draftTarget]?.label ?: draftTarget.ifBlank { "选择已安装或冻结的应用" },
                             onClick = { picker = "target" }, modifier = Modifier.testTag("editor.pick_target"),
-                            startAction = { AppIcon(appMap[draftTarget]?.icon) })
+                            startAction = { AppIcon(controller, appMap[draftTarget]) })
                         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                             TextField(draftHost, { draftHost = it }, label = "域名、网址或协议", singleLine = true,
                                 modifier = Modifier.fillMaxWidth().testTag("editor.host"))
@@ -215,7 +215,7 @@ import java.nio.charset.CodingErrorAction
                     SettingsCard {
                         Row(Modifier.fillMaxWidth().clickable { expanded = if (open) null else pkg }.padding(16.dp),
                             verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                            AppIcon(app?.icon)
+                            AppIcon(controller, app)
                             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                                 Text(app?.label ?: pkg, fontSize = 16.sp, fontWeight = FontWeight.Medium)
                                 QuietText("${rules.size} 条规则" + if (app == null) " · 未安装" else "")
@@ -240,7 +240,7 @@ import java.nio.charset.CodingErrorAction
         }
     }
     if (picker != null) {
-        ApplicationPicker(apps, picker == "source", {
+        ApplicationPicker(controller, apps, picker == "source", {
             if (picker == "source") draftSource = it else draftTarget = it
             picker = null
         }) { picker = null }
@@ -307,7 +307,7 @@ import java.nio.charset.CodingErrorAction
     } }
 }
 
-@Composable private fun ApplicationPicker(apps: List<SettingsController.AppEntry>, source: Boolean,
+@Composable private fun ApplicationPicker(controller: SettingsController, apps: List<SettingsController.AppEntry>, source: Boolean,
                                           selected: (String) -> Unit, dismiss: () -> Unit) {
     var query by rememberSaveable { mutableStateOf("") }
     val maxHeight = LocalWindowInfo.current.containerDpSize.height * .60f
@@ -318,7 +318,7 @@ import java.nio.charset.CodingErrorAction
             LazyColumn(Modifier.weight(1f, fill = false).testTag("picker.apps")) {
                 if (source) item { ArrowPreference(title = "所有应用", summary = "不限来源", onClick = { selected("*") }) }
                 items(found, key = { it.packageName }) { app ->
-                    ArrowPreference(title = app.label, summary = app.packageName, startAction = { AppIcon(app.icon) },
+                    ArrowPreference(title = app.label, summary = app.packageName, startAction = { AppIcon(controller, app) },
                         onClick = { selected(app.packageName) }, modifier = Modifier.testTag("picker.${app.packageName}"))
                 }
                 if (found.isEmpty()) item { QuietText("没有找到应用，请确认已安装在当前用户中。", Modifier.padding(16.dp)) }

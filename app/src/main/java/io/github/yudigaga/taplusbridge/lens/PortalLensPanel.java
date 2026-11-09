@@ -64,8 +64,11 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
 
@@ -76,6 +79,8 @@ public final class PortalLensPanel implements View.OnAttachStateChangeListener {
     private static final ExecutorService SIGNALS = idleExecutor(1, "TaplusBridge-Lens-signals");
     private static final ThreadPoolExecutor THUMBNAILS = thumbnailExecutor("TaplusBridge-Lens-thumbnail");
     private static final ThreadPoolExecutor THUMBNAIL_CLOSES = thumbnailExecutor("TaplusBridge-Lens-thumbnail-close");
+    private static final ScheduledThreadPoolExecutor THUMBNAIL_DEADLINES = thumbnailDeadlines();
+    private static final long THUMBNAIL_TIMEOUT_NANOS = TimeUnit.SECONDS.toNanos(6);
     private static volatile Interaction interactionLease;
     private static volatile WeakReference<PortalLensPanel> visibleSheet = new WeakReference<>(null);
     private final View host;
@@ -127,6 +132,16 @@ public final class PortalLensPanel implements View.OnAttachStateChangeListener {
                 new ArrayBlockingQueue<>(40), task -> {
                     Thread thread = new Thread(task, name); thread.setDaemon(true); return thread;
                 });
+        executor.allowCoreThreadTimeOut(true);
+        return executor;
+    }
+
+    private static ScheduledThreadPoolExecutor thumbnailDeadlines() {
+        ScheduledThreadPoolExecutor executor = new ScheduledThreadPoolExecutor(1, task -> {
+            Thread thread = new Thread(task, "TaplusBridge-Lens-thumbnail-timeout"); thread.setDaemon(true); return thread;
+        });
+        executor.setRemoveOnCancelPolicy(true);
+        executor.setKeepAliveTime(3, TimeUnit.SECONDS);
         executor.allowCoreThreadTimeOut(true);
         return executor;
     }
@@ -266,6 +281,7 @@ public final class PortalLensPanel implements View.OnAttachStateChangeListener {
         if (viewer != null) next.sessionViewerIntent = viewer;
         int generation = update.getInt("page_generation", -1);
         if (generation < 0 || generation < next.pageGeneration) return;
+        if (generation != next.pageGeneration) next.cancelThumbnails();
         next.pageGeneration = generation;
         String resultUrl = update.getString("result_url");
         if (resultPageUrl(resultUrl)) {
@@ -642,6 +658,8 @@ public final class PortalLensPanel implements View.OnAttachStateChangeListener {
     }
 
     private void base() {
+        Job current = job;
+        if (current != null) current.cancelThumbnails();
         if (!ensureResultSheet()) return;
         closeEmbeddedBrowser();
         closeSourcePage();
@@ -933,46 +951,59 @@ public final class PortalLensPanel implements View.OnAttachStateChangeListener {
     }
 
     private void loadThumbnail(ImageView target, String address, Job next) {
+        int resultGeneration = next.thumbnailGeneration.get(), pageGeneration = next.pageGeneration;
         FutureTask<Void> task = new FutureTask<>(() -> {
-            downloadThumbnail(target, address, next);
+            downloadThumbnail(target, address, next, resultGeneration, pageGeneration);
             return null;
         }) {
             @Override protected void done() { next.thumbnails.remove(this); }
         };
-        if (!thumbnailActive(next)) return;
+        if (!thumbnailActive(next, resultGeneration, pageGeneration)) return;
         next.thumbnails.add(task);
         try { THUMBNAILS.execute(task); }
         catch (RejectedExecutionException busy) { task.cancel(false); }
-        if (!thumbnailActive(next)) { task.cancel(true); THUMBNAILS.remove(task); }
+        if (!thumbnailActive(next, resultGeneration, pageGeneration)) { task.cancel(true); THUMBNAILS.remove(task); }
     }
 
-    private boolean thumbnailActive(Job next) {
-        return !next.cancelled && epoch.get() == next.epochValue && !Thread.currentThread().isInterrupted();
+    private boolean thumbnailActive(Job next, int resultGeneration, int pageGeneration) {
+        return !next.cancelled && epoch.get() == next.epochValue && !Thread.currentThread().isInterrupted()
+                && next.thumbnailGeneration.get() == resultGeneration && next.pageGeneration == pageGeneration;
     }
 
-    private void downloadThumbnail(ImageView target, String address, Job next) {
+    private void downloadThumbnail(ImageView target, String address, Job next, int resultGeneration, int pageGeneration) {
         HttpURLConnection connection = null;
+        ScheduledFuture<?> deadline = null;
+        AtomicBoolean timedOut = new AtomicBoolean();
+        long expiresAt = System.nanoTime() + THUMBNAIL_TIMEOUT_NANOS;
         try {
-            if (!thumbnailActive(next)) return;
+            if (!thumbnailActive(next, resultGeneration, pageGeneration)) return;
             byte[] bytes = inlineThumbnail(address);
             if (bytes == null) {
                 if (!webUrl(address)) return;
                 connection = (HttpURLConnection) new URL(address).openConnection();
                 next.thumbnailConnections.add(connection);
-                if (!thumbnailActive(next)) return;
+                HttpURLConnection active = connection;
+                deadline = THUMBNAIL_DEADLINES.schedule(() -> {
+                    timedOut.set(true); disconnectThumbnail(active);
+                }, Math.max(0, expiresAt - System.nanoTime()), TimeUnit.NANOSECONDS);
+                if (!thumbnailActive(next, resultGeneration, pageGeneration) || timedOut.get()) return;
                 connection.setConnectTimeout(6000); connection.setReadTimeout(6000); connection.setInstanceFollowRedirects(false);
                 if (connection.getResponseCode() != 200) return;
+                if (!thumbnailActive(next, resultGeneration, pageGeneration) || timedOut.get()
+                        || System.nanoTime() >= expiresAt) return;
                 try (InputStream input = connection.getInputStream(); ByteArrayOutputStream data = new ByteArrayOutputStream()) {
                     byte[] buffer = new byte[8192]; int read;
                     while ((read = input.read(buffer)) >= 0) {
-                        if (!thumbnailActive(next)) return;
+                        if (!thumbnailActive(next, resultGeneration, pageGeneration) || timedOut.get()
+                                || System.nanoTime() >= expiresAt) return;
                         if (data.size() + read > 1024 * 1024) return;
                         data.write(buffer, 0, read);
                     }
                     bytes = data.toByteArray();
                 }
             }
-            if (!thumbnailActive(next)) return;
+            if (!thumbnailActive(next, resultGeneration, pageGeneration) || timedOut.get()
+                    || System.nanoTime() >= expiresAt) return;
             BitmapFactory.Options options = new BitmapFactory.Options(); options.inJustDecodeBounds = true;
             BitmapFactory.decodeByteArray(bytes, 0, bytes.length, options);
             if (options.outWidth <= 0 || options.outHeight <= 0) return;
@@ -983,17 +1014,25 @@ public final class PortalLensPanel implements View.OnAttachStateChangeListener {
             Bitmap thumbnail = BitmapFactory.decodeByteArray(bytes, 0, bytes.length, options);
             MAIN.post(() -> {
                 if (thumbnail == null) return;
-                if (target.isAttachedToWindow() && thumbnailActive(next)
+                if (target.isAttachedToWindow() && thumbnailActive(next, resultGeneration, pageGeneration) && !timedOut.get()
                         && selectedImage.get() == next.image && !next.image.isRecycled()
                         && next.image.getGenerationId() == next.generation) target.setImageBitmap(thumbnail);
                 else thumbnail.recycle();
             });
         } catch (IOException | RuntimeException unavailable) { /* A missing thumbnail does not discard its source link. */ }
         finally {
+            if (deadline != null) deadline.cancel(false);
             if (connection != null) {
                 next.thumbnailConnections.remove(connection);
                 connection.disconnect();
             }
+        }
+    }
+
+    private static void disconnectThumbnail(HttpURLConnection connection) {
+        try { THUMBNAIL_CLOSES.execute(connection::disconnect); }
+        catch (RejectedExecutionException busy) {
+            // An interrupted or expired download also closes its connection in finally.
         }
     }
 
@@ -1059,6 +1098,7 @@ public final class PortalLensPanel implements View.OnAttachStateChangeListener {
         private ParcelFileDescriptor descriptor;
         final Set<FutureTask<Void>> thumbnails = ConcurrentHashMap.newKeySet();
         final Set<HttpURLConnection> thumbnailConnections = ConcurrentHashMap.newKeySet();
+        final AtomicInteger thumbnailGeneration = new AtomicInteger();
         final Runnable launchWatchdog = () -> interactionLaunchFailed(this,
                 "Google 验证窗口尚未打开，请重试；当前图片无需重新上传");
         final Runnable watchdog = () -> {
@@ -1066,16 +1106,12 @@ public final class PortalLensPanel implements View.OnAttachStateChangeListener {
         };
         Job(Bitmap image) { this.image = image; generation = image.getGenerationId(); epochValue = epoch.get(); }
         void cancelThumbnails() {
+            thumbnailGeneration.incrementAndGet();
             for (FutureTask<Void> thumbnail : thumbnails) {
                 thumbnail.cancel(true); THUMBNAILS.remove(thumbnail);
             }
             thumbnails.clear();
-            for (HttpURLConnection connection : thumbnailConnections) {
-                try { THUMBNAIL_CLOSES.execute(connection::disconnect); }
-                catch (RejectedExecutionException busy) {
-                    // The interrupted download still closes its connection in finally after its bounded timeout.
-                }
-            }
+            for (HttpURLConnection connection : thumbnailConnections) disconnectThumbnail(connection);
             thumbnailConnections.clear();
         }
         synchronized void hold(ParcelFileDescriptor input) throws IOException {

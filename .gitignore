@@ -8,7 +8,6 @@ local.properties
 /work/
 /analysis/
 /artifacts/
-/tools/test_*.py
 /hs_err_pid*.log
 keystore.properties
 signing.properties

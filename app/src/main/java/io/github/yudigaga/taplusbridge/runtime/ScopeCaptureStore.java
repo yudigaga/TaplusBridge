@@ -7,7 +7,6 @@ import io.github.yudigaga.taplusbridge.hook.ScopeCapturePayload;
 import java.io.IOException;
 import java.security.SecureRandom;
 import java.util.Base64;
-import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -16,9 +15,11 @@ import java.util.concurrent.TimeUnit;
 public final class ScopeCaptureStore {
     public static final int MAX_BYTES = 8 * 1024 * 1024;
     private final SecureRandom random = new SecureRandom();
-    private final ExecutorService writer = Executors.newSingleThreadExecutor(r -> {
+    private final java.util.concurrent.ThreadPoolExecutor writer = new java.util.concurrent.ThreadPoolExecutor(
+            1, 1, 0, TimeUnit.MILLISECONDS, new java.util.concurrent.ArrayBlockingQueue<>(1), r -> {
         Thread t = new Thread(r, "TaplusBridge-scope-image"); t.setDaemon(true); return t;
     });
+    private CaptureIo.Write sending;
     private final ScheduledExecutorService expiry = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "TaplusBridge-scope-expiry"); t.setDaemon(true); return t;
     });
@@ -89,13 +90,12 @@ public final class ScopeCaptureStore {
         }
         ParcelFileDescriptor[] pipe;
         try { pipe = ParcelFileDescriptor.createPipe(); }
-        catch (IOException unavailable) { return Bundle.EMPTY; }
+        catch (IOException unavailable) { erase(current); return Bundle.EMPTY; }
         try {
-            writer.execute(() -> {
-                try (var output = new ParcelFileDescriptor.AutoCloseOutputStream(pipe[1])) {
-                    output.write(current.png);
-                } catch (IOException ignored) { }
-            });
+            // The Bundle owns the read end until Binder marshals it; the producer owns only its stream.
+            sending = new CaptureIo.Write(new ParcelFileDescriptor.AutoCloseOutputStream(pipe[1]), current.png);
+            writer.execute(sending);
+            CaptureIo.expireReadEnd(pipe[0]);
             Bundle result = new Bundle(current.metadata);
             result.putString("scope_identity", current.identity);
             result.putString("kind", "image");
@@ -103,6 +103,8 @@ public final class ScopeCaptureStore {
             result.putParcelable("fd", pipe[0]); result.putInt("bytes", current.png.length);
             return result;
         } catch (RuntimeException rejected) {
+            if (sending != null) { sending.close(); sending = null; }
+            erase(current);
             for (var end : pipe) try { end.close(); } catch (IOException ignored) { }
             return Bundle.EMPTY;
         }
@@ -117,6 +119,7 @@ public final class ScopeCaptureStore {
     }
     private synchronized void expire(String nonce) { if (entry != null && entry.nonce.equals(nonce)) clear(); }
     public synchronized void clear() {
+        if (sending != null) { writer.remove(sending); sending.close(); sending = null; }
         if (entry != null) erase(entry);
         entry = null;
     }

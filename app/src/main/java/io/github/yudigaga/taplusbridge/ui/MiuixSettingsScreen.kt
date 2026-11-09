@@ -65,6 +65,7 @@ object MiuixSettingsScreen {
     var sourceScope by remember { mutableStateOf(controller.sourceScope()) }
     var sourceScopeError by remember { mutableStateOf(controller.sourceScopeError()) }
     var apps by remember { mutableStateOf<List<SettingsController.AppEntry>>(emptyList()) }
+    val needsApps by rememberUpdatedState(page == APPS || page == RULES)
     val refresh: () -> Unit = {
         snapshot = controller.snapshot()
         sourceScope = controller.sourceScope()
@@ -76,16 +77,26 @@ object MiuixSettingsScreen {
     }
     DisposableEffect(activity, controller) {
         val preferences = activity.getSharedPreferences("config", 0)
-        val listener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, _ -> refresh() }
+        val handler = android.os.Handler(android.os.Looper.getMainLooper())
+        val refreshAfterSave = Runnable { refresh() }
+        val listener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
+            handler.removeCallbacks(refreshAfterSave)
+            handler.post(refreshAfterSave)
+        }
         preferences.registerOnSharedPreferenceChangeListener(listener)
-        activity.setRefreshListener { refresh(); controller.loadInstalledApps { apps = it } }
+        activity.setRefreshListener { refresh(); if (needsApps) controller.loadInstalledApps { apps = it } }
+        controller.setApplicationsChanged { if (needsApps) controller.loadInstalledApps { apps = it } }
         controller.setAuthorizationRefresh(refresh)
-        controller.loadInstalledApps { apps = it }
         onDispose {
             preferences.unregisterOnSharedPreferenceChangeListener(listener)
+            handler.removeCallbacksAndMessages(null)
             activity.setRefreshListener(null)
+            controller.setApplicationsChanged(null)
             controller.setAuthorizationRefresh(null)
         }
+    }
+    LaunchedEffect(page, controller) {
+        if (page == APPS || page == RULES) controller.loadInstalledApps { apps = it }
     }
     val navigationItems = listOf(
         LiquidGlassNavigationItem("概览", SettingsIcons.Home, "nav.home"),

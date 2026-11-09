@@ -864,7 +864,12 @@ public final class RecognitionHooks {
                         () -> currentProbe(pickedEpoch, origin) && autoProbe.current(pickedEpoch)
                                 && !nativeUrlAvailable(service, nativeResult),
                         () -> HostDragHooks.dismissPreviewForLinkProbe(service, nativeResult, origin),
-                        url -> acceptProbeUrl(pickedEpoch, origin, url));
+                        url -> acceptProbeUrl(pickedEpoch, origin, url),
+                        () -> {
+                            if (!currentProbe(pickedEpoch, origin)) return;
+                            HostDragHooks.offerRecognizedLinks(service, nativeResult, enhancer.capturedLinks());
+                            HostDragHooks.nativeProbeCompleted(service, nativeResult);
+                        });
             } catch (RuntimeException failure) { report(failure); }
         });
     }

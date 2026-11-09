@@ -14,6 +14,7 @@ import java.util.Locale;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Set;
+import java.util.WeakHashMap;
 import java.util.function.BooleanSupplier;
 
 /** Manual data and validated owned online snapshots; never reads the removed Taplus rule store. */
@@ -32,6 +33,10 @@ public final class RuleRepository {
     // XML normalizes raw CR/CRLF in text nodes on a cold parse. Hashes authenticate the downloaded
     // UTF-8 bytes, so snapshot strings must survive XML without newline normalization.
     private static final String SNAPSHOT_ENCODING = "utf8-base64-v1:";
+    private static final String[] ROUTING_KEYS = {MANUAL, DISABLED, PRIMARY, PRIMARY_HASH, BACKUP, BACKUP_HASH,
+            HIGHEST, HIGHEST_HASH, WITHDRAWN};
+    // Repository instances are short-lived on the gesture path; accepted bytes need validating only once.
+    private static final Map<SharedPreferences, DerivedRules> DERIVED = new WeakHashMap<>();
     private final SharedPreferences prefs;
     private final OnlineRuleClient client;
 
@@ -135,15 +140,7 @@ public final class RuleRepository {
     }
     /** Invalid manual/app-toggle storage fails closed, rather than silently routing an online fallback. */
     public List<LinkRuleEntry> effectiveRules() {
-        synchronized (STORE_LOCK) {
-            Manual manual = manual(); if (!manual.valid || !disabledStorageValid()) return Collections.emptyList();
-            OnlineRuleBundle bundle = selected().cache.bundle;
-            try {
-                List<LinkRuleEntry> merged = merged(manual.rules, bundle == null ? Collections.emptyList() : bundle.rules);
-                ScopedRuleResolver.encode(merged);
-                return ScopedRuleResolver.filterEnabled(merged, disabledTargets());
-            } catch (IllegalArgumentException invalidAggregate) { return Collections.emptyList(); }
-        }
+        synchronized (STORE_LOCK) { return derived().effective; }
     }
     public Set<String> disabledTargets() {
         synchronized (STORE_LOCK) {
@@ -310,26 +307,67 @@ public final class RuleRepository {
     }
 
     private record Manual(List<LinkRuleEntry> rules, boolean valid) { }
-    private Manual manual() {
+    private record Cache(OnlineRuleBundle.Cache cache, long highest, String highestHash, boolean valid) { }
+    private record DerivedRules(Map<String, Object> values, Manual manual, Cache selected, List<LinkRuleEntry> effective) { }
+    private Manual manual() { return derived().manual; }
+    private Cache selected() { return derived().selected; }
+    /** Exact values catch direct writes immediately; failures never fall back to a previously valid read. */
+    private DerivedRules derived() {
+        Map<String, Object> values = new LinkedHashMap<>();
         try {
-            List<LinkRuleEntry> rules = RuleJsonCodec.decode(prefs.getString(MANUAL, "[]"));
+            Map<String, ?> current = prefs.getAll();
+            for (String key : ROUTING_KEYS) if (current.containsKey(key)) {
+                Object value = current.get(key);
+                values.put(key, value instanceof Set<?> set ? new LinkedHashSet<>(set) : value);
+            }
+        } catch (RuntimeException unavailable) {
+            return new DerivedRules(Collections.emptyMap(), new Manual(Collections.emptyList(), false),
+                    invalidCache(), Collections.emptyList());
+        }
+        DerivedRules cached = DERIVED.get(prefs);
+        if (cached != null && cached.values.equals(values)) return cached;
+        Manual manual = readManual(values);
+        Cache selected = readSelected(values);
+        DerivedRules result = new DerivedRules(values, manual, selected, readEffective(values, manual, selected));
+        DERIVED.put(prefs, result);
+        return result;
+    }
+    private static Manual readManual(Map<String, Object> values) {
+        try {
+            List<LinkRuleEntry> rules = RuleJsonCodec.decode((String) values.getOrDefault(MANUAL, "[]"));
             for (LinkRuleEntry entry : rules) if (!LinkRuleEntry.SOURCE_MANUAL.equals(entry.source)) throw new IllegalArgumentException();
-            return new Manual(rules, true);
+            return new Manual(Collections.unmodifiableList(rules), true);
         } catch (RuntimeException corrupt) { return new Manual(Collections.emptyList(), false); }
     }
-    private record Cache(OnlineRuleBundle.Cache cache, long highest, String highestHash, boolean valid) { }
-    private Cache selected() {
+    private static Cache invalidCache() { return new Cache(new OnlineRuleBundle.Cache(null, false, false), 0, "", false); }
+    private static Cache readSelected(Map<String, Object> values) {
         try {
-            long highest = prefs.getLong(HIGHEST, 0);
-            String hash = prefs.getString(HIGHEST_HASH, "").toLowerCase(Locale.ROOT);
+            long highest = (Long) values.getOrDefault(HIGHEST, 0L);
+            String hash = ((String) values.getOrDefault(HIGHEST_HASH, "")).toLowerCase(Locale.ROOT);
             if (highest < 0 || (highest == 0 && !hash.isEmpty()) || (highest > 0 && !hash.matches("[0-9a-f]{64}"))) throw new IllegalArgumentException();
-            OnlineRuleBundle.Cache cache = OnlineRuleBundle.selectCache(decodeSnapshot(prefs.getString(PRIMARY, "")), prefs.getString(PRIMARY_HASH, ""),
-                    decodeSnapshot(prefs.getString(BACKUP, "")), prefs.getString(BACKUP_HASH, ""), highest, hash, true);
+            OnlineRuleBundle.Cache cache = OnlineRuleBundle.selectCache(decodeSnapshot((String) values.getOrDefault(PRIMARY, "")),
+                    (String) values.getOrDefault(PRIMARY_HASH, ""), decodeSnapshot((String) values.getOrDefault(BACKUP, "")),
+                    (String) values.getOrDefault(BACKUP_HASH, ""), highest, hash, true);
             // A declared full withdrawal must not resurrect older nonempty data after corruption.
-            if (prefs.getBoolean(WITHDRAWN, false) && (cache.bundle == null || cache.bundle.revision < highest))
+            if ((Boolean) values.getOrDefault(WITHDRAWN, false) && (cache.bundle == null || cache.bundle.revision < highest))
                 cache = new OnlineRuleBundle.Cache(null, false, false);
             return new Cache(cache, highest, hash, true);
-        } catch (RuntimeException corrupt) { return new Cache(new OnlineRuleBundle.Cache(null, false, false), 0, "", false); }
+        } catch (RuntimeException corrupt) { return invalidCache(); }
+    }
+    @SuppressWarnings("unchecked")
+    private static List<LinkRuleEntry> readEffective(Map<String, Object> values, Manual manual, Cache selected) {
+        if (!manual.valid) return Collections.emptyList();
+        Set<String> disabled;
+        try {
+            disabled = (Set<String>) values.getOrDefault(DISABLED, Collections.emptySet());
+            for (String target : disabled) if (!validTarget(target)) return Collections.emptyList();
+        } catch (RuntimeException corrupt) { return Collections.emptyList(); }
+        OnlineRuleBundle bundle = selected.cache.bundle;
+        try {
+            List<LinkRuleEntry> merged = merged(manual.rules, bundle == null ? Collections.emptyList() : bundle.rules);
+            ScopedRuleResolver.encode(merged);
+            return ScopedRuleResolver.filterEnabled(merged, disabled);
+        } catch (IllegalArgumentException invalidAggregate) { return Collections.emptyList(); }
     }
     private boolean disabledStorageValid() {
         try { for (String target : prefs.getStringSet(DISABLED, Collections.emptySet())) if (!validTarget(target)) return false; return true; }

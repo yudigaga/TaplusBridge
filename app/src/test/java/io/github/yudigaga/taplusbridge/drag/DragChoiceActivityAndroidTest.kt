@@ -166,7 +166,7 @@ class DragChoiceActivityAndroidTest {
         val activity = show(result("rules", "", "", links))
         RuleReadCounter(context).use { reads ->
             compose.onNodeWithTag("drag.menu.execute").performClick()
-            assertEquals(1, reads.ruleSnapshots())
+            assertEquals(3, reads.ruleSnapshots()) // Constructor state/validation and one shared grouping snapshot.
             assertEquals(2, reads.switchReads("enabled")) // Action authorization plus the grouping snapshot.
             assertEquals(1, reads.switchReads("native"))
             assertEquals(1, reads.switchReads(ConfigStore.CLOUD_LINK_HANDOFF_KEY))

@@ -108,6 +108,38 @@ public final class HostProbeActionAndroidTest {
         assertEquals(1, captured.size());
     }
 
+    @Test public void definitiveFailureNotifiesCompletionOnceAndKeepsInflightCapturePending() throws Exception {
+        List<String> order = new ArrayList<>();
+        startWithCompletion(url -> order.add("url"), () -> order.add("complete"));
+        main.idle(); ResultReceiver ack = acknowledgement();
+        assertTrue(order.isEmpty());
+        ack.send(ProbeContract.READY, response(true)); main.idleFor(Duration.ofMillis(64));
+        assertTrue("READY is not completion while a URL may still arrive", order.isEmpty());
+        ack.send(ProbeContract.FAILED, response(false)); ack.send(ProbeContract.FAILED, response(false)); main.idle();
+        assertEquals(List.of("complete"), order);
+        main.idleFor(Duration.ofMillis(ProbeContract.TIMEOUT_MILLIS + 1));
+        assertEquals(List.of("complete"), order);
+    }
+
+    @Test public void successfulUrlIsDeliveredBeforeCompletionExactlyOnce() throws Exception {
+        List<String> order = new ArrayList<>();
+        startWithCompletion(url -> { assertEquals(LINK, url); order.add("url"); }, () -> order.add("complete"));
+        main.idle(); ResultReceiver ack = acknowledgement();
+        ack.send(ProbeContract.READY, response(true)); main.idleFor(Duration.ofMillis(64));
+        Bundle result = response(true); result.putString("url", LINK);
+        ack.send(ProbeContract.CAPTURED, result); ack.send(ProbeContract.CAPTURED, result); main.idle();
+        assertEquals(List.of("url", "complete"), order);
+    }
+
+    @Test public void aStaleProbeDoesNotSignalCompletionForItsReplacement() throws Exception {
+        List<String> order = new ArrayList<>();
+        startWithCompletion(url -> order.add("old_url"), () -> order.add("old_complete"));
+        main.idle(); ResultReceiver old = acknowledgement();
+        current.set(false); start(); main.idle();
+        old.send(ProbeContract.FAILED, response(false)); main.idle();
+        assertTrue(order.isEmpty());
+    }
+
     @Test public void startLeavesTheOriginalTouchDispatchBeforePreparingWindows() {
         start();
         assertEquals(0, provider.armCalls);
@@ -415,6 +447,13 @@ public final class HostProbeActionAndroidTest {
     private void startWithOverlayBarrier(BooleanSupplier prepareForTap) throws Exception {
         HostProbeAction.start(service, service, CaptureLease.WECHAT, SystemClock.elapsedRealtime(),
                 SystemClock.elapsedRealtime(), current::get, prepareForTap, captured::add);
+    }
+
+    private void startWithCompletion(java.util.function.Consumer<String> capturedUrl, Runnable completed) throws Exception {
+        HostProbeAction.class.getMethod("start", Context.class, Object.class, String.class, long.class, long.class,
+                BooleanSupplier.class, BooleanSupplier.class, java.util.function.Consumer.class, Runnable.class)
+                .invoke(null, service, service, CaptureLease.WECHAT, SystemClock.elapsedRealtime(),
+                        SystemClock.elapsedRealtime(), (BooleanSupplier) current::get, (BooleanSupplier) () -> true, capturedUrl, completed);
     }
 
     private ResultReceiver begin() {

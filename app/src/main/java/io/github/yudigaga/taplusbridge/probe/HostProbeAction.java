@@ -27,9 +27,13 @@ public final class HostProbeAction {
     }
     public static void start(Context context,Object service,String source,long pickedAt,long recognitionAt,
                              BooleanSupplier current,BooleanSupplier prepareForTap,Consumer<String> captured) {
+        start(context,service,source,pickedAt,recognitionAt,current,prepareForTap,captured,() -> {});
+    }
+    public static void start(Context context,Object service,String source,long pickedAt,long recognitionAt,
+                             BooleanSupplier current,BooleanSupplier prepareForTap,Consumer<String> captured,Runnable completed) {
         Handler main=new Handler(Looper.getMainLooper());
         main.post(() -> {
-            Run run=new Run(context,service,source,pickedAt,recognitionAt,current,prepareForTap,captured,main);
+            Run run=new Run(context,service,source,pickedAt,recognitionAt,current,prepareForTap,captured,completed,main);
             Run previous=ACTIVE.getAndSet(run);
             if(previous!=null) previous.finish(null,"replaced");
             run.begin();
@@ -42,13 +46,14 @@ public final class HostProbeAction {
     private static final class Run {
         final Context context; final Object service; final String source; final long pickedAt, recognitionAt;
         final BooleanSupplier current,prepareForTap; final Consumer<String> captured; final Handler main;
+        final Runnable completed;
         HostProbeWindow window; String nonce; int user=-1; boolean ready,finished,tapSent;
         final Runnable timeout=() -> finish(null,tapSent?"capture_timeout":"ready_timeout");
         Run(Context context,Object service,String source,long pickedAt,long recognitionAt,BooleanSupplier current,
-            BooleanSupplier prepareForTap,Consumer<String> captured,Handler main) {
+            BooleanSupplier prepareForTap,Consumer<String> captured,Runnable completed,Handler main) {
             this.context=context;this.service=service;this.source=source;this.pickedAt=pickedAt;
             this.recognitionAt=recognitionAt;
-            this.current=current;this.prepareForTap=prepareForTap;this.captured=captured;this.main=main;
+            this.current=current;this.prepareForTap=prepareForTap;this.captured=captured;this.completed=completed;this.main=main;
         }
         void begin() {
             try {
@@ -151,7 +156,10 @@ public final class HostProbeAction {
                 } catch(RuntimeException ignored) { }
             }
             ACTIVE.compareAndSet(this,null);
-            if(url!=null && current.getAsBoolean())captured.accept(url);
+            if(current.getAsBoolean()) {
+                try { if(url!=null)captured.accept(url); }
+                finally { completed.run(); }
+            }
         }
     }
     private static String safeReason(String reason) {
