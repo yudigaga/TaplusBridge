@@ -131,3 +131,11 @@ python -m unittest discover -s tools/tests -p 'test_*.py'
 Linux 使用 `bash ./gradlew`；截图输出由 Gradle 统一指定到仓库的 `artifacts/`，不依赖开发机绝对路径。GitHub Actions 在推送、PR 或手动触发时运行这些检查，需要下载 Gradle、Android SDK 37 和测试依赖，不需要正式签名密钥。
 
 本地单元测试和 CI 不代替手机上的 LSPosed 回调、ROM 窗口与手势时序、Root／Shizuku、Google Lens 网络及目标应用服务验收。
+
+## 赞助
+
+如果喜欢这个项目，欢迎请我喝杯咖啡 ☕
+
+<a href="https://raw.githubusercontent.com/yudigaga/TaplusBridge/main/docs/assets/wechat-sponsor.png">
+  <img src="https://raw.githubusercontent.com/yudigaga/TaplusBridge/main/docs/assets/wechat-sponsor.png" alt="微信赞赏码" width="360" />
+</a>
