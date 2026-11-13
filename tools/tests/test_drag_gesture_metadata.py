@@ -4,6 +4,25 @@ from tools.analyze_lsp_archive import drag_gesture_metadata
 
 
 class DragGestureMetadataTest(unittest.TestCase):
+    def test_import_payload_retains_only_presence_flags(self):
+        self.assertEqual(
+            {"stage": "import_payload", "reason": "unknown", "text_present": True,
+             "image_present": False, "link_present": False},
+            drag_gesture_metadata("drag gesture host stage=import_payload text_present=true image_present=false "
+                                  "link_present=false text=secret url=https://private.example token=nonce x=123"),
+        )
+        self.assertIsNone(drag_gesture_metadata(
+            "drag gesture host stage=import_payload text_present=secret image_present=false link_present=false"))
+
+    def test_import_and_consume_rejections_keep_only_fixed_reasons(self):
+        for stage, reason in (("import_declined", "gesture_expired"), ("import_failure_detail", "empty_content"),
+                              ("consume_rejected", "gesture_invalid"), ("consume_rejected", "capture_focus")):
+            with self.subTest(stage=stage, reason=reason):
+                self.assertEqual({"stage": stage, "reason": reason}, drag_gesture_metadata(
+                    f"drag gesture stage={stage} reason={reason} token=private_nonce text=private"))
+        self.assertEqual({"stage": "import_failure_detail", "reason": "unknown"}, drag_gesture_metadata(
+            "drag gesture host stage=import_failure_detail reason=secret_exception_detail"))
+
     def test_generic_drag_preparation_stages_retain_only_fixed_metadata(self):
         for stage in ("prepare_requested", "prepare_metadata", "prepare_image", "prepare_image_unavailable",
                       "prepare_capture_unavailable", "prepare_service_unavailable", "prepare_unavailable",

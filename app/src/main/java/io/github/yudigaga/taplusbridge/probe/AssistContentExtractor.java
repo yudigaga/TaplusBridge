@@ -12,7 +12,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
 
-/** Reads only the structure supplied for the original main window and physical touch point. */
+/** Reads only the structure supplied for the qualified source window and physical touch point. */
 public final class AssistContentExtractor {
     static final int MAX_NODES = 512, MAX_DEPTH = 32, MAX_WINDOWS = 8;
     private AssistContentExtractor() { }
@@ -37,6 +37,7 @@ public final class AssistContentExtractor {
         boolean visible(); boolean blocked(); int inputType(); String className(); CharSequence text();
         List<String> hrefs(); int children(); Node child(int index);
         default boolean editable() { return false; }
+        default CharSequence description() { return null; }
     }
     record Window(int left, int top, int width, int height, int display, Node root) {
         Window(int left, int top, int width, int height, Node root) { this(left, top, width, height, 0, root); }
@@ -62,7 +63,7 @@ public final class AssistContentExtractor {
         }
         if (selected == null) return SystemAssistContent.Result.EMPTY;
         Search search = new Search(rawX, rawY, selectedBounds);
-        search.visit(selected.root, selected.left, selected.top, selectedBounds, 0);
+        search.visit(selected.root, selected.left, selected.top, selectedBounds, 0, List.of());
         if (search.privateHit) return SystemAssistContent.Result.EMPTY;
         if (search.best != null) return search.best.content;
         if (search.container != null) {
@@ -96,22 +97,25 @@ public final class AssistContentExtractor {
         Candidate best, container;
         Search(float x, float y, Bounds window) { this.x = x; this.y = y; this.window = window; }
 
-        boolean visit(Node node, long originX, long originY, Bounds clip, int depth) {
+        boolean visit(Node node, long originX, long originY, Bounds clip, int depth, List<String> enclosingHrefs) {
             if (node == null || depth > MAX_DEPTH || remaining-- <= 0) return false;
             Bounds bounds = bounds(node, originX, originY).clip(clip);
             if (bounds.area() <= 0 || !bounds.contains(x, y) || !node.visible()) return false;
             if (privateNode(node)) { privateHit = true; return true; }
             int children = Math.max(0, Math.min(MAX_NODES, node.children()));
-            SystemAssistContent.Result content = content(node);
-            Candidate candidate = new Candidate(node, bounds, originX, originY, depth, content);
             boolean boundedContent = children == 0 || depth > 0 && bounds.area() <= window.area() / 2;
+            List<String> hrefs = node.hrefs();
+            if (depth > 0 && boundedContent && hrefs != null && !hrefs.isEmpty())
+                enclosingHrefs = new SystemAssistContent.Result("", hrefs).links();
+            SystemAssistContent.Result content = content(node, enclosingHrefs, depth > 0 && bounds.area() <= window.area() / 2);
+            Candidate candidate = new Candidate(node, bounds, originX, originY, depth, content);
             if (boundedContent && (!content.text().isEmpty() || !content.links().isEmpty()) && preferred(candidate, best)) best = candidate;
             // A blank area of the full window must never aggregate unrelated screen text.
             if (depth > 0 && children > 0 && bounds.area() <= window.area() / 2 && preferred(candidate, container))
                 container = candidate;
             long nextX = originX + node.left() - node.scrollX(), nextY = originY + node.top() - node.scrollY();
             for (int i = children - 1; i >= 0 && remaining > 0; i--)
-                if (visit(node.child(i), nextX, nextY, bounds, depth + 1)) break;
+                if (visit(node.child(i), nextX, nextY, bounds, depth + 1, enclosingHrefs)) break;
             return true;
         }
 
@@ -119,7 +123,7 @@ public final class AssistContentExtractor {
             if (node == null || depth > MAX_DEPTH || remaining-- <= 0 || out.full() || !node.visible() || privateNode(node)) return;
             Bounds bounds = bounds(node, originX, originY).clip(clip);
             if (bounds.area() <= 0) return;
-            SystemAssistContent.Result value = content(node);
+            SystemAssistContent.Result value = content(node, List.of(), depth > 0 && bounds.area() <= window.area() / 2);
             if (!value.text().isEmpty() || !value.links().isEmpty()) {
                 out.add(value, bounds);
                 if (!value.text().isEmpty()) return;
@@ -151,8 +155,10 @@ public final class AssistContentExtractor {
         return node.blocked() || node.editable() || password || name != null
                 && (name.endsWith("EditText") || name.endsWith("AutoCompleteTextView"));
     }
-    private static SystemAssistContent.Result content(Node node) {
+    private static SystemAssistContent.Result content(Node node, List<String> enclosingHrefs, boolean allowDescription) {
         CharSequence raw = node.text();
+        // A leaf may expose only accessibility semantics; parent descriptions can summarize unrelated children.
+        if (allowDescription && (raw == null || raw.toString().isBlank()) && node.children() == 0) raw = node.description();
         String text = raw == null ? "" : raw.toString().trim();
         List<String> links = new ArrayList<>();
         if (raw instanceof Spanned spanned) {
@@ -166,6 +172,8 @@ public final class AssistContentExtractor {
             if (links.size() >= SystemAssistContent.MAX_LINKS) break;
             links.add(href);
         }
+        // Keep an explicit containing-card href alongside visible URLs, but never borrow ancestor text or erase it for an empty leaf.
+        if (links.isEmpty() && !text.isEmpty()) links.addAll(enclosingHrefs);
         return new SystemAssistContent.Result(text, links);
     }
     private static final class Accumulator {
@@ -209,6 +217,7 @@ public final class AssistContentExtractor {
         public int inputType() { return view.getInputType(); }
         public String className() { return view.getClassName(); }
         public CharSequence text() { return view.getText(); }
+        public CharSequence description() { return view.getContentDescription(); }
         public boolean editable() {
             ViewStructure.HtmlInfo html = view.getHtmlInfo();
             if (html == null) return false;

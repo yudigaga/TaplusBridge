@@ -20,6 +20,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import io.github.yudigaga.taplusbridge.config.DragSettings
 import io.github.yudigaga.taplusbridge.config.RecognitionChannels
+import io.github.yudigaga.taplusbridge.browser.BrowserStore
 import io.github.yudigaga.taplusbridge.runtime.RuntimePublisher
 import io.github.yudigaga.taplusbridge.translation.TranslationSettings
 import io.github.yudigaga.taplusbridge.translation.TranslationStore
@@ -35,6 +36,7 @@ import top.yukonga.miuix.kmp.preference.SwitchPreference
     val context = LocalContext.current
     val initialState = remember(controller) { controller.snapshot() }
     var translationMode by remember { mutableStateOf(TranslationStore(context).load().mode) }
+    var browserPackage by remember { mutableStateOf(BrowserStore(context).selectedPackage()) }
     var enabled by rememberSaveable { mutableStateOf(initial.enabled) }
     var linkProbe by remember { mutableStateOf(controller.scopeLinkProbeEnabled()) }
     var channels by remember { mutableStateOf(controller.recognitionChannels()) }
@@ -161,6 +163,8 @@ import top.yukonga.miuix.kmp.preference.SwitchPreference
                     ArrowPreference(title = "替换翻译", summary = when (translationMode) {
                         TranslationSettings.Mode.APP -> "使用所选本机应用"; TranslationSettings.Mode.AI -> "使用配置的 AI 服务"; else -> "未替换 · 使用传送门原翻译"
                     }, onClick = { dialog = "translation" }, modifier = Modifier.testTag("drag.group.translation"))
+                    ArrowPreference(title = "默认浏览器", summary = if (browserPackage.isEmpty()) "沿用系统默认与原浏览器选择" else browserPackage,
+                        onClick = { dialog = "browser" }, modifier = Modifier.testTag("drag.group.browser"))
                     ArrowPreference(title = "补点取链", summary = if (linkProbe) "已允许不可见点击 · 会操作来源内容" else "已禁止不可见点击",
                         onClick = { dialog = "probe" }, modifier = Modifier.testTag("drag.group.probe"))
                     ArrowPreference(title = "长按与拖动", summary = if (enabled) "草稿已开启 · 计时、方向与分享" else "草稿已关闭 · 点击配置",
@@ -173,6 +177,8 @@ import top.yukonga.miuix.kmp.preference.SwitchPreference
     }
     if (dialog == "translation") TranslationSettingsDialog(
         onDismiss = { dialog = null }, onSaved = { translationMode = TranslationStore(context).load().mode })
+    else if (dialog == "browser") BrowserSettingsDialog(
+        onDismiss = { dialog = null }, onSaved = { browserPackage = BrowserStore(context).selectedPackage() })
     else dialog?.let { section ->
         val direction = choosingDirection
         val title = if (direction != null) "${directionLabel(direction)}操作" else when (section) {

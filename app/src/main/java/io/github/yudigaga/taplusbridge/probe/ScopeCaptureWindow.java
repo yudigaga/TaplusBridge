@@ -10,11 +10,13 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 
-/** A foreground main-window capture lease. It never changes input, window flags or secure layers. */
+/** A foreground application-window capture lease. It never changes window flags or secure layers. */
 public final class ScopeCaptureWindow {
     static final int MAX_EDGE = 1600, MAX_PIXELS = 3_000_000;
+    private static final int MAX_MENU_BASELINE = 64;
     private final Field windowManager, globalLock, root, focusedWindow;
     private final Field ownerUid, showUser, attributes, activityRecord, activityComponent, activityUser;
     private final Method displayContent, displayWindows, touchableWindow, frame, mainWindow, parentWindow, visible, surface, children;
@@ -39,14 +41,19 @@ public final class ScopeCaptureWindow {
         public final float x, y;
         public final Rect bounds;
         private final Rect expectedBounds;
-        private final Object window, record, surface;
+        private final Object window, main, record, surface;
+        private final List<Object> menuBaseline;
+        private final List<android.os.IBinder> menuBaselineBinders;
 
         private Snapshot(String source, String activity, int uid, int user, int display, float x, float y,
-                         Rect bounds, Object window, Object record, Object surface) {
+                         Rect bounds, Object window, Object main, Object record, Object surface, List<Object> menuBaseline,
+                         List<android.os.IBinder> menuBaselineBinders) {
             this.source = source; this.activity = activity; this.uid = uid; this.user = user;
             this.display = display; this.x = x; this.y = y;
             this.bounds = new Rect(bounds); expectedBounds = new Rect(bounds);
-            this.window = window; this.record = record; this.surface = surface;
+            this.window = window; this.main = main; this.record = record; this.surface = surface;
+            this.menuBaseline = menuBaseline;
+            this.menuBaselineBinders = menuBaselineBinders;
         }
 
         /** Separate observers may lease the same original point in the same physical gesture. */
@@ -55,9 +62,12 @@ public final class ScopeCaptureWindow {
                     && uid == other.uid && user == other.user && display == other.display
                     && Float.compare(x, other.x) == 0 && Float.compare(y, other.y) == 0
                     && expectedBounds.equals(other.expectedBounds) && bounds.equals(expectedBounds)
-                    && other.bounds.equals(other.expectedBounds) && window == other.window && record == other.record
+                    && other.bounds.equals(other.expectedBounds) && window == other.window && main == other.main
+                    && record == other.record
                     && sameSurface(surface, other.surface);
         }
+
+        boolean ownsWindow(Object candidate) { return window == candidate; }
     }
 
     /** Backend seam exercises WMS checks without claiming a local JVM performed a real capture. */
@@ -100,7 +110,7 @@ public final class ScopeCaptureWindow {
         if (mainWindow.getReturnType() != window) throw new NoSuchMethodException("capture_main_window");
     }
 
-    /** DOWN must hit the visible, focused, non-secure main application window in the owner user. */
+    /** DOWN may hit an owned main window, Dialog or attached popup in the focused Activity. */
     public Snapshot inspect(Object atms, int display, float x, float y) throws ReflectiveOperationException {
         if (display != 0 || !Float.isFinite(x) || !Float.isFinite(y)) throw rejected("capture_display");
         Object service = service(atms), monitor = globalLock.get(service);
@@ -108,33 +118,40 @@ public final class ScopeCaptureWindow {
             Object content = displayContent.invoke(root.get(service), display);
             Object hit = content == null ? null : touchableWindow.invoke(content, x, y);
             Object focus = content == null ? null : focusedWindow.get(content);
-            if (hit == null || focus != hit) throw rejected("capture_focus");
+            if (hit == null || focus == null) throw rejected("capture_focus");
             requireNoIme(content);
             Object record = activityRecord.get(hit);
-            if (record == null || mainWindow.invoke(record, false) != hit) throw rejected("capture_main_window");
-            WindowManager.LayoutParams params = params(hit);
+            Object main = record == null ? null : mainWindow.invoke(record, false);
+            if (main == null) throw rejected("capture_main_window");
+            WindowManager.LayoutParams params = params(main);
             ComponentName component = (ComponentName) activityComponent.get(record);
-            int uid = ownerUid.getInt(hit), user = activityUser.getInt(record);
-            if (uid < 10000 || uid / 100000 != 0 || user != 0 || showUser.getInt(hit) != 0
+            int uid = ownerUid.getInt(main), user = activityUser.getInt(record);
+            if (uid < 10000 || uid / 100000 != 0 || user != 0 || showUser.getInt(main) != 0
                     || component == null || !HostPolicy.validPackage(component.getPackageName())
                     || component.getClassName().length() > 512
                     || !component.getClassName().matches("[A-Za-z_$][A-Za-z0-9_$]*(?:\\.[A-Za-z_$][A-Za-z0-9_$]*)*")
                     || !component.getPackageName().equals(params.packageName)
-                    || !normalMain(params.type) || parentWindow.invoke(hit) != null)
+                    || !normalMain(params.type) || parentWindow.invoke(main) != null)
                 throw rejected("capture_identity");
-            requireVisibleSafe(hit);
+            requireVisibleSafe(main);
+            checkedBounds(main, x, y);
             Rect bounds = checkedBounds(hit, x, y);
             Object layer = surface.invoke(hit);
             if (!backend.validSurface(layer)) throw rejected("capture_surface");
+            List<Object> baseline = menuBaseline(content, component.getPackageName(), uid, user);
+            if (baseline != null && (!containsIdentity(baseline, main) || !containsIdentity(baseline, hit))) baseline = null;
             Snapshot snapshot = new Snapshot(component.getPackageName(), component.getClassName(), uid, user,
-                    display, x, y, bounds, hit, record, layer);
+                    display, x, y, bounds, hit, main, record, layer, baseline, menuBaselineBinders(baseline));
+            requireOwnedApplicationWindow(snapshot, main);
+            requireOwnedApplicationWindow(snapshot, hit);
+            requireOwnedApplicationWindow(snapshot, focus);
             // Any unknown or secure child means no capture; ordinary owned subwindows can be excluded.
             exclusions(snapshot);
             return snapshot;
         }
     }
 
-    /** Only the captured main layer is read, with popup layers excluded and the source UID enforced. */
+    /** Only the captured window layer is read, with child popups excluded and the source UID enforced. */
     public Bitmap capture(Object atms, Snapshot original) throws ReflectiveOperationException {
         return capture(atms, original, -1);
     }
@@ -177,6 +194,149 @@ public final class ScopeCaptureWindow {
     public void validateBehindHost(Object atms, Snapshot original, int hostUid) throws ReflectiveOperationException {
         if (hostUid < 10000 || hostUid >= 100000) throw rejected("capture_host_identity");
         validateWindows(atms, original, hostUid);
+    }
+
+    /** Verifies the original source without invoking any application callback. */
+    public boolean recognitionSourceCurrent(Object atms, Snapshot original, int hostUid) {
+        try { validateBehindHost(atms, original, hostUid); return true; }
+        catch (ReflectiveOperationException | RuntimeException changed) { return false; }
+    }
+
+    /** Closes only a new owned menu through its distinct, non-animated Back callback. */
+    public String dismissRecognitionMenu(Object atms, Snapshot original, int hostUid, BooleanSupplier stillCurrent)
+            throws ReflectiveOperationException {
+        return dismissRecognitionMenu(atms, original, hostUid, stillCurrent, () -> true);
+    }
+
+    public String dismissRecognitionMenu(Object atms, Snapshot original, int hostUid, BooleanSupplier stillCurrent,
+                                         BooleanSupplier beforeDispatch) throws ReflectiveOperationException {
+        if (stillCurrent == null || !stillCurrent.getAsBoolean()) return "stale";
+        if (original == null || hostUid < 10000 || hostUid >= 100000) return "unsupported";
+        final Object candidate;
+        final MenuCallback callback;
+        try {
+            Object service = service(atms), monitor = globalLock.get(service);
+            synchronized (monitor) {
+                Object content = displayContent.invoke(root.get(service), original.display);
+                candidate = content == null ? null : focusedWindow.get(content);
+                if (candidate == null || candidate == original.main || candidate == original.window) return "none";
+                if (original.menuBaseline == null || original.menuBaselineBinders == null) return "unsupported";
+                if (containsIdentity(original.menuBaseline, candidate)) return "none";
+                if (!ownedMenu(original, candidate)) return "unsupported";
+                try { validateWindows(atms, original, hostUid); }
+                catch (IllegalStateException changed) { return "changed"; }
+                callback = menuCallback(candidate);
+                if (callback == null) return "unsupported";
+                if (sharedMenuCallback(original, callback.binder)) return "ambiguous";
+            }
+            if (!stillCurrent.getAsBoolean()) return "stale";
+            synchronized (monitor) {
+                Object content = displayContent.invoke(root.get(service), original.display);
+                if (content == null || focusedWindow.get(content) != candidate || !ownedMenu(original, candidate))
+                    return "changed";
+                try { validateWindows(atms, original, hostUid); }
+                catch (IllegalStateException changed) { return "changed"; }
+                MenuCallback checked = menuCallback(candidate);
+                if (checked == null || !sameBinder(callback.binder, checked.binder)
+                        || focusedWindow.get(content) != candidate) return "changed";
+                if (sharedMenuCallback(original, callback.binder)) return "ambiguous";
+            }
+        } catch (ReflectiveOperationException | RuntimeException unavailable) { return "unsupported"; }
+        if (!stillCurrent.getAsBoolean()) return "stale";
+        try { if (beforeDispatch == null || !beforeDispatch.getAsBoolean()) return "unsupported"; }
+        catch (RuntimeException unavailable) { return "unsupported"; }
+        if (!stillCurrent.getAsBoolean()) return "stale";
+        // A callback may post asynchronously; an attempted dispatch must never authorize a retry.
+        try { callback.invoke.invoke(callback.target); }
+        catch (java.lang.reflect.InvocationTargetException unavailable) { return "sent"; }
+        return "sent";
+    }
+
+    private List<Object> menuBaseline(Object content, String source, int uid, int user) {
+        List<Object> windows = new ArrayList<>();
+        boolean[] complete = {true};
+        try {
+            displayWindows.invoke(content, (Consumer<Object>) window -> {
+                if (!complete[0]) return;
+                try {
+                    if (ownerUid.getInt(window) != uid || showUser.getInt(window) != user
+                            || !source.equals(params(window).packageName) || !Boolean.TRUE.equals(visible.invoke(window))
+                            || containsIdentity(windows, window)) return;
+                    if (windows.size() >= MAX_MENU_BASELINE) { complete[0] = false; return; }
+                    windows.add(window);
+                } catch (ReflectiveOperationException | RuntimeException unavailable) { complete[0] = false; }
+            }, true);
+        } catch (ReflectiveOperationException | RuntimeException unavailable) { return null; }
+        return complete[0] ? List.copyOf(windows) : null;
+    }
+
+    private boolean ownedMenu(Snapshot original, Object window) throws ReflectiveOperationException {
+        WindowManager.LayoutParams params = params(window);
+        Object parent = parentWindow.invoke(window);
+        boolean dialog = params.type == WindowManager.LayoutParams.TYPE_APPLICATION && parent == null;
+        boolean popup = params.type >= WindowManager.LayoutParams.FIRST_SUB_WINDOW
+                && params.type <= WindowManager.LayoutParams.LAST_SUB_WINDOW
+                && (parent == original.main || parent == original.window);
+        return (dialog || popup) && ownerUid.getInt(window) == original.uid
+                && showUser.getInt(window) == original.user && activityRecord.get(window) == original.record
+                && original.source.equals(params.packageName) && (params.flags & WindowManager.LayoutParams.FLAG_SECURE) == 0
+                && Boolean.TRUE.equals(visible.invoke(window));
+    }
+
+    private List<android.os.IBinder> menuBaselineBinders(List<Object> windows) {
+        if (windows == null) return null;
+        List<android.os.IBinder> binders = new ArrayList<>();
+        try {
+            for (Object window : windows) {
+                Object info = method(window.getClass(), "getOnBackInvokedCallbackInfo").invoke(window);
+                android.os.IBinder binder = info == null ? null
+                        : callbackBinder(method(info.getClass(), "getCallback").invoke(info));
+                if (binder != null) binders.add(binder);
+            }
+            return List.copyOf(binders);
+        } catch (ReflectiveOperationException | RuntimeException unavailable) { return null; }
+    }
+
+    private record MenuCallback(Object target, android.os.IBinder binder, Method invoke) { }
+
+    private MenuCallback menuCallback(Object window) throws ReflectiveOperationException {
+        Object info = method(window.getClass(), "getOnBackInvokedCallbackInfo").invoke(window);
+        if (info == null || !Boolean.FALSE.equals(method(info.getClass(), "isAnimationCallback").invoke(info))) return null;
+        Object priority = method(info.getClass(), "getPriority").invoke(info);
+        if (!(priority instanceof Integer value) || value != -1 && value != 0 && value != 1_000_000) return null;
+        Object callback = method(info.getClass(), "getCallback").invoke(info);
+        android.os.IBinder binder = callbackBinder(callback);
+        if (binder == null || !binder.isBinderAlive()) return null;
+        Method invoke = method(callback.getClass(), "onBackInvoked");
+        return invoke.getReturnType() == void.class ? new MenuCallback(callback, binder, invoke) : null;
+    }
+
+    private boolean sharedMenuCallback(Snapshot original, android.os.IBinder candidate) throws ReflectiveOperationException {
+        for (android.os.IBinder previous : original.menuBaselineBinders)
+            if (sameBinder(candidate, previous)) return true;
+        List<Object> existing = new ArrayList<>(original.menuBaseline);
+        if (!containsIdentity(existing, original.main)) existing.add(original.main);
+        if (!containsIdentity(existing, original.window)) existing.add(original.window);
+        for (Object window : existing) {
+            Object info = method(window.getClass(), "getOnBackInvokedCallbackInfo").invoke(window);
+            if (info != null && sameBinder(candidate, callbackBinder(method(info.getClass(), "getCallback").invoke(info))))
+                return true;
+        }
+        return false;
+    }
+
+    private static android.os.IBinder callbackBinder(Object callback) throws ReflectiveOperationException {
+        Object binder = callback == null ? null : method(callback.getClass(), "asBinder").invoke(callback);
+        return binder instanceof android.os.IBinder value ? value : null;
+    }
+
+    private static boolean sameBinder(android.os.IBinder first, android.os.IBinder second) {
+        return first != null && (first == second || first.equals(second));
+    }
+
+    private static boolean containsIdentity(List<Object> values, Object target) {
+        for (Object value : values) if (value == target) return true;
+        return false;
     }
 
     /** Token of the already validated source Activity; never accepts a token supplied by an app. */
@@ -291,15 +451,16 @@ public final class ScopeCaptureWindow {
             Object window = original.window;
             WindowManager.LayoutParams params = params(window);
             ComponentName component = (ComponentName) activityComponent.get(original.record);
-            if (activityRecord.get(window) != original.record || mainWindow.invoke(original.record, false) != window
+            if (activityRecord.get(window) != original.record || mainWindow.invoke(original.record, false) != original.main
                     || ownerUid.getInt(window) != original.uid || showUser.getInt(window) != original.user
                     || activityUser.getInt(original.record) != original.user || component == null
                     || !original.source.equals(component.getPackageName()) || !original.activity.equals(component.getClassName())
-                    || !original.source.equals(params.packageName) || !normalMain(params.type)
-                    || parentWindow.invoke(window) != null || !sameSurface(surface.invoke(window), original.surface)
+                    || !original.source.equals(params.packageName) || !sameSurface(surface.invoke(window), original.surface)
                     || !original.expectedBounds.equals(checkedBounds(window, original.x, original.y)))
                 throw rejected("capture_window_changed");
-            requireVisibleSafe(window);
+            requireOwnedApplicationWindow(original, original.main);
+            requireOwnedApplicationWindow(original, window);
+            checkedBounds(original.main, original.x, original.y);
             if (!backend.validSurface(original.surface)) throw rejected("capture_surface");
             if (focus == null || hit == null) throw rejected("capture_focus");
             List<Object> chrome = new ArrayList<>();
@@ -328,7 +489,7 @@ public final class ScopeCaptureWindow {
 
     private void admitForeground(Snapshot original, Object candidate, Object window, int hostUid, List<Object> chrome)
             throws ReflectiveOperationException {
-        if (candidate == window || trustedHostOverlay(candidate, hostUid)) return;
+        if (candidate == window || candidate == original.main || trustedHostOverlay(candidate, hostUid)) return;
         try { requireSameActivityForeground(original, candidate); }
         catch (RuntimeException rejected) {
             if (!sameAppChrome(original, candidate)) throw rejected;
@@ -436,6 +597,19 @@ public final class ScopeCaptureWindow {
             return;
         }
         requirePopup(snapshot, window);
+    }
+
+    private void requireOwnedApplicationWindow(Snapshot snapshot, Object window) throws ReflectiveOperationException {
+        WindowManager.LayoutParams params = params(window);
+        Object parent = parentWindow.invoke(window);
+        boolean application = normalMain(params.type) && parent == null
+                && (window == snapshot.main || params.type == WindowManager.LayoutParams.TYPE_APPLICATION);
+        boolean popup = params.type >= WindowManager.LayoutParams.FIRST_SUB_WINDOW
+                && params.type <= WindowManager.LayoutParams.LAST_SUB_WINDOW && parent == snapshot.main;
+        if ((!application && !popup) || ownerUid.getInt(window) != snapshot.uid
+                || showUser.getInt(window) != snapshot.user || activityRecord.get(window) != snapshot.record
+                || !snapshot.source.equals(params.packageName)) throw rejected("capture_focus");
+        requireVisibleSafe(window);
     }
 
     private void requireVisibleSafe(Object window) throws ReflectiveOperationException {

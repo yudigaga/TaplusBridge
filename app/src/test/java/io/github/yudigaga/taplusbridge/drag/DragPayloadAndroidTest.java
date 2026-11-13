@@ -10,6 +10,9 @@ import android.database.Cursor;
 import android.net.Uri;
 import android.os.CancellationSignal;
 import android.os.ParcelFileDescriptor;
+import android.text.SpannableString;
+import android.text.Spanned;
+import android.text.style.URLSpan;
 import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.IOException;
@@ -67,6 +70,41 @@ public final class DragPayloadAndroidTest {
             assertEquals("卡片标题", card.text); assertEquals(List.of("https://example.com/item?x=1&y=2"), card.links());
         }
     }
+    @Test public void richTextHiddenUrlSpanSurvivesWithoutVisibleUrl() throws Exception {
+        String url = "https://example.com/actual-card";
+        SpannableString title = new SpannableString("查看链接");
+        title.setSpan(new URLSpan(url), 0, title.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        try (DragPayload card = read(ClipData.newPlainText("card", title))) {
+            assertEquals("查看链接", card.text);
+            assertEquals(List.of(url), card.links());
+            assertEquals("查看链接\n" + url, card.sharedText());
+        }
+    }
+    @Test public void richTextUrlSpansDeduplicateVisibleAndRepeatedDestinations() throws Exception {
+        String visible = "https://example.com/visible", hidden = "https://example.com/hidden";
+        SpannableString title = new SpannableString(visible + " 查看链接 再次查看");
+        title.setSpan(new URLSpan(visible), 0, visible.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        title.setSpan(new URLSpan(hidden), visible.length() + 1, visible.length() + 5,
+                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        title.setSpan(new URLSpan(hidden), visible.length() + 6, title.length(),
+                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        try (DragPayload card = read(ClipData.newPlainText("card", title))) {
+            assertEquals(title.toString(), card.text);
+            assertEquals(List.of(visible, hidden), card.links());
+            assertEquals(title + "\n" + hidden, card.sharedText());
+        }
+    }
+    @Test public void repeatedLongSpansCannotExhaustTheLinkBufferBeforeDeduplication() throws Exception {
+        String url = "https://example.com/" + "p".repeat(7000);
+        SpannableString title = new SpannableString("看".repeat(32));
+        for (int i = 0; i < 32; i++)
+            title.setSpan(new URLSpan(url), i, i + 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        try (DragPayload card = read(ClipData.newPlainText("card", title))) {
+            assertEquals(List.of(url), card.links());
+            assertEquals(title + "\n" + url, card.sharedText());
+        }
+    }
+
     @Test public void readsOnlyTheExplicitHttpFieldsOfAnEmbeddedIntent() throws Exception {
         Intent launch = new Intent("dangerous.custom.ACTION", Uri.parse("https://example.com/real"))
                 .setPackage("com.example.target").putExtra(Intent.EXTRA_TEXT, "https://example.org/extra");

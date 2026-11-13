@@ -1,5 +1,7 @@
 # 0.15.4：长按内容、四边彩虹与碰触反馈
 
+> 本文中的本地归档路径不随源码仓库分发；公开发布产物请以 Releases 为准。
+
 日期：2026-11-03（Asia/Shanghai）。版本：0.15.4 / 36。范围及授权见 [scope.md](scope.md)。这是本地长期签名 R8 Release 交付，未远程发布。
 
 ## 最终交互
@@ -24,13 +26,13 @@
 
 ## 验证和产物
 
-运行 17 个定向 JUnit / Robolectric 套件，涉及彩虹碰触位置、密度缩放、回中取消、边缘吸附、震动重入、两类拖放 UI、长按交接、单次 token、来源校验、卡片富文本、识别会话隔离、链接边界及选择操作。准确统计与最终 lint、签名、对齐、APK 和 mapping 哈希见 [validation-0.15.4.json](../artifacts/validation-0.15.4.json)。
+运行 17 个定向 JUnit / Robolectric 套件，涉及彩虹碰触位置、密度缩放、回中取消、边缘吸附、震动重入、两类拖放 UI、长按交接、单次 token、来源校验、卡片富文本、识别会话隔离、链接边界及选择操作。准确统计与最终 lint、签名、对齐、APK 和 mapping 哈希见 validation-0.15.4.json（本地归档：`../artifacts/validation-0.15.4.json`）。
 
 最终结果：175 项测试通过，失败/错误/跳过均为 0；Release lint 为 0 错误、37 警告。54 项宿主静态定义检查通过。APK v2 长期签名、4 字节 ZIP、16 KiB 原生库 ZIP 与 ELF PT_LOAD 对齐通过；设备框架 ContentCatcher SDK 仍未作动态验证。
 
-本地 Canvas 渲染检查包括中心、靠近、四边接触状态，见 [渲染拼图](../artifacts/ui-0.15.4/rainbow-contact-sheet.png)。它检查实际 View 绘制，不代表手机帧率、手指触感或触摸交接已经验收。
+本地 Canvas 渲染检查包括中心、靠近、四边接触状态，见 渲染拼图（本地归档：`../artifacts/ui-0.15.4/rainbow-contact-sheet.png`）。它检查实际 View 绘制，不代表手机帧率、手指触感或触摸交接已经验收。
 
-APK：[TaplusBridge-0.15.4-release.apk](../artifacts/TaplusBridge-0.15.4-release.apk)。配套 [SHA-256](../artifacts/SHA256SUMS-0.15.4.txt) 和 [R8 mapping](../artifacts/TaplusBridge-0.15.4-r8-mapping.zip) 同目录归档。签名使用与 0.15.3 正式包相同的长期密钥。安装后重启手机使系统侧 Hook 更新。
+APK：TaplusBridge-0.15.4-release.apk（本地归档：`../artifacts/TaplusBridge-0.15.4-release.apk`）。配套 SHA-256（本地归档：`../artifacts/SHA256SUMS-0.15.4.txt`） 和 R8 mapping（本地归档：`../artifacts/TaplusBridge-0.15.4-r8-mapping.zip`） 同目录归档。签名使用与 0.15.3 正式包相同的长期密钥。安装后重启手机使系统侧 Hook 更新。
 
 APK 为 3,267,337 字节，SHA-256：`F9DBDD49CF2203A38FD1CB1555D5C41E3943640FEEFED65349D74DE0FF2AEEB5`。长期签名证书 SHA-256：`2f3c681d676d8f763b191dea0714c399e21bbaa0e948f25289ebfbcf41d1aabd`。
 

@@ -1,6 +1,8 @@
 # 115 37.2.6 链接接收契约
 
-分析日期：2026-11-06，Asia/Shanghai。普通 APK 静态逆向，`flavor = null`。工具为 JADX 1.5.6、Android SDK build-tools 36.0.0 aapt。范围见 [scope](../analysis/cloud115-37.2.6/scope.md)。
+> 本文中的本地归档路径不随源码仓库分发；公开发布产物请以 Releases 为准。
+
+分析日期：2026-11-06，Asia/Shanghai。普通 APK 静态逆向，`flavor = null`。工具为 JADX 1.5.6、Android SDK build-tools 36.0.0 aapt。范围见 scope（本地归档：`../analysis/cloud115-37.2.6/scope.md`）。
 
 该版本已有标准磁力和 ed2k 接收入口。模块按用户规则选定 115 后，可以原样传递 `ACTION_VIEW` 的 data，无需私有协议转换。该版本没有 HTTP/HTTPS 的 Intent filter；通用文本分享入口会进入发帖页面，不能作为“在网盘打开链接”的等价替代。以上是静态入口契约，未做手机登录状态、Activity 启动或离线任务验收。
 

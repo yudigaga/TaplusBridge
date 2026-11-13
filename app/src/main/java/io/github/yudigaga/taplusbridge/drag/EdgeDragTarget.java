@@ -14,11 +14,14 @@ public final class EdgeDragTarget {
                 || originX < 0 || originY < 0 || originX > width || originY > height)
             return new Contact(null, null, 0, 0);
         float dx = x - originX, dy = y - originY;
-        if (Math.hypot(dx, dy) < 48 * density) return new Contact(null, null, 0, 0);
         boolean horizontal = Math.abs(dx) > Math.abs(dy);
         String direction = horizontal ? dx < 0 ? "left" : "right" : dy < 0 ? "up" : "down";
         float distance = horizontal ? Math.abs(dx) : Math.abs(dy);
         float travel = horizontal ? dx < 0 ? originX : width - originX : dy < 0 ? originY : height - originY;
+        float threshold = Math.min(48 * density, Math.min(travel, Math.max(8 * density, travel / 2)));
+        // Short paths must remain reachable without turning ordinary long-press jitter into a drag.
+        double movement = travel < 8 * density ? distance : Math.hypot(dx, dy);
+        if (distance == 0 || travel <= 0 || movement < threshold) return new Contact(null, null, 0, 0);
         float dimension = horizontal ? width : height;
         float progress = Math.max(0, Math.min(1, distance / Math.max(1, travel)));
         float approachingInset = Math.min(dimension * .32f, 190 * density) * progress;

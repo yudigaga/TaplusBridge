@@ -542,10 +542,17 @@ public final class SystemLongPressDrag implements RuntimeServer.DragGestures {
                 || run == null || !token.equals(run.token) || !valid(run, config) || run.consumed
                 || !run.gesture.released() || !source.equals(run.target.source) || !direction.equals(run.direction())
                 || "none".equals(config.drag.action(direction))
-                || SystemClock.elapsedRealtime() - run.releasedAt >= RELEASE_GRACE_MILLIS)
+                || SystemClock.elapsedRealtime() - run.releasedAt >= RELEASE_GRACE_MILLIS) {
+            log("consume_rejected reason=gesture_invalid");
             return Bundle.EMPTY;
+        }
         try { validateAfterPick(run); }
-        catch (ReflectiveOperationException | RuntimeException changed) { return Bundle.EMPTY; }
+        catch (ReflectiveOperationException | RuntimeException changed) {
+            String reason = "drag_source_changed".equals(changed.getMessage()) ? "source_changed"
+                    : ScopeCaptureWindow.diagnosticWindowReason(changed.getMessage());
+            log("consume_rejected reason=" + reason);
+            return Bundle.EMPTY;
+        }
         run.consumed = true;
         Bundle result = new Bundle(); result.putBoolean("accepted", true); result.putString("action", config.drag.action(direction));
         log("imported direction=" + direction); return result;
@@ -595,7 +602,7 @@ public final class SystemLongPressDrag implements RuntimeServer.DragGestures {
         result.putString("state", run.gesture.released() ? "released" : "holding");
         String direction = run.direction();
         if (direction != null) { result.putString("direction", direction); result.putString("action", run.config.drag.action(direction)); }
-        if (run.gesture.direction() != null) result.putBoolean("dragging", true);
+        if (direction != null || run.gesture.direction() != null) result.putBoolean("dragging", true);
         if (io.github.yudigaga.taplusbridge.recognition.RouteLink.valid(run.cardLink)) result.putString("card_link", run.cardLink);
         result.putLong("native_at", run.stages.nativeAt());
         result.putLong("recognition_at", run.stages.recognitionAt());

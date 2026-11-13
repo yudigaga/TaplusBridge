@@ -35,6 +35,14 @@ public final class BridgeProvider extends ContentProvider {
     }
     private Bundle dispatch(String method, String arg, Bundle extras) {
         Context context = getContext();
+        if ("selection_actions".equals(method)) {
+            if (context == null || arg != null) return Bundle.EMPTY;
+            int callerUid = Binder.getCallingUid();
+            long identity = Binder.clearCallingIdentity();
+            try { return SourceSelectionTargets.read(context, callerUid, extras); }
+            catch (RuntimeException unavailable) { return Bundle.EMPTY; }
+            finally { Binder.restoreCallingIdentity(identity); }
+        }
         if (context != null && "lens_config".equals(method) && Binder.getCallingUid() == Process.myUid()) {
             Bundle result = new Bundle(); result.putBoolean("enabled", new ConfigStore(context).lensEnabled()); return result;
         }
@@ -61,6 +69,7 @@ public final class BridgeProvider extends ContentProvider {
                 && !"source_scope".equals(method) && !"lens_config".equals(method)
                 && !"recognition_channels".equals(method)
                 && !"translation_prepare".equals(method)
+                && !"action_target".equals(method)
                 && !"link_choice_prepare".equals(method)
                 && !"drag_take".equals(method) && !"drag_complete".equals(method) && !"drag_import".equals(method))) return Bundle.EMPTY;
         int uid = Binder.getCallingUid();
@@ -71,6 +80,14 @@ public final class BridgeProvider extends ContentProvider {
         try {
             PackageInfo host = context.getPackageManager().getPackageInfo(BridgeContract.HOST_PACKAGE, 0);
             if (!HostPolicy.supportedVersion(host.versionName, host.getLongVersionCode())) return declined("unsupported_host");
+            if ("action_target".equals(method)) {
+                if (arg != null || extras == null || !java.util.Set.of("kind", "source").containsAll(extras.keySet())
+                        || !(extras.get("kind") instanceof String kind)
+                        || !("browser".equals(kind) || "translate".equals(kind))
+                        || extras.containsKey("source") && (!(extras.get("source") instanceof String source)
+                                || !HostPolicy.validPackage(source))) return Bundle.EMPTY;
+                return ActionTargets.presentation(context, kind, extras.getString("source"));
+            }
             if ("link_choice_prepare".equals(method)) {
                 if (extras == null || !(extras.get("links") instanceof List<?> raw)
                         || raw.isEmpty() || raw.size() > io.github.yudigaga.taplusbridge.links.LinkChoiceRequests.MAX_LINKS
@@ -175,7 +192,12 @@ public final class BridgeProvider extends ContentProvider {
             }
             LaunchPlanner.PlanningResult planned = LaunchPlanner.planWithReason(context, extras);
             LaunchPlanner.Plan plan = planned.plan();
-            if (plan == null) return declined(planned.reason());
+            if (plan == null) {
+                Bundle browser = ActionTargets.browserFallback(context, method, extras, planned.reason());
+                if (browser == null) return declined(planned.reason());
+                if (browser.containsKey("direct")) recordRequest(context);
+                return browser;
+            }
             if ("resolve".equals(method)) return preview(context, plan);
             Intent direct = LaunchPlanner.directIfReady(context, plan);
             if (direct != null) {

@@ -7,6 +7,7 @@ import android.view.WindowManager;
 import io.github.yudigaga.taplusbridge.hook.HostPolicy;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import org.junit.Before;
 import org.junit.Test;
@@ -46,6 +47,15 @@ public final class ScopeCaptureWindowAndroidTest {
         atms.mWindowManager.mRoot.display.mCurrentFocus = popup;
         atms.mWindowManager.mRoot.display.hit = popup;
         return popup;
+    }
+
+    private Window dialog() {
+        Window dialog = new Window(); dialog.mAttrs.type = WindowManager.LayoutParams.TYPE_APPLICATION;
+        dialog.mActivityRecord = main.mActivityRecord; dialog.bounds = new Rect(10, 100, 200, 300);
+        atms.mWindowManager.mRoot.display.mCurrentFocus = dialog;
+        atms.mWindowManager.mRoot.display.hit = dialog;
+        atms.mWindowManager.mRoot.display.additionalWindows.add(main);
+        return dialog;
     }
 
     private Window hostOverlay(int type) {
@@ -92,15 +102,149 @@ public final class ScopeCaptureWindowAndroidTest {
         fresh(); main.mAttrs.packageName = "com.example.other"; assertThrows(IllegalStateException.class, this::inspect);
     }
 
-    @Test public void downMustHitANormalMainWindowOnTheDefaultDisplay() throws Exception {
+    @Test public void downMustHitAnOwnedApplicationWindowOnTheDefaultDisplay() throws Exception {
         assertThrows(IllegalStateException.class, () -> access.inspect(atms, 1, 50, 200));
         assertThrows(IllegalStateException.class, () -> access.inspect(atms, 0, Float.NaN, 200));
         assertThrows(IllegalStateException.class, () -> access.inspect(atms, 0, -1, 200));
         assertThrows(IllegalStateException.class, () -> access.inspect(atms, 0, 400, 200));
         main.mAttrs.type = WindowManager.LayoutParams.TYPE_INPUT_METHOD;
         assertThrows(IllegalStateException.class, this::inspect);
-        fresh(); popup(1002); assertThrows(IllegalStateException.class, this::inspect);
+        fresh(); popup(WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY);
+        assertThrows(IllegalStateException.class, this::inspect);
         fresh(); atms.mWindowManager = null; assertThrows(IllegalStateException.class, this::inspect);
+    }
+
+    @Test public void downInsideAnExistingDialogCapturesItsOwnBoundedSurface() throws Exception {
+        Window dialog = dialog();
+        ScopeCaptureWindow.Snapshot original = inspect();
+        assertEquals(new Rect(10, 100, 200, 300), original.bounds);
+        assertSame(capture.result, access.capture(atms, original));
+        assertSame(dialog.layer, capture.layer); assertNotSame(main.layer, capture.layer);
+        assertEquals(new Rect(0, 0, 190, 200), capture.crop); assertEquals(21001, capture.uid);
+        assertSame(dialog, atms.mWindowManager.mRoot.display.mCurrentFocus);
+        assertEquals(0, dialog.mAttrs.flags);
+    }
+
+    @Test public void downInsideAnExistingPopupCapturesItsOwnBoundedSurface() throws Exception {
+        Window popup = popup(WindowManager.LayoutParams.TYPE_APPLICATION_PANEL);
+        ScopeCaptureWindow.Snapshot original = inspect();
+        assertEquals(new Rect(10, 100, 200, 300), original.bounds);
+        assertSame(capture.result, access.capture(atms, original));
+        assertSame(popup.layer, capture.layer); assertNotSame(main.layer, capture.layer);
+        assertEquals(new Rect(0, 0, 190, 200), capture.crop); assertEquals(21001, capture.uid);
+        assertSame(main, popup.parent); assertEquals(0, capture.excluded.length);
+    }
+
+    @Test public void downOnMainBehindAnOwnedDialogCapturesTheMainSurface() throws Exception {
+        Window dialog = dialog(); dialog.bounds = new Rect(10, 300, 200, 600);
+        atms.mWindowManager.mRoot.display.hit = main;
+        ScopeCaptureWindow.Snapshot original = inspect();
+        assertSame(capture.result, access.capture(atms, original));
+        assertSame(main.layer, capture.layer); assertEquals(new Rect(0, 0, 400, 800), capture.crop);
+        assertSame(dialog, atms.mWindowManager.mRoot.display.mCurrentFocus);
+    }
+
+    @Test public void downInsideANonFocusablePopupKeepsTheMainActivityFocus() throws Exception {
+        Window popup = popup(WindowManager.LayoutParams.TYPE_APPLICATION_PANEL);
+        popup.mAttrs.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
+        atms.mWindowManager.mRoot.display.mCurrentFocus = main;
+        ScopeCaptureWindow.Snapshot original = inspect();
+        assertSame(capture.result, access.capture(atms, original));
+        assertSame(popup.layer, capture.layer); assertSame(main, atms.mWindowManager.mRoot.display.mCurrentFocus);
+        assertEquals(0, capture.excluded.length);
+    }
+
+    @Test public void existingPopupAndDialogStillRequireOwnedSafeActivityWindowsAtDown() throws Exception {
+        for (boolean sibling : new boolean[]{false, true}) for (int invalid = 0; invalid < 12; invalid++) {
+            fresh(); Window target = sibling ? dialog() : popup(WindowManager.LayoutParams.TYPE_APPLICATION_PANEL);
+            switch (invalid) {
+                case 0 -> target.mOwnerUid++;
+                case 1 -> target.mShowUserId = 10;
+                case 2 -> target.mAttrs.packageName = "com.example.other";
+                case 3 -> target.mAttrs.flags = WindowManager.LayoutParams.FLAG_SECURE;
+                case 4 -> target.showing = false;
+                case 5 -> target.mActivityRecord = new Record();
+                case 6 -> main.mAttrs.flags = WindowManager.LayoutParams.FLAG_SECURE;
+                case 7 -> main.showing = false;
+                case 8 -> main.mOwnerUid++;
+                case 9 -> {
+                    Window ime = new Window(); ime.mAttrs.type = WindowManager.LayoutParams.TYPE_INPUT_METHOD;
+                    atms.mWindowManager.mRoot.display.additionalWindows.add(ime);
+                }
+                case 10 -> target.mAttrs.type = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY;
+                case 11 -> target.parent = new Window();
+            }
+            assertThrows("sibling=" + sibling + " case=" + invalid, IllegalStateException.class, this::inspect);
+            assertEquals(0, capture.calls);
+        }
+    }
+
+    @Test public void aLeasedPopupOrDialogCannotOutliveItsMainActivityWindow() throws Exception {
+        for (boolean sibling : new boolean[]{false, true}) for (int invalid = 0; invalid < 8; invalid++) {
+            fresh(); Window target = sibling ? dialog() : popup(WindowManager.LayoutParams.TYPE_APPLICATION_PANEL);
+            ScopeCaptureWindow.Snapshot original = inspect();
+            switch (invalid) {
+                case 0 -> main.mActivityRecord.main = new Window();
+                case 1 -> main.mAttrs.flags = WindowManager.LayoutParams.FLAG_SECURE;
+                case 2 -> main.showing = false;
+                case 3 -> target.mOwnerUid++;
+                case 4 -> target.layer = new Object();
+                case 5 -> target.bounds.bottom--;
+                case 6 -> target.parent = new Window();
+                case 7 -> target.mAttrs.type = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY;
+            }
+            assertThrows("sibling=" + sibling + " case=" + invalid, IllegalStateException.class,
+                    () -> access.capture(atms, original));
+            assertEquals(0, capture.calls);
+        }
+    }
+
+    @Test public void popupTouchTransfersFromTheActualHitWindowInsteadOfItsActivityMainWindow() throws Exception {
+        Window popup = popup(WindowManager.LayoutParams.TYPE_APPLICATION_PANEL);
+        ScopeCaptureWindow.Snapshot original = inspect(); Window mask = hostOverlay(2038);
+        mask.mAttrs.width = WindowManager.LayoutParams.MATCH_PARENT;
+        mask.mAttrs.height = WindowManager.LayoutParams.MATCH_PARENT;
+        mask.mAttrs.setTitle("TaplusBridge:DragMask:" + "a".repeat(43));
+        assertTrue(access.transferTouchToMask(atms, original, HOST_UID, mask.mAttrs.getTitle().toString()));
+        assertSame(popup.mInputChannel, atms.mWindowManager.mInputManager.from);
+        assertSame(mask.mInputChannel, atms.mWindowManager.mInputManager.to);
+    }
+
+    private SourceWindowAccess.CardPlan planCardTap(ScopeCaptureWindow.Snapshot target) throws Exception {
+        SourceWindowAccess clicks = new SourceWindowAccess(Atms.class);
+        java.lang.reflect.Method method;
+        try { method = SourceWindowAccess.class.getMethod("planCardTap", Object.class,
+                ScopeCaptureWindow.Snapshot.class, int.class); }
+        catch (NoSuchMethodException missing) {
+            throw new AssertionError("A card tap must retain its original captured application window", missing);
+        }
+        try { return (SourceWindowAccess.CardPlan) method.invoke(clicks, atms, target, HOST_UID); }
+        catch (java.lang.reflect.InvocationTargetException wrapped) {
+            if (wrapped.getCause() instanceof Exception cause) throw cause;
+            throw wrapped;
+        }
+    }
+
+    @Test public void aCardTapInsideItsOriginalDialogOrPopupDoesNotDismissTheCapturedWindow() throws Exception {
+        for (boolean sibling : new boolean[]{false, true}) {
+            fresh(); Window original = sibling ? dialog() : popup(WindowManager.LayoutParams.TYPE_APPLICATION_PANEL);
+            ScopeCaptureWindow.Snapshot target = inspect();
+            access.validateBehindHost(atms, target, HOST_UID);
+            SourceWindowAccess.CardPlan plan = planCardTap(target);
+            assertFalse("sibling=" + sibling, plan.dismiss());
+            assertSame(original, atms.mWindowManager.mRoot.display.hit);
+            assertSame(original, atms.mWindowManager.mRoot.display.mCurrentFocus);
+        }
+    }
+
+    @Test public void aNewPopupStillRequiresDismissalWhenTheOriginalMainWindowIsHit() throws Exception {
+        ScopeCaptureWindow.Snapshot target = inspect();
+        popup(WindowManager.LayoutParams.TYPE_APPLICATION_PANEL).bounds = new Rect(10, 300, 200, 600);
+        atms.mWindowManager.mRoot.display.hit = main;
+        access.validateBehindHost(atms, target, HOST_UID);
+        SourceWindowAccess.CardPlan plan = planCardTap(target);
+        assertTrue(plan.dismiss()); assertFalse(plan.popupCovered());
+        assertEquals(50f, plan.dismissX(), 0f); assertEquals(200f, plan.dismissY(), 0f);
     }
 
     @Test public void aReplacedMainSurfaceRecordUidOrFramePreventsCapture() throws Exception {
@@ -511,7 +655,7 @@ public final class ScopeCaptureWindowAndroidTest {
         assertEquals(0, capture.excluded.length); assertNull(dialog.parent);
         assertSame(dialog, atms.mWindowManager.mRoot.display.mCurrentFocus);
         assertEquals(0, dialog.mAttrs.flags);
-        assertThrows(IllegalStateException.class, this::inspect);
+        assertEquals(SOURCE, inspect().source);
     }
 
     @Test public void secureOrDifferentActivitySiblingDialogsNeverAuthorizeCaptureOfTheOldMainLayer() throws Exception {
@@ -524,6 +668,265 @@ public final class ScopeCaptureWindowAndroidTest {
         dialog.mAttrs.flags = 0; dialog.mActivityRecord = new Record();
         assertThrows(IllegalStateException.class, () -> access.capture(atms, original));
         assertEquals(0, capture.calls);
+    }
+
+    private String dismissRecognitionMenu(ScopeCaptureWindow.Snapshot target, BooleanSupplier current) throws Exception {
+        java.lang.reflect.Method method;
+        try { method = ScopeCaptureWindow.class.getMethod("dismissRecognitionMenu", Object.class,
+                ScopeCaptureWindow.Snapshot.class, int.class, BooleanSupplier.class); }
+        catch (NoSuchMethodException missing) {
+            throw new AssertionError("Recognition must close only its newly opened source menu", missing);
+        }
+        try { return (String) method.invoke(access, atms, target, HOST_UID, current); }
+        catch (java.lang.reflect.InvocationTargetException wrapped) {
+            if (wrapped.getCause() instanceof Exception cause) throw cause;
+            throw wrapped;
+        }
+    }
+
+    private String dismissRecognitionMenu(ScopeCaptureWindow.Snapshot target, BooleanSupplier current,
+                                          BooleanSupplier beforeDispatch) throws Exception {
+        java.lang.reflect.Method method;
+        try { method = ScopeCaptureWindow.class.getMethod("dismissRecognitionMenu", Object.class,
+                ScopeCaptureWindow.Snapshot.class, int.class, BooleanSupplier.class, BooleanSupplier.class); }
+        catch (NoSuchMethodException missing) {
+            throw new AssertionError("Only an actual menu dispatch may arm recognition retention", missing);
+        }
+        try { return (String) method.invoke(access, atms, target, HOST_UID, current, beforeDispatch); }
+        catch (java.lang.reflect.InvocationTargetException wrapped) {
+            if (wrapped.getCause() instanceof Exception cause) throw cause;
+            throw wrapped;
+        }
+    }
+
+    private boolean recognitionSourceCurrent(ScopeCaptureWindow.Snapshot target) throws Exception {
+        java.lang.reflect.Method method;
+        try { method = ScopeCaptureWindow.class.getMethod("recognitionSourceCurrent", Object.class,
+                ScopeCaptureWindow.Snapshot.class, int.class); }
+        catch (NoSuchMethodException missing) {
+            throw new AssertionError("Retention must validate the original source window without invoking Back", missing);
+        }
+        try { return (Boolean) method.invoke(access, atms, target, HOST_UID); }
+        catch (java.lang.reflect.InvocationTargetException wrapped) {
+            if (wrapped.getCause() instanceof Exception cause) throw cause;
+            throw wrapped;
+        }
+    }
+
+    private FakeBackCallback backCallback(Window window) {
+        FakeBackCallback callback = new FakeBackCallback(atms.mWindowManager);
+        window.backInfo = new FakeBackInfo(callback); return callback;
+    }
+
+    @Test public void recognitionClosesOnlyANewDialogOrPopupAndInvokesItsCallbackOutsideTheWmsLock() throws Exception {
+        for (boolean sibling : new boolean[]{false, true}) {
+            fresh(); ScopeCaptureWindow.Snapshot target = inspect();
+            Window menu = sibling ? dialog() : popup(WindowManager.LayoutParams.TYPE_APPLICATION_PANEL);
+            FakeBackCallback callback = backCallback(menu);
+            assertEquals("sent", dismissRecognitionMenu(target, () -> true));
+            assertEquals(1, callback.calls); assertEquals(0, capture.calls);
+            assertEquals(0, atms.mWindowManager.mInputManager.calls);
+        }
+    }
+
+    @Test public void platformOverlayPriorityCanDismissItsOwnNewDialogWithoutCallingTheMainCallback() throws Exception {
+        for (int priority : new int[]{-1, 0, 1_000_000}) {
+            fresh(); FakeBackCallback mainCallback = backCallback(main); ScopeCaptureWindow.Snapshot target = inspect();
+            Window menu = dialog(); FakeBackCallback callback = backCallback(menu); menu.backInfo.priority = priority;
+            assertEquals("priority=" + priority, "sent", dismissRecognitionMenu(target, () -> true));
+            assertEquals(1, callback.calls); assertEquals(0, mainCallback.calls);
+        }
+    }
+
+    @Test public void unverifiedBackCallbackPrioritiesRemainUnsupported() throws Exception {
+        for (int priority : new int[]{-2, 1, 1_000_001}) {
+            fresh(); ScopeCaptureWindow.Snapshot target = inspect(); Window menu = dialog();
+            FakeBackCallback callback = backCallback(menu); menu.backInfo.priority = priority;
+            assertEquals("priority=" + priority, "unsupported", dismissRecognitionMenu(target, () -> true));
+            assertEquals(0, callback.calls);
+        }
+    }
+
+    @Test public void beforeDispatchRunsOnceOutsideTheWmsLockImmediatelyBeforeTheMenuCallback() throws Exception {
+        ScopeCaptureWindow.Snapshot target = inspect(); FakeBackCallback callback = backCallback(dialog()); int[] before = {0};
+        assertEquals("sent", dismissRecognitionMenu(target, () -> true, () -> {
+            assertFalse(Thread.holdsLock(atms.mWindowManager.mGlobalLock));
+            assertEquals(0, callback.calls); before[0]++; return true;
+        }));
+        assertEquals(1, before[0]); assertEquals(1, callback.calls);
+    }
+
+    @Test public void aRejectedBeforeDispatchNeverInvokesTheSourceMenuCallback() throws Exception {
+        ScopeCaptureWindow.Snapshot target = inspect(); FakeBackCallback callback = backCallback(dialog()); int[] before = {0};
+        assertEquals("unsupported", dismissRecognitionMenu(target, () -> true, () -> { before[0]++; return false; }));
+        assertEquals(1, before[0]); assertEquals(0, callback.calls);
+    }
+
+    @Test public void aMissingOrRejectedMenuNeverArmsRecognitionRetention() throws Exception {
+        for (int failure = 0; failure < 5; failure++) {
+            fresh(); ScopeCaptureWindow.Snapshot target = inspect(); int[] before = {0};
+            FakeBackCallback callback = failure == 0 ? backCallback(main) : backCallback(dialog());
+            if (failure == 2) atms.mWindowManager.mRoot.display.mCurrentFocus.mAttrs.flags = WindowManager.LayoutParams.FLAG_SECURE;
+            if (failure == 3) backCallback(main).binder = callback.binder;
+            if (failure == 4) main.mActivityRecord.mActivityComponent = new ComponentName(SOURCE, SOURCE + ".OtherActivity");
+            boolean current = failure != 1;
+            String expected = switch (failure) {
+                case 0 -> "none";
+                case 1 -> "stale";
+                case 2 -> "unsupported";
+                case 3 -> "ambiguous";
+                default -> "changed";
+            };
+            assertEquals(expected, dismissRecognitionMenu(target, () -> current, () -> { before[0]++; return true; }));
+            assertEquals(0, before[0]); assertEquals(0, callback.calls);
+        }
+    }
+
+    @Test public void recognitionSourceValidationAllowsOwnedMenusAndVerifiedHostUiWithoutInvokingBack() throws Exception {
+        FakeBackCallback mainCallback = backCallback(main); ScopeCaptureWindow.Snapshot target = inspect();
+        FakeBackCallback menuCallback = backCallback(dialog());
+        assertTrue(recognitionSourceCurrent(target));
+        hostOverlay(WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY);
+        assertTrue(recognitionSourceCurrent(target));
+        assertEquals(0, mainCallback.calls); assertEquals(0, menuCallback.calls); assertEquals(0, capture.calls);
+    }
+
+    @Test public void recognitionSourceValidationRejectsForeignFocusOrAChangedOriginalSource() throws Exception {
+        for (int invalid = 0; invalid < 6; invalid++) {
+            fresh(); FakeBackCallback callback = backCallback(main); ScopeCaptureWindow.Snapshot target = inspect();
+            switch (invalid) {
+                case 0 -> hostOverlay(WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY).mOwnerUid++;
+                case 1 -> main.layer = new Object();
+                case 2 -> main.mActivityRecord.mActivityComponent = new ComponentName(SOURCE, SOURCE + ".OtherActivity");
+                case 3 -> main.mOwnerUid++;
+                case 4 -> main.mActivityRecord.main = new Window();
+                case 5 -> main.mAttrs.flags = WindowManager.LayoutParams.FLAG_SECURE;
+            }
+            assertFalse("case=" + invalid, recognitionSourceCurrent(target));
+            assertEquals(0, callback.calls); assertEquals(0, capture.calls);
+        }
+    }
+
+    @Test public void recognitionPreservesAnExistingTargetDialogAndOtherVisibleWindowsFromDown() throws Exception {
+        Window existing = dialog(); FakeBackCallback callback = backCallback(existing);
+        ScopeCaptureWindow.Snapshot target = inspect();
+        assertEquals("none", dismissRecognitionMenu(target, () -> true)); assertEquals(0, callback.calls);
+        fresh(); existing = dialog(); callback = backCallback(existing);
+        atms.mWindowManager.mRoot.display.hit = main; atms.mWindowManager.mRoot.display.mCurrentFocus = main;
+        atms.mWindowManager.mRoot.display.additionalWindows.add(existing);
+        target = inspect();
+        atms.mWindowManager.mRoot.display.hit = existing; atms.mWindowManager.mRoot.display.mCurrentFocus = existing;
+        assertEquals("none", dismissRecognitionMenu(target, () -> true)); assertEquals(0, callback.calls);
+    }
+
+    @Test public void recognitionReturnsNoneUntilANewSourceMenuExists() throws Exception {
+        ScopeCaptureWindow.Snapshot target = inspect(); FakeBackCallback callback = backCallback(main);
+        assertEquals("none", dismissRecognitionMenu(target, () -> true)); assertEquals(0, callback.calls);
+    }
+
+    @Test public void aNewPhysicalDownOrAChangedSourceRevokesRecognitionMenuDismissal() throws Exception {
+        ScopeCaptureWindow.Snapshot target = inspect(); FakeBackCallback callback = backCallback(dialog());
+        assertEquals("stale", dismissRecognitionMenu(target, () -> false)); assertEquals(0, callback.calls);
+        main.mActivityRecord.mActivityComponent = new ComponentName(SOURCE, SOURCE + ".OtherActivity");
+        assertEquals("changed", dismissRecognitionMenu(target, () -> true)); assertEquals(0, callback.calls);
+    }
+
+    @Test public void recognitionMenuCallbacksCannotBeSharedWithTheMainTargetOrAnyWindowExistingAtDown() throws Exception {
+        for (int shared = 0; shared < 3; shared++) {
+            fresh(); Window previous = shared == 0 ? main : dialog();
+            FakeBackCallback original = backCallback(previous);
+            if (shared == 2) {
+                atms.mWindowManager.mRoot.display.hit = main; atms.mWindowManager.mRoot.display.mCurrentFocus = main;
+                atms.mWindowManager.mRoot.display.additionalWindows.add(previous);
+            }
+            ScopeCaptureWindow.Snapshot target = inspect();
+            FakeBackCallback candidate = backCallback(dialog()); candidate.binder = original.binder;
+            assertEquals("shared=" + shared, "ambiguous", dismissRecognitionMenu(target, () -> true));
+            assertEquals(0, original.calls); assertEquals(0, candidate.calls);
+        }
+    }
+
+    @Test public void aMenuCallbackSharedWithTheCurrentMainCallbackIsAmbiguousEvenIfMainChangedItAfterDown() throws Exception {
+        ScopeCaptureWindow.Snapshot target = inspect(); FakeBackCallback mainCallback = backCallback(main);
+        FakeBackCallback candidate = backCallback(dialog()); candidate.binder = mainCallback.binder;
+        assertEquals("ambiguous", dismissRecognitionMenu(target, () -> true));
+        assertEquals(0, mainCallback.calls); assertEquals(0, candidate.calls);
+    }
+
+    @Test public void aNewMenuCannotReuseTheCallbackThatBelongedToTheMainWindowAtDown() throws Exception {
+        FakeBackCallback previous = backCallback(main); ScopeCaptureWindow.Snapshot target = inspect();
+        FakeBackCallback current = backCallback(main);
+        FakeBackCallback candidate = backCallback(dialog()); candidate.binder = previous.binder;
+        assertEquals("ambiguous", dismissRecognitionMenu(target, () -> true));
+        assertEquals(0, previous.calls); assertEquals(0, current.calls); assertEquals(0, candidate.calls);
+    }
+
+    @Test public void changedMenuCallbackOrFocusIsRejectedBeforeRecognitionSendsAnyBackCallback() throws Exception {
+        for (boolean changeFocus : new boolean[]{false, true}) {
+            fresh(); ScopeCaptureWindow.Snapshot target = inspect(); Window menu = dialog();
+            FakeBackCallback first = backCallback(menu), replacement = new FakeBackCallback(atms.mWindowManager);
+            menu.beforeBackRead = () -> {
+                if (menu.backReads != 2) return;
+                if (changeFocus) atms.mWindowManager.mRoot.display.mCurrentFocus = main;
+                else menu.backInfo = new FakeBackInfo(replacement);
+            };
+            assertEquals("focus=" + changeFocus, "changed", dismissRecognitionMenu(target, () -> true));
+            assertEquals(0, first.calls); assertEquals(0, replacement.calls);
+        }
+    }
+
+    @Test public void sourceChangeDuringMenuInspectionStillPreventsTheRecognitionCallback() throws Exception {
+        ScopeCaptureWindow.Snapshot target = inspect(); Window menu = dialog(); FakeBackCallback callback = backCallback(menu);
+        java.util.concurrent.atomic.AtomicBoolean current = new java.util.concurrent.atomic.AtomicBoolean(true);
+        menu.beforeBackRead = () -> current.set(false);
+        assertEquals("stale", dismissRecognitionMenu(target, current::get)); assertEquals(0, callback.calls);
+    }
+
+    @Test public void recognitionRejectsSecureForeignAnimatedOrPrivilegedMenuCallbacks() throws Exception {
+        for (int invalid = 0; invalid < 11; invalid++) {
+            fresh(); ScopeCaptureWindow.Snapshot target = inspect(); Window menu = dialog();
+            FakeBackCallback callback = backCallback(menu);
+            switch (invalid) {
+                case 0 -> menu.mAttrs.flags = WindowManager.LayoutParams.FLAG_SECURE;
+                case 1 -> menu.mOwnerUid++;
+                case 2 -> menu.mShowUserId = 10;
+                case 3 -> menu.mAttrs.packageName = "com.example.other";
+                case 4 -> menu.mActivityRecord = new Record();
+                case 5 -> menu.showing = false;
+                case 6 -> menu.backInfo.animation = true;
+                case 7 -> menu.backInfo.priority = 1;
+                case 8 -> callback.alive = false;
+                case 9 -> menu.backInfo = null;
+                case 10 -> callback.binder = null;
+            }
+            assertEquals("case=" + invalid, "unsupported", dismissRecognitionMenu(target, () -> true));
+            assertEquals(0, callback.calls);
+        }
+    }
+
+    @Test public void anUnavailableDownWindowBaselineDisablesOnlyMenuCleanup() throws Exception {
+        atms.mWindowManager.mRoot.display.failAtVisit = 2;
+        ScopeCaptureWindow.Snapshot target = inspect();
+        atms.mWindowManager.mRoot.display.failAtVisit = -1;
+        assertSame(capture.result, access.capture(atms, target));
+        FakeBackCallback callback = backCallback(dialog());
+        assertEquals("unsupported", dismissRecognitionMenu(target, () -> true)); assertEquals(0, callback.calls);
+    }
+
+    @Test public void unavailableHistoricalBackMetadataDisablesOnlyMenuCleanup() throws Exception {
+        main.backFailure = new UnsupportedOperationException("optional_back_contract_unavailable");
+        ScopeCaptureWindow.Snapshot target = inspect(); main.backFailure = null;
+        assertSame(capture.result, access.capture(atms, target));
+        FakeBackCallback callback = backCallback(dialog());
+        assertEquals("unsupported", dismissRecognitionMenu(target, () -> true)); assertEquals(0, callback.calls);
+    }
+
+    @Test public void aDownWindowBaselineMissingTheOriginalSourceWindowCannotAuthorizeMenuCleanup() throws Exception {
+        atms.mWindowManager.mRoot.display.omitWindows = true;
+        ScopeCaptureWindow.Snapshot target = inspect(); atms.mWindowManager.mRoot.display.omitWindows = false;
+        assertSame(capture.result, access.capture(atms, target));
+        FakeBackCallback callback = backCallback(dialog());
+        assertEquals("unsupported", dismissRecognitionMenu(target, () -> true)); assertEquals(0, callback.calls);
     }
 
     private static final class FakeCapture implements ScopeCaptureWindow.CaptureBackend {
@@ -557,9 +960,13 @@ public final class ScopeCaptureWindowAndroidTest {
     static final class Root { final Display display = new Display(); Display getDisplayContent(int id) { return id == 0 ? display : null; } }
     static final class Display {
         Window hit, mCurrentFocus;
+        int visits, failAtVisit = -1;
+        boolean omitWindows;
         final List<Window> additionalWindows = new ArrayList<>();
         Window getTouchableWinAtPointLocked(float x, float y) { return hit; }
         void forAllWindows(Consumer<Window> action, boolean topToBottom) {
+            if (++visits == failAtVisit) throw new IllegalStateException("baseline_unavailable");
+            if (omitWindows) return;
             if (hit != null) hit.forAllWindows(action, topToBottom);
             if (mCurrentFocus != null && mCurrentFocus != hit) mCurrentFocus.forAllWindows(action, topToBottom);
             for (Window window : additionalWindows) action.accept(window);
@@ -572,9 +979,14 @@ public final class ScopeCaptureWindowAndroidTest {
         Record mActivityRecord = new Record(); Window parent; Rect bounds = new Rect(0, 0, 400, 800);
         Object layer = new Object(); boolean showing = true; final List<Window> descendants = new ArrayList<>();
         long surfaceGeneration;
+        FakeBackInfo backInfo; int backReads; Runnable beforeBackRead = () -> {}; RuntimeException backFailure;
         Window() { mAttrs.type = 1; mAttrs.packageName = SOURCE; mAttrs.flags = 0; }
         Rect getFrame() { return bounds; } Window getParentWindow() { return parent; }
         boolean isVisible() { return showing; }
+        FakeBackInfo getOnBackInvokedCallbackInfo() {
+            if (backFailure != null) throw backFailure;
+            backReads++; beforeBackRead.run(); return backInfo;
+        }
         Object getSurfaceControl() { return surfaceGeneration == 0 ? layer : new SurfaceToken(surfaceGeneration); }
         static final class SurfaceToken { final long mNativeObject; SurfaceToken(long id) { mNativeObject = id; } }
         void forAllWindows(Consumer<Window> action, boolean topToBottom) { action.accept(this); for (Window child : descendants) action.accept(child); }
@@ -582,5 +994,31 @@ public final class ScopeCaptureWindowAndroidTest {
     static final class Record {
         ComponentName mActivityComponent = new ComponentName(SOURCE, ACTIVITY); int mUserId = 0;
         Window main; Window findMainWindow(boolean ignored) { return main; }
+    }
+    static final class FakeBackInfo {
+        final FakeBackCallback callback; int priority; boolean animation;
+        FakeBackInfo(FakeBackCallback callback) { this.callback = callback; }
+        FakeBackCallback getCallback() { return callback; }
+        int getPriority() { return priority; }
+        boolean isAnimationCallback() { return animation; }
+    }
+    static final class FakeBackCallback {
+        final Wms wms; android.os.IBinder binder; int calls; boolean alive = true;
+        FakeBackCallback(Wms wms) {
+            this.wms = wms;
+            binder = (android.os.IBinder) java.lang.reflect.Proxy.newProxyInstance(
+                    android.os.IBinder.class.getClassLoader(), new Class<?>[]{android.os.IBinder.class},
+                    (proxy, method, arguments) -> switch (method.getName()) {
+                        case "isBinderAlive", "pingBinder" -> alive;
+                        case "equals" -> proxy == arguments[0];
+                        case "hashCode" -> System.identityHashCode(proxy);
+                        default -> null;
+                    });
+        }
+        android.os.IBinder asBinder() { return binder; }
+        void onBackInvoked() {
+            assertFalse("source callbacks must never run under the WMS lock", Thread.holdsLock(wms.mGlobalLock));
+            calls++;
+        }
     }
 }

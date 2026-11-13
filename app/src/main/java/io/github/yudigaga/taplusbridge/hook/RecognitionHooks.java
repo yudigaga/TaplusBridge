@@ -81,6 +81,8 @@ public final class RecognitionHooks {
             links = List.copyOf(links.stream().filter(io.github.yudigaga.taplusbridge.recognition.RouteLink::valid)
                     .limit(io.github.yudigaga.taplusbridge.recognition.LinkExtractor.MAX_RESULTS)
                     .collect(java.util.stream.Collectors.toList()));
+            // Only a drag still missing a usable link needs the online recommendation to finish.
+            waiting = waiting && links.isEmpty();
         }
     }
 
@@ -860,6 +862,7 @@ public final class RecognitionHooks {
                 synchronized (sessionLock) {
                     if (!currentProbe(pickedEpoch, origin) || !autoProbe.claim(pickedEpoch)) return;
                 }
+                if (!HostDragHooks.claimNativeProbe(service, nativeResult)) return;
                 HostProbeAction.start(context, service, origin, pickedAt(), deadline,
                         () -> currentProbe(pickedEpoch, origin) && autoProbe.current(pickedEpoch)
                                 && !nativeUrlAvailable(service, nativeResult),

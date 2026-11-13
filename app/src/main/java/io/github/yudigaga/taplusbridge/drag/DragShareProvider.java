@@ -42,9 +42,12 @@ public final class DragShareProvider extends ContentProvider {
                 removed.add(files.remove(oldest)); edit.remove(oldest);
             }
             String token = UUID.randomUUID().toString();
+            long wall = System.currentTimeMillis();
+            // Cache cleanup must use the same start time as this share grant.
+            if (!payload.image.setLastModified(wall)) throw new IOException("unavailable_drag_image_store");
             try {
                 JSONObject data = new JSONObject().put("file", payload.image.getName()).put("mime", "image/png")
-                        .put("wall", System.currentTimeMillis()).put("elapsed", SystemClock.elapsedRealtime()).put("order", order);
+                        .put("wall", wall).put("elapsed", SystemClock.elapsedRealtime()).put("order", order);
                 if (!edit.putString(token, data.toString()).commit()) throw new IOException("unavailable_drag_image_store");
             } catch (org.json.JSONException invalid) { throw new IOException("invalid_drag_image_store", invalid); }
             for (Entry previous : removed) if (!previous.file.equals(payload.image)) previous.file.delete();

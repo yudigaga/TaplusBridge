@@ -48,12 +48,13 @@ public final class HostDragHooks {
     @FunctionalInterface interface DeliveryCall { void run() throws ReflectiveOperationException; }
     private WeakReference<Object> expanded = new WeakReference<>(null);
     private static final class Pending {
-        final long generation, deadline;
+        final long generation, deadline, beganAt = SystemClock.elapsedRealtime();
         final Object result;
         final String token, action;
         final boolean recognition, image, preserveNative;
         long recognitionEpoch = -1;
         String recognizedText = "";
+        boolean recommendationWaitLogged;
         Pending(long generation, Object result, String token, String action, boolean recognition,
                 boolean image, boolean preserveNative, long deadline) {
             this.generation = generation; this.result = result; this.token = token; this.action = action;
@@ -139,6 +140,11 @@ public final class HostDragHooks {
     static void nativeProbeCompleted(Object service, Object result) {
         HostDragHooks hooks = installed;
         if (hooks != null) hooks.longPress.nativeProbeCompleted(service, result);
+    }
+
+    static boolean claimNativeProbe(Object service, Object result) {
+        HostDragHooks hooks = installed;
+        return hooks == null || hooks.longPress.claimNativeProbe(service, result);
     }
 
     public static boolean dismissPreviewForLinkProbe(Object service, Object result, String source) {
@@ -303,7 +309,7 @@ public final class HostDragHooks {
                                 pending = null; return;
                             }
                             if (recognitionHooks != null && (captured == null || captured.waiting())) {
-                                main.postDelayed(() -> perform(context, service, next), 100); return;
+                                awaitRecommendation(context, service, next, captured); return;
                             }
                             if (next.image && !policy.disabled(Channel.OCR) && recognitionHooks != null)
                                 next.recognizedText = recognitionHooks.ocrText(service, next.result, next.recognitionEpoch);
@@ -323,10 +329,12 @@ public final class HostDragHooks {
                             pending = null; return;
                         }
                         if (recognitionHooks != null && (captured == null || captured.waiting())) {
-                            main.postDelayed(() -> perform(context, service, next), 100); return;
+                            awaitRecommendation(context, service, next, captured); return;
                         }
                         module.log(4, "TaplusBridge", "drag delivery stage=recognition_ready action=" + next.action
-                                + " chars=" + (words == null ? 0 : words.length()));
+                                + " chars=" + (words == null ? 0 : words.length()) + " links="
+                                + (captured == null ? 0 : captured.links().size()) + " elapsed_ms="
+                                + Math.max(0, SystemClock.elapsedRealtime() - next.beganAt));
                         completeRecognition(context, service, next, next.recognizedText); return;
                     }
                     main.postDelayed(() -> perform(context, service, next), 100); return;
@@ -359,6 +367,16 @@ public final class HostDragHooks {
         } catch (ReflectiveOperationException | RuntimeException failure) { fail(context, next, failure); }
     }
 
+    private void awaitRecommendation(Context context, Object service, Pending next, RecognitionHooks.DragSnapshot captured) {
+        if (!next.recommendationWaitLogged) {
+            next.recommendationWaitLogged = true;
+            if (module != null) module.log(4, "TaplusBridge", "drag delivery stage=recognition_wait action=" + next.action
+                    + " reason=" + (captured == null ? "snapshot_pending" : "recommendation_pending")
+                    + " elapsed_ms=" + Math.max(0, SystemClock.elapsedRealtime() - next.beganAt));
+        }
+        main.postDelayed(() -> perform(context, service, next), 100);
+    }
+
     private void selectAll(Object textCard) throws ReflectiveOperationException {
         int count = (Integer) segmentCount.invoke(textCard);
         if (count > 0 && (Integer) selectedCount.invoke(textCard) != count
@@ -388,7 +406,8 @@ public final class HostDragHooks {
                 request.putStringArrayList("links", new ArrayList<>(links));
                 Bundle completed = BridgeTransport.call(context, "drag_complete", request);
                 if (completed == null || completed.getString("token") == null) throw new IllegalStateException("drag_expired");
-                module.log(4, "TaplusBridge", "drag delivery stage=recognition_complete action=" + next.action);
+                module.log(4, "TaplusBridge", "drag delivery stage=recognition_complete action=" + next.action
+                        + " links=" + links.size() + " elapsed_ms=" + Math.max(0, SystemClock.elapsedRealtime() - next.beganAt));
                 Bundle choice = new Bundle(); choice.putString("token", completed.getString("token"));
                 main.post(() -> {
                     if (generation.get() != next.generation) return;

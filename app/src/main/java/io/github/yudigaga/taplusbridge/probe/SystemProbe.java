@@ -214,6 +214,7 @@ public final class SystemProbe {
         }
         try {
             scopeCapture = new SystemScopeCapture(module, worker, () -> system, () -> atmsInstance, () -> runtime, atms, physical);
+            scopeCapture.setMenuNavigationGuardReady(MenuKeyInputHooks.install(module,loader,()->scopeCapture));
             module.log(4, TAG, "Scope capture system hooks installed");
         } catch (ReflectiveOperationException | RuntimeException unavailable) {
             module.log(5, TAG, "Scope capture system unavailable: " + unavailable.getClass().getSimpleName());
@@ -341,9 +342,8 @@ public final class SystemProbe {
                         () -> runtime == null ? null : runtime.sourceCaptureConfiguration(),
                         target -> {
                             int uid = hostUid();
-                            cardPlan = windows.planCardTap(atmsInstance, target.source, target.activity, target.uid,
-                                    target.user, target.display, target.x, target.y, uid);
-                            if (!cardPlan.dismiss()) scopeCapture.validateLinkTargetBehind(target, uid);
+                            scopeCapture.validateLinkTargetBehind(target, uid);
+                            cardPlan = windows.planCardTap(atmsInstance, target, uid);
                         }, (target, action, downAt) -> {
                             if (action == MotionEvent.ACTION_DOWN) {
                                 SourceWindowAccess.CardPlan planned = cardPlan;

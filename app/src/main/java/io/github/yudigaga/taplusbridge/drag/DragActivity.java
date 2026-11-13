@@ -28,6 +28,8 @@ import android.widget.FrameLayout;
 import io.github.yudigaga.taplusbridge.R;
 import io.github.yudigaga.taplusbridge.bridge.BridgeProvider;
 import io.github.yudigaga.taplusbridge.bridge.LaunchPlanner;
+import io.github.yudigaga.taplusbridge.browser.BrowserApps;
+import io.github.yudigaga.taplusbridge.browser.BrowserStore;
 import io.github.yudigaga.taplusbridge.config.ConfigStore;
 import io.github.yudigaga.taplusbridge.config.DragSettings;
 import io.github.yudigaga.taplusbridge.hook.HostPolicy;
@@ -61,6 +63,8 @@ public final class DragActivity extends ComponentActivity {
     private DragAndDropPermissions permissions;
     private Future<?> readTask;
     private ModuleProcessLifecycle.Lease readLease;
+    private Future<?> shareTask;
+    private ModuleProcessLifecycle.Lease shareLease;
     private DropView target;
     private boolean dropped, destroyed, reading;
     private int generation;
@@ -313,34 +317,33 @@ public final class DragActivity extends ComponentActivity {
     private void browser(String url) {
         if (io.github.yudigaga.taplusbridge.recognition.RouteLink.valid(url)
                 && !io.github.yudigaga.taplusbridge.capture.IntentObservation.validHttpUrl(url)) { rules(url); return; }
+        String selected = new BrowserStore(this).selectedPackage();
+        if (!selected.isEmpty()) {
+            Intent intent = BrowserApps.viewIntent(this, url, selected);
+            if (intent == null) { fail("所选浏览器当前不可用，请在模块内重新选择"); return; }
+            try { startActivity(intent); finish(); }
+            catch (RuntimeException unavailable) { fail("所选浏览器当前不可用，请在模块内重新选择"); }
+            return;
+        }
         Intent generic = new Intent(Intent.ACTION_VIEW, Uri.parse("https://example.com/"))
                 .addCategory(Intent.CATEGORY_BROWSABLE);
-        LinkedHashMap<String, ResolveInfo> browsers = new LinkedHashMap<>();
-        for (ResolveInfo info : getPackageManager().queryIntentActivities(generic,
-                PackageManager.MATCH_DEFAULT_ONLY | PackageManager.GET_RESOLVED_FILTER))
-            if (info.activityInfo != null && info.activityInfo.exported && info.activityInfo.enabled && info.filter != null
-                    && info.filter.countDataAuthorities() == 0 && info.filter.countDataPaths() == 0)
-                browsers.putIfAbsent(info.activityInfo.packageName, info);
-        Intent selector = Intent.makeMainSelectorActivity(Intent.ACTION_MAIN, Intent.CATEGORY_APP_BROWSER);
-        for (ResolveInfo info : getPackageManager().queryIntentActivities(selector, 0))
-            if (info.activityInfo != null && info.activityInfo.exported && info.activityInfo.enabled)
-                browsers.putIfAbsent(info.activityInfo.packageName, info);
+        List<BrowserApps.Target> browsers = BrowserApps.installed(this);
         if (browsers.isEmpty()) { fail("未找到可用的浏览器"); return; }
-        Consumer<ResolveInfo> open = info -> {
+        Consumer<BrowserApps.Target> open = info -> {
             try {
-                Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(url)).addCategory(Intent.CATEGORY_BROWSABLE)
-                        .setPackage(info.activityInfo.packageName);
-                if (getPackageManager().resolveActivity(intent, PackageManager.MATCH_DEFAULT_ONLY) == null)
-                    throw new IllegalStateException("browser_unavailable");
+                Intent intent = BrowserApps.viewIntent(this, url, info.packageName());
+                if (intent == null) throw new IllegalStateException("browser_unavailable");
                 startActivity(intent); finish();
             } catch (RuntimeException unavailable) { fail("浏览器无法打开该链接"); }
         };
         ResolveInfo preferred = getPackageManager().resolveActivity(generic, PackageManager.MATCH_DEFAULT_ONLY);
-        if (preferred != null && preferred.activityInfo != null && browsers.containsKey(preferred.activityInfo.packageName)) {
-            open.accept(browsers.get(preferred.activityInfo.packageName)); return;
-        }
-        if (browsers.size() == 1) { open.accept(browsers.values().iterator().next()); return; }
-        choose("选择浏览器", new ArrayList<>(browsers.values()), open);
+        if (preferred != null && preferred.activityInfo != null)
+            for (BrowserApps.Target browser : browsers)
+                if (browser.packageName().equals(preferred.activityInfo.packageName)) { open.accept(browser); return; }
+        if (browsers.size() == 1) { open.accept(browsers.get(0)); return; }
+        DragMenuUi.showActions(this, "选择浏览器", browsers.stream()
+                .map(browser -> browser.label() + "\n" + browser.packageName()).collect(java.util.stream.Collectors.toList()),
+                index -> open.accept(browsers.get(index)));
     }
 
     private void share() throws IOException {
@@ -356,34 +359,56 @@ public final class DragActivity extends ComponentActivity {
         if (!settings.shareOnlySelected && settings.shareTargets.isEmpty()) {
             startActivity(Intent.createChooser(send, "分享拖拽内容")); finish(); return;
         }
-        LinkedHashMap<String, ResolveInfo> compatible = new LinkedHashMap<>();
-        for (ResolveInfo info : getPackageManager().queryIntentActivities(send, PackageManager.MATCH_DEFAULT_ONLY)) {
-            if (info.activityInfo == null || !info.activityInfo.exported || !info.activityInfo.enabled) continue;
-            compatible.put(new ComponentName(info.activityInfo.packageName, info.activityInfo.name).flattenToString(), info);
-        }
-        ArrayList<ResolveInfo> choices = new ArrayList<>();
-        for (String component : settings.shareTargets) {
-            ResolveInfo selected = compatible.remove(component); if (selected != null) choices.add(selected);
-        }
-        if (!settings.shareOnlySelected) {
-            ArrayList<ResolveInfo> remaining = new ArrayList<>(compatible.values());
-            remaining.sort(Comparator.comparing(info -> info.loadLabel(getPackageManager()).toString())); choices.addAll(remaining);
-        }
-        if (choices.isEmpty()) { fail("自定义分享菜单没有能接收当前内容的应用，请检查分享目标设置"); return; }
-        choose("分享拖拽内容", choices, info -> {
+        List<String> configured = settings.shareTargets;
+        boolean onlySelected = settings.shareOnlySelected;
+        int expected = ++generation;
+        if (shareTask != null) shareTask.cancel(true);
+        if (shareLease != null) shareLease.close();
+        ModuleProcessLifecycle.Lease lease = ModuleProcessLifecycle.acquire(15_000); shareLease = lease;
+        try { shareTask = IO.submit(() -> {
+            ArrayList<ShareTarget> choices = new ArrayList<>(); String error = null;
             try {
-                startActivity(new Intent(send).setComponent(new ComponentName(info.activityInfo.packageName, info.activityInfo.name)));
-                finish();
-            } catch (RuntimeException unavailable) { fail("分享目标暂不可用"); }
-        });
+                LinkedHashMap<String, ShareTarget> compatible = new LinkedHashMap<>();
+                PackageManager manager = getPackageManager();
+                for (ResolveInfo info : manager.queryIntentActivities(send, PackageManager.MATCH_DEFAULT_ONLY)) {
+                    if (Thread.currentThread().isInterrupted()) break;
+                    if (info.activityInfo == null || !info.activityInfo.exported || !info.activityInfo.enabled) continue;
+                    String component = new ComponentName(info.activityInfo.packageName, info.activityInfo.name).flattenToString();
+                    compatible.put(component, new ShareTarget(info, info.loadLabel(manager).toString()));
+                }
+                for (String component : configured) {
+                    ShareTarget selected = compatible.remove(component); if (selected != null) choices.add(selected);
+                }
+                if (!onlySelected) {
+                    ArrayList<ShareTarget> remaining = new ArrayList<>(compatible.values());
+                    remaining.sort(Comparator.comparing(ShareTarget::label)); choices.addAll(remaining);
+                }
+            } catch (RuntimeException unavailable) { error = "无法读取分享目标，请重试"; }
+            String message = error;
+            if (!main.post(() -> {
+                try {
+                    if (destroyed || isFinishing() || generation != expected) return;
+                    if (!allowed()) { finish(); return; }
+                    if (message != null) { fail(message); return; }
+                    if (choices.isEmpty()) { fail("自定义分享菜单没有能接收当前内容的应用，请检查分享目标设置"); return; }
+                    DragMenuUi.showActions(this, "分享拖拽内容", choices.stream()
+                            .map(item -> item.label + "\n" + item.info.activityInfo.packageName)
+                            .collect(java.util.stream.Collectors.toList()), index -> {
+                        if (!allowed()) { finish(); return; }
+                        ResolveInfo info = choices.get(index).info;
+                        try {
+                            startActivity(new Intent(send).setComponent(new ComponentName(info.activityInfo.packageName, info.activityInfo.name)));
+                            finish();
+                        } catch (RuntimeException unavailable) { fail("分享目标暂不可用"); }
+                    });
+                } finally { lease.close(); if (shareLease == lease) shareLease = null; }
+            })) lease.close();
+        }); } catch (RuntimeException unavailable) {
+            lease.close(); shareLease = null; fail("无法读取分享目标，请重试");
+        }
     }
 
-    private void choose(String title, List<ResolveInfo> choices, Consumer<ResolveInfo> selected) {
-        String[] labels = new String[choices.size()];
-        for (int i = 0; i < choices.size(); i++) labels[i] = choices.get(i).loadLabel(getPackageManager()).toString()
-                + "\n" + choices.get(i).activityInfo.packageName;
-        DragMenuUi.showActions(this, title, java.util.Arrays.asList(labels), index -> selected.accept(choices.get(index)));
-    }
+    private record ShareTarget(ResolveInfo info, String label) { }
 
     private void handoff(String action, boolean recognize) {
         if (!allowed()) { finish(); return; }
@@ -450,6 +475,7 @@ public final class DragActivity extends ComponentActivity {
     }
 
     private boolean applyChoice(String action, List<Content> contents, boolean[] checked, int single) {
+        if (destroyed || isFinishing() || payload == null) return false;
         ArrayList<String> texts = new ArrayList<>(), links = new ArrayList<>(); boolean image = false;
         for (int i = 0; i < contents.size(); i++) {
             if (single >= 0 ? i != single : !checked[i]) continue;
@@ -497,6 +523,8 @@ public final class DragActivity extends ComponentActivity {
         destroyed = true; ++generation; cancelled.cancel();
         if (readTask != null) readTask.cancel(true);
         if (readLease != null) { readLease.close(); readLease = null; }
+        if (shareTask != null) shareTask.cancel(true);
+        if (shareLease != null) { shareLease.close(); shareLease = null; }
         if (target != null) target.dispose();
         releasePermissions(); if (payload != null) { payload.close(); payload = null; }
         super.onDestroy();

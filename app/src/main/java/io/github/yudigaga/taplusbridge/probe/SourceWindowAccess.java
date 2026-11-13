@@ -84,13 +84,46 @@ public final class SourceWindowAccess {
                     && (window == focus || sourceMain(window, source, activity, uid, user, x, y))))
                 return CardPlan.tap();
             if (coveringMenu(window, focus, source, activity, uid, user, x, y)) {
-                return CardPlan.dismiss(x, y, true);
+                Rect popup = (Rect) frame.invoke(focus);
+                Object record = activityRecord.get(focus);
+                Rect main = (Rect) frame.invoke(mainWindow.invoke(record, false));
+                if (!popup.contains((int) x, (int) y)) return CardPlan.dismiss(x, y, false);
+                Rect[] outside = {new Rect(main.left, main.top, Math.min(main.right, popup.left), main.bottom),
+                        new Rect(Math.max(main.left, popup.right), main.top, main.right, main.bottom),
+                        new Rect(main.left, main.top, main.right, Math.min(main.bottom, popup.top)),
+                        new Rect(main.left, Math.max(main.top, popup.bottom), main.right, main.bottom)};
+                Rect best = null;
+                for (Rect region : outside) if (region.width() >= 2 && region.height() >= 2
+                        && (best == null || (long) region.width() * region.height() > (long) best.width() * best.height()))
+                    best = region;
+                if (best == null) throw new Rejected();
+                float dismissX = best.exactCenterX(), dismissY = best.exactCenterY();
+                // WMS geometric hit testing can return the main window outside the modal frame.
+                Object outsideHit = touchableWindow.invoke(content, dismissX, dismissY);
+                Object activityMain = mainWindow.invoke(record, false);
+                if (outsideHit != focus && outsideHit != activityMain) throw new Rejected();
+                return CardPlan.dismiss(dismissX, dismissY, false);
             }
         }
         ProbeClickPlan.Window kind = inspect(atms, source, activity, uid, user, display, x, y);
         if (kind == ProbeClickPlan.Window.MAIN) return CardPlan.tap();
         if (kind == ProbeClickPlan.Window.OUTSIDE_POPUP) return CardPlan.dismiss(x, y, false);
         throw new Rejected();
+    }
+
+    public CardPlan planCardTap(Object atms, ScopeCaptureWindow.Snapshot target, int hostUid)
+            throws ReflectiveOperationException {
+        available(atms);
+        Object service = windowManager.get(atms), monitor = globalLock.get(service);
+        synchronized (monitor) {
+            Object content = displayContent.invoke(root.get(service), target.display);
+            Object hit = content == null ? null : touchableWindow.invoke(content, target.x, target.y);
+            Object record = hit == null ? null : activityRecord.get(hit);
+            if (record != null && target.ownsWindow(hit) && mainWindow.invoke(record, false) != hit)
+                return CardPlan.tap(); // The popup itself was selected at DOWN; it is not a later obstruction.
+        }
+        return planCardTap(atms, target.source, target.activity, target.uid, target.user,
+                target.display, target.x, target.y, hostUid);
     }
 
     private boolean isHostOverlay(Object window, int hostUid) throws ReflectiveOperationException {
@@ -121,26 +154,30 @@ public final class SourceWindowAccess {
 
     private boolean coveringMenu(Object window, Object focus, String source, String activity, int uid, int user,
                                  float x, float y) throws ReflectiveOperationException {
-        if (focus != window) return false;
-        WindowManager.LayoutParams params = (WindowManager.LayoutParams) attributes.get(window);
-        if (params == null || params.type < 1000 || params.type > 1999
+        if (focus == null) return false;
+        WindowManager.LayoutParams params = (WindowManager.LayoutParams) attributes.get(focus);
+        if (params == null || !(params.type == WindowManager.LayoutParams.TYPE_APPLICATION
+                || params.type >= 1000 && params.type <= 1999)
                 || (params.flags & (WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
                 | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
                 | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
                 | WindowManager.LayoutParams.FLAG_SECURE)) != 0) return false;
-        Object record = activityRecord.get(window);
+        Object record = activityRecord.get(focus);
         ComponentName component = record == null ? null : (ComponentName) activityComponent.get(record);
         Object main = record == null ? null : mainWindow.invoke(record, false);
-        Rect popupBounds = (Rect) frame.invoke(window);
+        Rect popupBounds = (Rect) frame.invoke(focus);
         Rect mainBounds = main == null ? null : (Rect) frame.invoke(main);
-        Object parent = parentWindow.invoke(window);
-        return ownerUid.getInt(window) == uid && showUser.getInt(window) == user
+        Object parent = parentWindow.invoke(focus);
+        return ownerUid.getInt(focus) == uid && showUser.getInt(focus) == user
                 && source.equals(params.packageName) && component != null
                 && source.equals(component.getPackageName()) && activity.equals(component.getClassName())
-                && activityUser.getInt(record) == user && main != null && ownerUid.getInt(main) == uid
-                && (parent == main || parent == null) && popupBounds != null && mainBounds != null
-                && popupBounds.contains((int) x, (int) y) && mainBounds.contains((int) x, (int) y)
-                && Boolean.TRUE.equals(visible.invoke(window)) && Boolean.TRUE.equals(visible.invoke(main));
+                && activityUser.getInt(record) == user && main != null && main != focus
+                && (window == focus || window == main)
+                && (params.type == WindowManager.LayoutParams.TYPE_APPLICATION ? parent == null : parent == main)
+                && popupBounds != null && !popupBounds.isEmpty() && mainBounds != null
+                && mainBounds.contains(popupBounds) && sourceMain(main, source, activity, uid, user, x, y)
+                && (((WindowManager.LayoutParams) attributes.get(main)).flags & WindowManager.LayoutParams.FLAG_SECURE) == 0
+                && Boolean.TRUE.equals(visible.invoke(focus));
     }
 
     public ProbeClickPlan.Window inspect(Object atms, String source, String activity, int uid, int user,

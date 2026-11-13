@@ -13,6 +13,8 @@ import android.os.Looper;
 import android.os.SystemClock;
 import android.net.Uri;
 import android.view.WindowManager;
+import io.github.libxposed.api.XposedInterface;
+import io.github.libxposed.api.XposedModule;
 import io.github.yudigaga.taplusbridge.drag.RainbowDragView;
 import io.github.yudigaga.taplusbridge.bridge.BridgeContract;
 import io.github.yudigaga.taplusbridge.config.RecognitionChannels;
@@ -22,6 +24,7 @@ import java.io.IOException;
 import java.lang.reflect.Field;
 import java.lang.reflect.Proxy;
 import java.util.HashMap;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import org.robolectric.Robolectric;
@@ -117,6 +120,14 @@ public final class HostLongPressDragAndroidTest {
     @Test public void coordinateOnlyNativePickDoesNotDisableTheSystemLinkFallback() throws Exception {
         NativeResult coordinateOnly = result(); coordinateOnly.properties.put("coordinate", "50-60");
         assertFallbackProbeAfterRelease(coordinateOnly);
+    }
+
+    @Test public void nativeCardGeometryWithoutAStartedProbeStillRequestsSystemFallback() throws Exception {
+        NativeResult pick = result();
+        Bundle content = new Bundle();
+        content.putParcelable("view_rect", new android.graphics.Rect(0, 0, 200, 100));
+        pick.jobs.put("text_pick", Map.of("pick_mode", content));
+        assertFallbackProbeAfterRelease(pick);
     }
 
     @Test public void aReconstructedDragPayloadNeverAuthorizesANewSourceClick() throws Exception {
@@ -219,6 +230,11 @@ public final class HostLongPressDragAndroidTest {
             ShadowLooper.idleMainLooper();
             assertTrue(checked.await(2, java.util.concurrent.TimeUnit.SECONDS));
             assertEquals(1, calls.get());
+            if (nativePick != null) {
+                var claim = HostLongPressDrag.class.getDeclaredMethod("claimNativeProbe", Object.class, Object.class);
+                claim.setAccessible(true);
+                assertFalse("the reserved system probe must reject a later native click", (Boolean) claim.invoke(observer, service, nativePick));
+            }
         } finally { observer.close(service); installBridge(null); }
     }
 
@@ -630,12 +646,19 @@ public final class HostLongPressDragAndroidTest {
         var process = HostLongPressDrag.class.getDeclaredMethod("process", type, HostLongPressDrag.Lease.class);
         process.setAccessible(true);
         try {
+            var claim = HostLongPressDrag.class.getDeclaredMethod("claimNativeProbe", Object.class, Object.class);
+            claim.setAccessible(true);
+            assertFalse((Boolean) claim.invoke(observer, new Object(), pick));
+            assertFalse((Boolean) claim.invoke(observer, service, result()));
+            assertTrue((Boolean) claim.invoke(observer, service, pick));
+            assertFalse("one native probe owns the pick", (Boolean) claim.invoke(observer, service, pick));
             var completed = HostLongPressDrag.class.getDeclaredMethod("nativeProbeCompleted", Object.class, Object.class);
             completed.setAccessible(true);
             completed.invoke(observer, new Object(), pick);
             completed.invoke(observer, service, result());
             process.invoke(observer, held, lease);
             assertNull("an in-flight probe keeps the late URL grace", provider.importText);
+            assertFalse("an owned native click must prevent a system click", type.getDeclaredField("systemLinkRequested").getBoolean(held));
             response.putBoolean("link_complete", true);
             process.invoke(observer, held, HostLongPressDrag.lease(response, SOURCE, TOKEN, IDENTITY));
             assertNull("A completed system fallback cannot finish a native probe that took ownership", provider.importText);
@@ -671,6 +694,94 @@ public final class HostLongPressDragAndroidTest {
 
     @Test public void lateTextPickCannotReplaceThePreparedImageDuringDelivery() throws Exception {
         assertMixedImageDelivery(true);
+    }
+
+    @Test public void emptyImportReportsItsFixedReasonWithoutCallingTheBridge() throws Exception {
+        var attempt = failedImport(RuntimeEnvironment.getApplication(), null, null, null);
+        assertEquals(0, attempt.provider.importCalls);
+        assertTrue(attempt.events.contains("drag gesture host stage=import_payload text_present=false image_present=false link_present=false"));
+        assertTrue(attempt.events.contains("drag gesture host stage=import_failure_detail reason=empty_content"));
+        assertTrue(attempt.events.contains("drag gesture host stage=import_failed exception=IOException"));
+    }
+
+    @Test public void bridgeImportRejectionsReportOnlyAllowlistedReasons() throws Exception {
+        String secret = "private-import-response";
+        String text = "private-import-body " + "https" + "://example.test/private-import-link";
+        for (String reason : new String[]{"disabled", "invalid_request", "runtime_unavailable", "gesture_expired", "invalid_payload", secret}) {
+            Bundle response = new Bundle(); response.putString("reason", reason);
+            var attempt = failedImport(RuntimeEnvironment.getApplication(), text, null, response);
+            assertEquals(1, attempt.provider.importCalls);
+            assertEquals(text, attempt.provider.importText);
+            assertTrue(attempt.events.contains("drag gesture host stage=import_payload text_present=true image_present=false link_present=true"));
+            assertTrue(attempt.events.contains("drag gesture host stage=import_declined reason=" + (reason.equals(secret) ? "unknown" : reason)));
+            assertTrue(attempt.events.contains("drag gesture host stage=import_failure_detail reason=import_unavailable"));
+            assertTrue(attempt.events.contains("drag gesture host stage=import_failed exception=IOException"));
+            String logged = String.join("\n", attempt.events);
+            assertFalse(logged.contains(secret)); assertFalse(logged.contains(text));
+            assertFalse(logged.contains("private-import-link"));
+            assertFalse(logged.contains(TOKEN)); assertFalse(logged.contains(SOURCE));
+        }
+    }
+
+    @Test public void recycledImportImageReportsOnlyItsFixedReason() throws Exception {
+        Bitmap image = Bitmap.createBitmap(2, 2, Bitmap.Config.ARGB_8888); image.recycle();
+        var attempt = failedImport(RuntimeEnvironment.getApplication(), null, image, null);
+        assertEquals(0, attempt.provider.importCalls);
+        assertTrue(attempt.events.contains("drag gesture host stage=import_payload text_present=false image_present=true link_present=false"));
+        assertTrue(attempt.events.contains("drag gesture host stage=import_failure_detail reason=recycled_image"));
+    }
+
+    @Test public void imageCacheIoFailuresDoNotLogArbitraryExceptionMessages() throws Exception {
+        Context base = RuntimeEnvironment.getApplication();
+        File blocked = File.createTempFile("private-import-path-", ".cache", base.getCacheDir());
+        Context context = new android.content.ContextWrapper(base) {
+            @Override public File getCacheDir() { return blocked; }
+        };
+        Bitmap image = Bitmap.createBitmap(2, 2, Bitmap.Config.ARGB_8888);
+        try {
+            var attempt = failedImport(context, null, image, null);
+            assertEquals(0, attempt.provider.importCalls);
+            assertTrue(attempt.events.contains("drag gesture host stage=import_failed exception=IOException"));
+            assertTrue(attempt.events.contains("drag gesture host stage=import_failure_detail reason=unknown"));
+            assertFalse(String.join("\n", attempt.events).contains("private-import-path-"));
+        } finally { if (!image.isRecycled()) image.recycle(); assertTrue(blocked.delete()); }
+    }
+
+    private record ImportAttempt(List<String> events, RecordingImportProvider provider) { }
+
+    private static ImportAttempt failedImport(Context context, String text, Bitmap image, Bundle response) throws Exception {
+        RecordingImportProvider provider = Robolectric.buildContentProvider(RecordingImportProvider.class)
+                .create(BridgeContract.AUTHORITY).get();
+        provider.importResponse = response;
+        org.robolectric.shadows.ShadowContentResolver.registerProviderInternal(BridgeContract.AUTHORITY, provider);
+        List<String> events = new ArrayList<>();
+        XposedModule module = new XposedModule() { };
+        XposedInterface framework = (XposedInterface) Proxy.newProxyInstance(XposedInterface.class.getClassLoader(),
+                new Class<?>[]{XposedInterface.class}, (target, method, args) -> {
+                    if ("log".equals(method.getName())) events.add((String) args[2]);
+                    return null;
+                });
+        module.attachFramework(framework, () -> { });
+        HostLongPressDrag observer = new HostLongPressDrag(module, null, (a, b, c, d) -> fail("Rejected imports must not deliver"));
+        Object service = new Object();
+        Bundle state = preparedState(); state.putString("state", "released");
+        state.putString("direction", "right"); state.putString("action", "share");
+        var lease = HostLongPressDrag.lease(state, SOURCE, TOKEN, IDENTITY);
+        var type = Class.forName(HostLongPressDrag.class.getName() + "$Held");
+        var constructor = type.getDeclaredConstructor(Context.class, Object.class, Object.class,
+                String.class, Bitmap.class, HostLongPressDrag.Lease.class); constructor.setAccessible(true);
+        Object held = constructor.newInstance(context, service, null, text, image, lease);
+        Field current = HostLongPressDrag.class.getDeclaredField("current"); current.setAccessible(true); current.set(observer, held);
+        var importing = HostLongPressDrag.class.getDeclaredMethod("importContent", type, HostLongPressDrag.Lease.class);
+        importing.setAccessible(true);
+        try {
+            importing.invoke(observer, held, lease);
+            assertNull("A failed import releases its held gesture", current.get(observer));
+            return new ImportAttempt(events, provider);
+        } finally {
+            observer.close(service);
+            ((java.util.concurrent.ScheduledExecutorService) org.robolectric.util.ReflectionHelpers.getField(observer, "worker")).shutdownNow();
+        }
     }
 
     @Test public void lateTextPickCannotReplaceAnEarlierNativeImageDuringDelivery() throws Exception {
@@ -867,6 +978,8 @@ public final class HostLongPressDragAndroidTest {
     public static final class RecordingImportProvider extends ContentProvider {
         String importText;
         boolean importImage;
+        int importCalls;
+        Bundle importResponse;
         int policyReads;
         RecognitionChannels channels = RecognitionChannels.defaults();
         @Override public boolean onCreate() { return true; }
@@ -877,8 +990,14 @@ public final class HostLongPressDragAndroidTest {
                 policy.putString("channels",channels.toJson());return policy;
             }
             if (!"drag_import".equals(method)) return Bundle.EMPTY;
+            importCalls++;
             importText = extras.getString("text");
             importImage = extras.get("fd") instanceof android.os.ParcelFileDescriptor;
+            if (importResponse != null) {
+                if ("runtime_unavailable".equals(importResponse.getString("reason")))
+                    org.robolectric.shadows.ShadowSystemClock.advanceBy(java.time.Duration.ofSeconds(2));
+                return importResponse;
+            }
             Bundle response = new Bundle(); response.putString("token", "c".repeat(43)); return response;
         }
         @Override public Cursor query(Uri uri, String[] projection, String selection, String[] args, String order) { return null; }

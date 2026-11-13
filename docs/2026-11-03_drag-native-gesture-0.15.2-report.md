@@ -1,10 +1,12 @@
 # 0.15.2：补齐原生长按后的方向手势
 
+> 本文中的本地归档路径不随源码仓库分发；公开发布产物请以 Releases 为准。
+
 日期：2026-11-03（Asia/Shanghai）。版本：0.15.2 / 34。范围见 [scope.md](scope.md)。本次保留原输入和原生长按行为，通过旁路观察添加单指长按后的方向操作；没有新增 SystemUI 或来源应用作用域。
 
 ## 日志与原因
 
-输入为 LSPosed_20261103_110419.zip，SHA-256 为 7223C9031680146B59015793473354266E401F30E577EACDBA381B9CD9CD8F85。流式筛选元数据见 [诊断摘要](../artifacts/drag-diagnosis-20261103-110419.json)。
+输入为 LSPosed_20261103_110419.zip，SHA-256 为 7223C9031680146B59015793473354266E401F30E577EACDBA381B9CD9CD8F85。流式筛选元数据见 诊断摘要（本地归档：`../artifacts/drag-diagnosis-20261103-110419.json`）。
 
 当前模块日志第 15 行确认加载 0.15.1/33，第 57 行确认 drag stage=installed signatures=1 display_layout=split。当前 modules 与 verbose 日志中的 drag stage 都仅有一次 installed，没有 observed、shown 或 rejected。用户也确认长按仅出现原识别或来源应用菜单，内容没有跟手移动。因此上一轮 Android 16 字段修复已经越过安装问题，但原手势没有进入被观察的系统 performDrag。
 
@@ -22,7 +24,7 @@
 
 ## 验证与限制
 
-执行受影响链路的定向 JUnit/Robolectric 测试、Release lint、签名构建、两版宿主静态合同，以及 APK 签名、对齐、版本、作用域和 mapping 检查。准确数量、哈希与证书见 [验证清单](../artifacts/validation-0.15.2.json)。没有运行全量测试，没有安装手机、执行真实 LSPosed 回调或远程发布。
+执行受影响链路的定向 JUnit/Robolectric 测试、Release lint、签名构建、两版宿主静态合同，以及 APK 签名、对齐、版本、作用域和 mapping 检查。准确数量、哈希与证书见 验证清单（本地归档：`../artifacts/validation-0.15.2.json`）。没有运行全量测试，没有安装手机、执行真实 LSPosed 回调或远程发布。
 
 最终本地结果：18 个测试套件共 249 项通过，失败/错误/跳过均为 0；lintRelease 为 0 错误、32 警告。两版拖拽宿主各 54 项静态定义检查通过，设备提供的外部 SDK 仍仅有引用证据。正式签名证书与 0.15.1 一致，APK v2 签名、4 字节及 16 KiB 对齐通过。APK 为 3250949 字节，SHA-256：702D4B5F2697E650617EA3E71DF541288B932BEDFA58077F6121EF4D0DC9653B；对应 R8 mapping 已归档。
 

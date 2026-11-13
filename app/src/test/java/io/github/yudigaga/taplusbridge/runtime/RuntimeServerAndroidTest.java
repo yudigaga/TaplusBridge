@@ -652,8 +652,70 @@ public final class RuntimeServerAndroidTest {
         assertFalse(server.handle(HOST_UID,"scope_link_probe_owns",new Bundle()).getBoolean("owned"));
     }
 
+    @Test public void recognitionVisibilityOnlyReachesTheAuthenticatedHostAndAllowedSource() {
+        assertTrue(config.saveSourceScope(SourceScopePolicy.Mode.BLACKLIST,List.of(),List.of(),true)); publish();
+        FakeSourceCapture capture = new FakeSourceCapture(); server.setSourceCapture(capture);
+        Bundle shown = new Bundle(); shown.putString("source", SOURCE);
+        shown.putLong("shown_elapsed", android.os.SystemClock.elapsedRealtime());
+        for (int uid : new int[]{MODULE_UID,22001,121001,1000,0})
+            assertEquals("unauthorized", server.handle(uid,"recognition_visible",shown).getString("reason"));
+        assertEquals(0,capture.recognitionShows);
+        assertTrue(server.handle(HOST_UID,"recognition_visible",shown).getBoolean("accepted"));
+        assertEquals(1,capture.recognitionShows); assertEquals(2,capture.lastRequest.size());
+        assertEquals(SOURCE,capture.lastRequest.getString("source"));
+        assertEquals(server.sourceCaptureConfiguration().identity,capture.lastConfig.identity);
+        config.setEnabled(false); publish();
+        assertFalse(server.handle(HOST_UID,"recognition_visible",shown).getBoolean("accepted"));
+        assertEquals(1,capture.recognitionShows);
+    }
+
+    @Test public void malformedHiddenOrBlockedRecognitionNotificationsCannotCloseMenus() {
+        assertTrue(config.saveSourceScope(SourceScopePolicy.Mode.BLACKLIST,List.of(),List.of(),true)); publish();
+        FakeSourceCapture capture = new FakeSourceCapture(); server.setSourceCapture(capture);
+        Bundle shown = new Bundle(); shown.putString("source", SOURCE);
+        shown.putLong("shown_elapsed", android.os.SystemClock.elapsedRealtime());
+        Bundle extras = new Bundle(shown); extras.putString("url", URL);
+        Bundle wrongType = new Bundle(shown); wrongType.putInt("shown_elapsed", 1);
+        Bundle future = new Bundle(shown); future.putLong("shown_elapsed", android.os.SystemClock.elapsedRealtime()+1);
+        Bundle missing = new Bundle(); missing.putString("source", SOURCE);
+        for (Bundle request : List.of(extras, wrongType, future, missing))
+            assertFalse(server.handle(HOST_UID,"recognition_visible",request).getBoolean("accepted"));
+        assertEquals(0,capture.recognitionShows);
+        assertTrue(config.saveSourceScope(SourceScopePolicy.Mode.BLACKLIST,List.of(SOURCE),List.of(),true)); publish();
+        assertFalse(server.handle(HOST_UID,"recognition_visible",shown).getBoolean("accepted"));
+        assertEquals(0,capture.recognitionShows);
+        assertTrue(config.saveSourceScope(SourceScopePolicy.Mode.BLACKLIST,List.of(),List.of(),true));
+        config.setRecognitionEnabled(false); publish();
+        assertFalse(server.handle(HOST_UID,"recognition_visible",shown).getBoolean("accepted"));
+        assertEquals(0,capture.recognitionShows);
+    }
+
+    @Test public void onlyTheHostCanClaimTheExactRecognitionMenuEchoFields() {
+        assertTrue(config.saveSourceScope(SourceScopePolicy.Mode.BLACKLIST,List.of(),List.of(),true));publish();
+        FakeSourceCapture capture=new FakeSourceCapture();server.setSourceCapture(capture);
+        Bundle request=new Bundle();request.putString("source",SOURCE);request.putString("activity",SOURCE+".MainActivity");
+        request.putLong("shown_elapsed",android.os.SystemClock.elapsedRealtime());
+        for(int uid:new int[]{MODULE_UID,22001,121001,1000,0})
+            assertEquals("unauthorized",server.handle(uid,"recognition_menu_retain",request).getString("reason"));
+        assertEquals(0,capture.retentionClaims);
+        assertTrue(server.handle(HOST_UID,"recognition_menu_retain",request).getBoolean("keep"));
+        assertEquals(1,capture.retentionClaims);assertEquals(3,capture.lastRequest.size());
+        for(String injected:List.of("token","url","text")) {
+            Bundle extra=new Bundle(request);extra.putString(injected,"not-authority");
+            assertFalse(server.handle(HOST_UID,"recognition_menu_retain",extra).getBoolean("keep"));
+        }
+        Bundle missing=new Bundle(request);missing.remove("activity");
+        assertFalse(server.handle(HOST_UID,"recognition_menu_retain",missing).getBoolean("keep"));
+        Bundle wrong=new Bundle(request);wrong.putInt("shown_elapsed",0);
+        assertFalse(server.handle(HOST_UID,"recognition_menu_retain",wrong).getBoolean("keep"));
+        assertEquals(1,capture.retentionClaims);
+        config.setEnabled(false);publish();
+        assertFalse(server.handle(HOST_UID,"recognition_menu_retain",request).getBoolean("keep"));
+        assertEquals(1,capture.retentionClaims);
+    }
+
     static final class FakeSourceCapture implements RuntimeServer.SourceCapture {
-        int takes,nativeResults,lastOwner,ownershipChecks;
+        int takes,nativeResults,lastOwner,ownershipChecks,recognitionShows,retentionClaims;
         Bundle lastRequest,lastNativeRequest;
         RuntimeSnapshot lastConfig;
         public Bundle take(int owner,Bundle request,RuntimeSnapshot config) {
@@ -662,6 +724,14 @@ public final class RuntimeServerAndroidTest {
         }
         public void nativeResult(Bundle request) {
             nativeResults++;lastNativeRequest=request==null?null:new Bundle(request);
+        }
+        public Bundle recognitionVisible(Bundle request,RuntimeSnapshot config) {
+            recognitionShows++;lastRequest=new Bundle(request);lastConfig=config;
+            Bundle response=new Bundle();response.putBoolean("accepted",true);return response;
+        }
+        public Bundle retainRecognition(Bundle request,RuntimeSnapshot config) {
+            retentionClaims++;lastRequest=new Bundle(request);lastConfig=config;
+            Bundle response=new Bundle();response.putBoolean("keep",true);return response;
         }
         public boolean ownsLinkPick(Bundle request) {
             ownershipChecks++; lastRequest = request == null ? null : new Bundle(request); return true;

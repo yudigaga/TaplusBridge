@@ -1,5 +1,7 @@
 # 0.2.0-dev 单次卡片捕获验证
 
+> 本文中的本地归档路径不随源码仓库分发；公开发布产物请以 Releases 为准。
+
 日期：2026-10-29，Asia/Shanghai。
 
 > 本文为0.2.0的历史记录。该包将框架作用域误写为`android`，本文下方“安卓系统”的勾选说明有误。请使用0.2.1并勾选`system`（系统框架），当前操作与验证结果见[作用域修复说明](2026-10-29-system-scope-fix-0.2.1.md)。以下保留旧版本事实，不能作为正确注入框架的证据。
@@ -8,7 +10,7 @@
 
 ## 安装和复现
 
-1. 安装 [TaplusBridge-0.2.0-dev.apk](../artifacts/TaplusBridge-0.2.0-dev.apk)，版本为0.2.0-dev / versionCode 5，Android Debug签名，可覆盖同签名开发版。
+1. 安装 TaplusBridge-0.2.0-dev.apk（本地归档：`../artifacts/TaplusBridge-0.2.0-dev.apk`），版本为0.2.0-dev / versionCode 5，Android Debug签名，可覆盖同签名开发版。
 2. LSPosed勾选「传送门」与「安卓系统」，重启手机。不要勾选微信或QQ。新增系统观察入口要求Android13及以上，原有模块最低Android9。
 3. 在「传送门增强」中打开总开关及「显示一次性捕获操作」。宿主仍限定传送门4.1.3 / 40013。
 4. 返回微信中的原卡片，长按触发传送门，选择「捕获接下来打开的卡片」。无可提取链接时也尝试发布这个操作；有已识别应用卡片时放在现有结果之后。
@@ -50,7 +52,7 @@
 - APK v2签名和4字节对齐通过；无原生库。证书SHA256：`4e06d06e242802a8b8e77f696079ddd78e3d615d0cf73b781f3a187abb51f980`。
 - APK大小300751字节，SHA256：`096D8DD1412AF6F19416C674D29EF288811D7CBC7ADEE434D839A569DAC2BBF4`。
 
-完整机器可读证据见[validation-0.2.0.json](../artifacts/validation-0.2.0.json)，逐项测试见`artifacts/junit-0.2.0/`，签名、对齐、清单与Lint输出均在`artifacts/`。
+完整机器可读证据见validation-0.2.0.json（本地归档：`../artifacts/validation-0.2.0.json`），逐项测试见`artifacts/junit-0.2.0/`，签名、对齐、清单与Lint输出均在`artifacts/`。
 
 当前ADB列表为空。未安装手机、未实测system_server Hook/广播、未验证原卡片URL、未验证本次捕获后的Root/冰箱解冻和目标内容落点。未运行设备仪器测试、未构建长期密钥正式版、未远程发布。原有IceBridge工程保持只读。
 

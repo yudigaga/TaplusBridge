@@ -51,7 +51,7 @@ public final class HostProbeWindow implements AutoCloseable {
         try {
             for (WindowState window : lease.windows) {
                 window.appliedFlags = (window.originalFlags & ~WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH)
-                        | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE;
+                        | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE | WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
                 window.appliedAlpha = 0f;
                 if (window.appliedFlags == window.originalFlags && window.appliedAlpha == window.originalAlpha) continue;
                 window.changed = true;
@@ -107,7 +107,8 @@ public final class HostProbeWindow implements AutoCloseable {
             // cannot safely pass the source point through. Release only our two inspected windows.
             window.appliedAlpha = window.covers ? 0f : window.originalAlpha;
             window.appliedFlags = window.originalFlags & ~WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH;
-            if (window.covers) window.appliedFlags |= WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE;
+            if (window.covers) window.appliedFlags |= WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                    | WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
         }
         if (!visibleWindow) throw invalid("host_window_hidden");
         HostProbeWindow result = new HostProbeWindow(service, expectedSource, activity, content,

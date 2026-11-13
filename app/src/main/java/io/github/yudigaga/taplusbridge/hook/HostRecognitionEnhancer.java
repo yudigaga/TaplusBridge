@@ -375,8 +375,10 @@ public final class HostRecognitionEnhancer {
             if (existing.contains(url)) continue;
             Preview resolved = resolve(context, url, null, source, true);
             if (resolved == null) continue;
-            grouped.computeIfAbsent(resolved.target(), ignored -> new ArrayList<>()).add(url);
-            destinations.put(resolved.target(), resolved);
+            // Browser fallbacks have no rule for the multi-link chooser to revalidate on click.
+            String group = resolved.browserFallback() ? resolved.target() + '\n' + url : resolved.target();
+            grouped.computeIfAbsent(group, ignored -> new ArrayList<>()).add(url);
+            destinations.put(group, resolved);
             existing.add(url);
         }
         for (Map.Entry<String, List<String>> entry : grouped.entrySet()) {
@@ -429,9 +431,13 @@ public final class HostRecognitionEnhancer {
         diagnostic("bind_recommend", "reached", null, 0, capturedLinks().size(), null, null);
         beforeBind(card);
         if (HostCaptureAction.isAction(info)) { HostCaptureAction.bind(card); return; }
-        if (!(card instanceof View view) || !modelClass.isInstance(info)
-                || HostPolicy.isTranslation(read(category, info))) {
+        if (!(card instanceof View view) || !modelClass.isInstance(info)) {
             diagnostic("bind_recommend", "skipped", null, 0, 0, null, null);
+            return;
+        }
+        if (HostPolicy.isTranslation(read(category, info))) {
+            HostActionTargets.Target target = HostActionTargets.read(view.getContext(), "translate", source);
+            if (target != null) applyCard(card, new Preview(target.packageName(), target.title(), target.icon(), false), true);
             return;
         }
         Intent candidate = nativeCandidate(info);
@@ -547,7 +553,7 @@ public final class HostRecognitionEnhancer {
             String label = response == null ? null : response.getString("title");
             if (HostPolicy.validTarget(target) && label != null && !label.isBlank() && label.length() <= 256) {
                 @SuppressWarnings("deprecation") Bitmap icon = response.getParcelable("icon");
-                resolved = new Preview(target, label, icon);
+                resolved = new Preview(target, label, icon, response.getBoolean("browser_fallback"));
                 perfOutcome = "success";
                 diagnostic("resolve", "success", target, 0, icon == null ? 0 : 1, null, null);
             } else {
@@ -558,7 +564,8 @@ public final class HostRecognitionEnhancer {
             perfOutcome = "failed";
             diagnostic("resolve", "failed", null, 0, 0, ignored.getClass(), "exception");
         }
-        synchronized (previews) {
+        // A browser selection may change immediately; only successful rule/native previews use the TTL.
+        if (resolved != null && !resolved.browserFallback()) synchronized (previews) {
             if (previews.size() >= 32) previews.clear();
             previews.put(key, new CachedPreview(now, resolved));
         }
@@ -567,6 +574,10 @@ public final class HostRecognitionEnhancer {
     }
 
     private void applyCard(Object card, Preview preview) {
+        applyCard(card, preview, false);
+    }
+
+    private void applyCard(Object card, Preview preview, boolean translation) {
         long startedNanos = System.nanoTime();
         try {
             Object titleView = value(card, "mRecommendTitle");
@@ -574,7 +585,7 @@ public final class HostRecognitionEnhancer {
             Object sourceIcon = value(card, "mRecommendIcon");
             diagnostic("apply_card", titleView instanceof TextView && subtitleView instanceof TextView
                     && sourceIcon != null ? "reached" : "fields_missing", preview.target(), 0, 0, null, null);
-            if (titleView instanceof TextView text) text.setText("在" + preview.label() + "打开");
+            if (titleView instanceof TextView text) text.setText(translation ? "使用" + preview.label() + "翻译" : "在" + preview.label() + "打开");
             if (subtitleView instanceof TextView text) {
                 text.setText(preview.label());
                 text.setVisibility(View.VISIBLE);
@@ -634,6 +645,6 @@ public final class HostRecognitionEnhancer {
         catch (IllegalAccessException | IllegalArgumentException ignored) { return null; }
     }
 
-    private record Preview(String target, String label, Bitmap icon) { }
+    private record Preview(String target, String label, Bitmap icon, boolean browserFallback) { }
     private record CachedPreview(long at, Preview preview) { }
 }

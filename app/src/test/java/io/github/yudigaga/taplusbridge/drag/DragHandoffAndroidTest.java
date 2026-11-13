@@ -77,6 +77,17 @@ public final class DragHandoffAndroidTest {
         ShadowSystemClock.advanceBy(Duration.ofMillis(DragShareProvider.TTL));
         assertNull(provider.getType(uri)); assertThrows(FileNotFoundException.class, () -> provider.openFile(uri, "r"));
     }
+    @Test public void newlySharedImageSurvivesCacheCleanupAfterAContentSelectionDelay() throws Exception {
+        var provider = Robolectric.buildContentProvider(DragShareProvider.class).create(DragShareProvider.AUTHORITY).get();
+        DragPayload payload = image();
+        assertTrue(payload.image.setLastModified(System.currentTimeMillis() - DragShareProvider.TTL - 1_000));
+        Uri uri = DragShareProvider.expose(context, payload);
+        DragPayload.deleteExpired(payload.image.getParentFile());
+        assertTrue("A fresh share grant must keep its image until that grant expires", payload.image.isFile());
+        try (var in = new ParcelFileDescriptor.AutoCloseInputStream(provider.openFile(uri, "r"))) {
+            assertArrayEquals(PNG, in.readAllBytes());
+        }
+    }
     @Test public void shareProviderCannotExposeFilesOutsideItsOwnedCache() throws Exception {
         File outside = File.createTempFile("image-", ".png", context.getCacheDir()); Files.write(outside.toPath(), PNG);
         DragPayload forged = new DragPayload("", "com.example.source", outside, "image/png", 1, 1, "");

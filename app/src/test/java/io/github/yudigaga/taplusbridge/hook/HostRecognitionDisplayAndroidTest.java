@@ -111,6 +111,107 @@ public final class HostRecognitionDisplayAndroidTest {
         assertEquals(0, provider.resolveCalls);
     }
 
+    @Test public void configuredTranslationCardUsesActualTargetAndProtectsItsIconFromLateStockWrites() {
+        provider.translation = true;
+        Card card = new Card(context);
+        FakeModel translation = model(null); translation.cat = "EN_2_CH_PARA";
+        enhancer.bindRecommendation(card, translation, null);
+        assertEquals("使用翻译应用翻译", card.mRecommendTitle.getText().toString());
+        assertEquals("翻译应用", card.mRecommendAbstract.getText().toString());
+        assertSame(card.mRecommendIcon.getDrawable(), enhancer.iconFor(card.mRecommendIcon));
+        assertTrue(card.mRecommendIcon.getDrawable() instanceof BitmapDrawable);
+        assertEquals(java.util.Set.of("kind"), provider.lastActionRequest.keySet());
+        assertEquals("translate", provider.lastActionRequest.getString("kind"));
+        assertEquals(0, provider.resolveCalls);
+        enhancer.beforeBind(card);
+        assertNull(enhancer.iconFor(card.mRecommendIcon));
+    }
+
+    @Test public void aiTranslationCardCanDisplayModuleIconAndNativeRebindDropsOverride() {
+        provider.translation = true; provider.translationTarget = BridgeContract.APP_PACKAGE;
+        Card card = new Card(context);
+        FakeModel translation = model(null); translation.cat = "TRANSLATION";
+        enhancer.bindRecommendation(card, translation, null);
+        assertNotNull(enhancer.iconFor(card.mRecommendIcon));
+        provider.translation = false; card.resetToBrowser();
+        Drawable original = card.mRecommendIcon.getDrawable();
+        enhancer.bindRecommendation(card, translation, null);
+        assertStockCard(card, original); assertNull(enhancer.iconFor(card.mRecommendIcon));
+    }
+
+    @Test public void excludedSourceKeepsNativeTranslationCardWhenTheRealTranslationActionIsDenied() {
+        int hostUid = android.os.Process.myUid() + 1;
+        var pm = (org.robolectric.shadows.ShadowPackageManager) org.robolectric.shadow.api.Shadow.extract(context.getPackageManager());
+        android.content.pm.PackageInfo host = new android.content.pm.PackageInfo();
+        host.packageName = BridgeContract.HOST_PACKAGE; host.versionName = "5.1.5"; host.versionCode = 50015;
+        host.applicationInfo = new android.content.pm.ApplicationInfo();
+        host.applicationInfo.packageName = host.packageName; host.applicationInfo.uid = hostUid;
+        host.applicationInfo.enabled = true; host.applicationInfo.flags = android.content.pm.ApplicationInfo.FLAG_INSTALLED;
+        pm.installPackage(host); pm.setPackagesForUid(hostUid, host.packageName);
+        android.content.pm.PackageInfo app = new android.content.pm.PackageInfo();
+        app.packageName = "com.example.translate"; app.applicationInfo = new android.content.pm.ApplicationInfo();
+        app.applicationInfo.packageName = app.packageName; app.applicationInfo.enabled = true;
+        app.applicationInfo.flags = android.content.pm.ApplicationInfo.FLAG_INSTALLED; pm.installPackage(app);
+        pm.setApplicationIcon(app.packageName, new ColorDrawable(Color.MAGENTA));
+        android.content.pm.ResolveInfo handler = new android.content.pm.ResolveInfo(); handler.isDefault = true;
+        handler.activityInfo = new android.content.pm.ActivityInfo(); handler.activityInfo.packageName = app.packageName;
+        handler.activityInfo.name = app.packageName + ".Entry"; handler.activityInfo.applicationInfo = app.applicationInfo;
+        handler.activityInfo.enabled = true; handler.activityInfo.exported = true;
+        pm.addResolveInfoForIntent(new Intent(Intent.ACTION_SEND).setType("text/plain"), handler);
+        new io.github.yudigaga.taplusbridge.translation.TranslationStore(context).save(
+                new io.github.yudigaga.taplusbridge.translation.TranslationSettings(
+                        io.github.yudigaga.taplusbridge.translation.TranslationSettings.Mode.APP,
+                        "com.example.translate/com.example.translate.Entry", Intent.ACTION_SEND, "", "", "", "中文", ""));
+        assertTrue(new io.github.yudigaga.taplusbridge.config.ConfigStore(context).saveSourceScope(
+                io.github.yudigaga.taplusbridge.config.SourceScopePolicy.Mode.WHITELIST,
+                java.util.List.of(), java.util.List.of("com.example.allowed")));
+        var realProvider = Robolectric.buildContentProvider(io.github.yudigaga.taplusbridge.bridge.BridgeProvider.class)
+                .create(BridgeContract.AUTHORITY).get();
+        ShadowContentResolver.registerProviderInternal(BridgeContract.AUTHORITY, realProvider);
+        org.robolectric.shadows.ShadowBinder.setCallingUid(hostUid);
+        try {
+            Bundle request = new Bundle(); request.putString("text", "selected words"); request.putString("source", "com.example.denied");
+            assertNull(realProvider.call("translation_prepare", null, request).getParcelable("direct"));
+            Card card = new Card(context); card.mRecommendTitle.setText("原生翻译");
+            Drawable original = card.mRecommendIcon.getDrawable();
+            FakeModel translation = model(null); translation.cat = "TRANSLATION";
+            enhancer.bindRecommendation(card, translation, "com.example.denied");
+            assertEquals("原生翻译", card.mRecommendTitle.getText().toString());
+            assertSame(original, card.mRecommendIcon.getDrawable());
+            assertNull(enhancer.iconFor(card.mRecommendIcon));
+        } finally { org.robolectric.shadows.ShadowBinder.setCallingUid(android.os.Process.myUid()); }
+    }
+
+    @Test public void unmatchedBrowserLinksKeepEveryUrlInAnIndividuallyClickableCard() {
+        provider.browser = true;
+        String first = "https://ordinary.example/first", second = "https://ordinary.example/second";
+        enhancer.capturePayload(first + "\n" + second);
+        ArrayList<Object> cards = enhancer.merge(context, new ArrayList<>(), null);
+        assertEquals("Browser fallback must not enter the rule-only multi-link chooser", 2, cards.size());
+        java.util.Set<String> destinations = new java.util.HashSet<>();
+        for (Object card : cards) {
+            HostRecognitionEnhancer.LinkCard selected = HostRecognitionEnhancer.linkCard(card);
+            assertNotNull(selected); assertEquals(1, selected.links().size());
+            destinations.add(selected.links().get(0));
+            assertEquals(selected.links().get(0), ((FakeModel) card).detailUrl);
+        }
+        assertEquals(java.util.Set.of(first, second), destinations);
+    }
+
+    @Test public void browserSelectionChangesReplaceTheSameCardImmediatelyIncludingAnUnmatchedFirstBind() {
+        Card card = new Card(context); FakeModel info = model("https://ordinary.example/article");
+        enhancer.bindRecommendation(card, info, null);
+        provider.browser = true;
+        enhancer.bindRecommendation(card, info, null);
+        assertEquals("在浏览器 A打开", card.mRecommendTitle.getText().toString());
+        assertEquals(Color.GREEN, ((BitmapDrawable) card.mRecommendIcon.getDrawable()).getBitmap().getPixel(0, 0));
+        provider.browserTarget = "com.example.browsersecond";
+        enhancer.bindRecommendation(card, info, null);
+        assertEquals("在浏览器 B打开", card.mRecommendTitle.getText().toString());
+        assertEquals(Color.YELLOW, ((BitmapDrawable) card.mRecommendIcon.getDrawable()).getBitmap().getPixel(0, 0));
+        assertSame(card.mRecommendIcon.getDrawable(), enhancer.iconFor(card.mRecommendIcon));
+    }
+
     @Test public void beforeBindRemovesIconOverrideBeforeAStockOrRecycledBinding() {
         Card card = new Card(context);
         enhancer.bindRecommendation(card, model(BILI_URL), null);
@@ -251,13 +352,38 @@ public final class HostRecognitionDisplayAndroidTest {
         String lastSource;
         boolean lastLocalRecognition;
         Intent lastCandidate;
+        boolean translation;
+        String translationTarget = "com.example.translate";
+        Bundle lastActionRequest;
+        boolean browser;
+        String browserTarget = "com.example.browserfirst";
         @Override public boolean onCreate() { return true; }
         @Override public Bundle call(String method, String arg, Bundle extras) {
+            if ("action_target".equals(method)) {
+                lastActionRequest = new Bundle(extras);
+                Bundle response = new Bundle();
+                response.putBoolean("configured", translation); response.putBoolean("available", translation);
+                if (translation) {
+                    response.putString("target", translationTarget); response.putString("title", "翻译应用");
+                    Bitmap icon = Bitmap.createBitmap(64, 64, Bitmap.Config.ARGB_8888); icon.eraseColor(Color.GREEN);
+                    response.putParcelable("icon", icon);
+                }
+                return response;
+            }
             if (!"resolve".equals(method) || extras == null) return null;
             resolveCalls++;
             lastSource = extras.getString("source");
             lastLocalRecognition = extras.getBoolean("local_recognition");
             lastCandidate = extras.getParcelable("candidate");
+            if (browser && extras.getString("url", "").startsWith("https://ordinary.example/")) {
+                boolean first = "com.example.browserfirst".equals(browserTarget);
+                Bundle preview = new Bundle(); preview.putString("target", browserTarget);
+                preview.putString("title", first ? "浏览器 A" : "浏览器 B");
+                preview.putBoolean("browser_fallback", true);
+                Bitmap icon = Bitmap.createBitmap(64, 64, Bitmap.Config.ARGB_8888);
+                icon.eraseColor(first ? Color.GREEN : Color.YELLOW); preview.putParcelable("icon", icon);
+                return preview;
+            }
             boolean douyin = lastCandidate != null && Intent.ACTION_MAIN.equals(lastCandidate.getAction())
                     && "com.ss.android.ugc.aweme".equals(lastCandidate.getPackage());
             if (!douyin && !BILI_URL.equals(extras.getString("url"))) return null;

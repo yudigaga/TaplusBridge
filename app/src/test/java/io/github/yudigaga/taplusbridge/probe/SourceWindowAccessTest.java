@@ -40,14 +40,42 @@ public final class SourceWindowAccessTest {
         catch (SourceWindowAccess.Rejected expected) { }
     }
     @Test public void pointInsideMenuNeverGetsInjected() throws Exception { popup(1002, new Rect(0, 0, 200, 200)); rejected(); }
-    @Test public void pointInsideMenuDismissalKeepsTheOriginalSourcePoint() throws Exception {
+    @Test public void coveringMenuDismissalUsesOnlyAnOwnedOutsidePoint() throws Exception {
         MainWindow menu = popup(1002, new Rect(0, 0, 200, 200));
         atms.mWindowManager.mRoot.display.hit = menu;
+        atms.mWindowManager.mRoot.display.geometricHits = true;
         SourceWindowAccess.CardPlan plan = access.planCardTap(atms, SOURCE, ACTIVITY, 21001, 0, 0, 50, 100, 22002);
         assertTrue(plan.dismiss());
-        assertTrue(plan.popupCovered());
-        assertEquals(50f, plan.dismissX(), 0f);
-        assertEquals(100f, plan.dismissY(), 0f);
+        assertFalse(plan.popupCovered());
+        assertFalse(menu.bounds.contains((int) plan.dismissX(), (int) plan.dismissY()));
+        assertTrue(main.bounds.contains((int) plan.dismissX(), (int) plan.dismissY()));
+    }
+    @Test public void ordinaryModalDialogCanPrepareAnOutsideDismissal() throws Exception {
+        MainWindow dialog = popup(2, new Rect(0, 300, 400, 800)); dialog.parent = null;
+        atms.mWindowManager.mRoot.display.hit = dialog;
+        atms.mWindowManager.mRoot.display.geometricHits = true;
+        SourceWindowAccess.CardPlan plan = access.planCardTap(atms, SOURCE, ACTIVITY, 21001, 0, 0, 50, 500, 22002);
+        assertTrue(plan.dismiss()); assertFalse(plan.popupCovered());
+        assertFalse(dialog.bounds.contains((int) plan.dismissX(), (int) plan.dismissY()));
+        assertTrue(main.bounds.contains((int) plan.dismissX(), (int) plan.dismissY()));
+    }
+    @Test public void outsideDismissPointCoveredByAnotherAppIsRejected() throws Exception {
+        MainWindow menu = popup(1002, new Rect(0, 0, 200, 200));
+        atms.mWindowManager.mRoot.display.hit = menu;
+        atms.mWindowManager.mRoot.display.geometricHits = true;
+        atms.mWindowManager.mRoot.display.outsideHit = new MainWindow();
+        atms.mWindowManager.mRoot.display.outsideHit.mOwnerUid++;
+        assertThrows(SourceWindowAccess.Rejected.class,
+                () -> access.planCardTap(atms, SOURCE, ACTIVITY, 21001, 0, 0, 50, 100, 22002));
+    }
+    @Test public void fullScreenMenuAndSecureActivityCannotPrepareOutsideDismissal() throws Exception {
+        MainWindow menu = popup(1002, new Rect(main.bounds));
+        atms.mWindowManager.mRoot.display.hit = menu;
+        assertThrows(SourceWindowAccess.Rejected.class,
+                () -> access.planCardTap(atms, SOURCE, ACTIVITY, 21001, 0, 0, 50, 100, 22002));
+        menu.bounds = new Rect(0, 0, 200, 200); main.mAttrs.flags = WindowManager.LayoutParams.FLAG_SECURE;
+        assertThrows(SourceWindowAccess.Rejected.class,
+                () -> access.planCardTap(atms, SOURCE, ACTIVITY, 21001, 0, 0, 50, 100, 22002));
     }
     @Test public void outsideMenuDismissalKeepsTheSourcePointWithoutCoveredPopupHandling() throws Exception {
         popup(1002, new Rect(100, 150, 280, 300));
@@ -106,8 +134,13 @@ public final class SourceWindowAccessTest {
     static final class Wms { final Object mGlobalLock = new Object(); final Root mRoot = new Root(); }
     static final class Root { final Display display = new Display(); Display getDisplayContent(int id) { return id == 0 ? display : null; } }
     static final class Display {
-        MainWindow hit, mCurrentFocus;
-        MainWindow getTouchableWinAtPointLocked(float x, float y) { return hit; }
+        MainWindow hit, mCurrentFocus, outsideHit;
+        boolean geometricHits;
+        MainWindow getTouchableWinAtPointLocked(float x, float y) {
+            if (geometricHits && hit != null && !hit.bounds.contains((int) x, (int) y))
+                return outsideHit != null ? outsideHit : hit.mActivityRecord.main;
+            return hit;
+        }
     }
     static final class MainWindow {
         int mOwnerUid = 21001, mShowUserId = 0;

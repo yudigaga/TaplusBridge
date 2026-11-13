@@ -16,6 +16,66 @@ import static org.junit.Assert.*;
 public final class AssistContentExtractorAndroidTest {
     private static final int WINDOW_X = 30, WINDOW_Y = 70;
 
+    @Test public void emptyLeafTextFallsBackToItsOwnDescriptionAndActualLinks() {
+        Node root = node(0, 0, 400, 800, null);
+        Node label = node(0, 100, 300, 80, "  ");
+        label.description = "图片说明 https://example.com/item";
+        root.children.add(label);
+        var result = read(root, WINDOW_X + 50, WINDOW_Y + 120);
+        assertEquals(label.description, result.text());
+        assertEquals(List.of("https://example.com/item"), result.links());
+    }
+
+    @Test public void descriptionNeverReplacesNonemptyText() {
+        Node root = node(0, 0, 400, 800, null);
+        Node label = node(0, 100, 300, 80, "正文");
+        label.description = "https://unrelated.example/label";
+        root.children.add(label);
+        var result = read(root, WINDOW_X + 50, WINDOW_Y + 120);
+        assertEquals("正文", result.text()); assertTrue(result.links().isEmpty());
+    }
+
+    @Test public void containerDescriptionsCannotReplaceChildrenOrFillBlankPadding() {
+        Node root = node(0, 0, 400, 800, null); root.description = "全屏摘要";
+        Node card = node(0, 100, 300, 100, null); card.description = "整张卡片摘要";
+        card.children.add(node(20, 20, 200, 40, "正文")); root.children.add(card);
+        assertEquals("正文", read(root, WINDOW_X + 5, WINDOW_Y + 110).text());
+        assertEquals("", read(root, WINDOW_X + 50, WINDOW_Y + 700).text());
+    }
+
+    @Test public void rootAndFullWindowLeafDescriptionsCannotSupplyUnrelatedScreenSummaries() {
+        Node root = node(0, 0, 400, 800, null); root.description = "全屏语义摘要";
+        assertEquals("", read(root, WINDOW_X + 50, WINDOW_Y + 700).text());
+        Node fullWindow = node(0, 0, 400, 800, null); fullWindow.description = "另一份全屏语义摘要";
+        root.children.add(fullWindow);
+        assertEquals("", read(root, WINDOW_X + 50, WINDOW_Y + 700).text());
+    }
+
+    @Test public void descriptionsKeepTheVisibilityAndPrivateInputGuards() {
+        for (int mode = 0; mode < 5; mode++) {
+            Node root = node(0, 0, 400, 800, null);
+            Node label = node(0, 100, 300, 80, null); label.description = "private description";
+            if (mode == 0) label.visible = false;
+            if (mode == 1) label.blocked = true;
+            if (mode == 2) label.inputType = 0x81;
+            if (mode == 3) label.className = "android.widget.EditText";
+            if (mode == 4) label.editable = true;
+            root.children.add(label);
+            assertEquals("", read(root, WINDOW_X + 50, WINDOW_Y + 120).text());
+        }
+    }
+
+    @Test public void viewNodeAdapterReadsTheDescriptionSuppliedByTheSource() throws Exception {
+        var view = org.robolectric.util.ReflectionHelpers.newInstance(android.app.assist.AssistStructure.ViewNode.class);
+        org.robolectric.util.ReflectionHelpers.setField(view, "mContentDescription", "source description");
+        var type = Class.forName(AssistContentExtractor.class.getName() + "$StructureNode");
+        var constructor = type.getDeclaredConstructor(android.app.assist.AssistStructure.ViewNode.class);
+        constructor.setAccessible(true);
+        Object node = constructor.newInstance(view);
+        var description = type.getDeclaredMethod("description"); description.setAccessible(true);
+        assertEquals("source description", description.invoke(node));
+    }
+
     @Test public void pointSelectsRealNestedTextUsingWindowAndScrolledParentCoordinates() {
         Node root = node(0, 0, 400, 800, null);
         Node scroll = node(0, 100, 400, 500, null); scroll.scrollY = 120;
@@ -177,6 +237,102 @@ public final class AssistContentExtractorAndroidTest {
         assertThrows(UnsupportedOperationException.class, () -> result.links().add("https://fake.example"));
     }
 
+    @Test public void aCommentLinkCannotBorrowThePostOrAnotherReplysDestination() {
+        Node root = node(0, 0, 400, 800, null);
+        Node post = node(0, 70, 400, 180, null);
+        post.children.add(linkLabel(20, 30, "https://post.example/article"));
+        root.children.add(post);
+        Node comments = node(0, 300, 400, 480, null); comments.scrollY = 60;
+        Node selected = node(0, 180, 400, 100, null);
+        selected.children.add(linkLabel(20, 10, "https://reply.example/release"));
+        Node other = node(0, 340, 400, 100, null);
+        other.children.add(linkLabel(20, 10, "https://other.example/reply"));
+        comments.children.add(selected); comments.children.add(other); root.children.add(comments);
+
+        var result = read(root, 80, 510);
+        assertEquals("查看链接", result.text());
+        assertEquals(List.of("https://reply.example/release"), result.links());
+    }
+
+    @Test public void theSameHiddenLinkInDetailAndScrolledFeedUsesItsOwnContentNode() {
+        Node detail = node(0, 0, 400, 800, null);
+        detail.children.add(node(0, 0, 400, 420, "gitlab.com in a screenshot is not the selected link"));
+        Node body = node(0, 430, 400, 230, null);
+        body.children.add(linkLabel(20, 60, "https://release.example/project/releases"));
+        detail.children.add(body);
+
+        Node feed = node(0, 0, 400, 800, null);
+        Node viewport = node(0, 90, 400, 650, null); viewport.scrollY = 300;
+        Node card = node(0, 350, 400, 480, null);
+        card.children.add(node(0, 0, 400, 280, "post image and title"));
+        card.children.add(linkLabel(20, 330, "https://release.example/project/releases"));
+        Node next = node(0, 850, 400, 250, null);
+        next.children.add(linkLabel(20, 10, "https://next.example/post"));
+        viewport.children.add(card); viewport.children.add(next); feed.children.add(viewport);
+
+        var detailed = read(detail, 80, 580);
+        var listed = read(feed, 80, 560);
+        assertEquals("查看链接", detailed.text()); assertEquals("查看链接", listed.text());
+        assertEquals(List.of("https://release.example/project/releases"), detailed.links());
+        assertEquals(List.of("https://release.example/project/releases"), listed.links());
+    }
+
+    private static Node linkLabel(int left, int top, String destination) {
+        SpannableString text = new SpannableString("查看链接");
+        text.setSpan(new URLSpan(destination), 0, 4, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        return node(left, top, 160, 40, text);
+    }
+
+    @Test public void aCardTitleKeepsTheExplicitHrefOfItsContainingCard() {
+        Node root = node(0, 0, 400, 800, null);
+        Node card = node(0, 100, 400, 180, null);
+        card.hrefs = List.of("https://project.example/releases");
+        card.children.add(node(20, 30, 300, 40, "发布 · 仓库 · 网站"));
+        card.children.add(linkLabel(20, 100, "https://unrelated.example/author"));
+        root.children.add(card);
+        var result = read(root, 80, 210);
+        assertEquals("发布 · 仓库 · 网站", result.text());
+        assertEquals(List.of("https://project.example/releases"), result.links());
+    }
+
+    @Test public void nestedCardsUseTheNearestExplicitHrefAndKeepAChildLinksOwnTarget() {
+        Node root = node(0, 0, 400, 800, null);
+        Node outer = node(0, 100, 400, 240, null); outer.hrefs = List.of("https://outer.example/post");
+        Node inner = node(10, 10, 380, 150, null); inner.hrefs = List.of("https://inner.example/card");
+        inner.children.add(node(10, 10, 300, 40, "link title"));
+        inner.children.add(linkLabel(10, 70, "https://child.example/actual"));
+        outer.children.add(inner); root.children.add(outer);
+        assertEquals(List.of("https://inner.example/card"), read(root, 80, 200).links());
+        assertEquals(List.of("https://child.example/actual"), read(root, 80, 260).links());
+    }
+
+    @Test public void aPlainCommentCannotInheritUrlsFromAncestorTextOrAScreenWideHref() {
+        Node root = node(0, 0, 400, 800, null); root.hrefs = List.of("https://screen.example/page");
+        Node post = node(0, 100, 400, 200, "post https://post.example/article");
+        post.children.add(node(20, 10, 300, 40, "plain reply without a link")); root.children.add(post);
+        var result = read(root, 80, 190);
+        assertEquals("plain reply without a link", result.text()); assertTrue(result.links().isEmpty());
+    }
+
+    @Test public void aVisibleChildUrlDoesNotDiscardItsContainingCardsActualHref() {
+        Node root = node(0, 0, 400, 800, null);
+        Node card = node(0, 100, 400, 180, null);
+        card.hrefs = List.of("https://actual.example/download");
+        card.children.add(node(20, 10, 300, 40, "https://shown.example/path")); root.children.add(card);
+        assertEquals(List.of("https://actual.example/download", "https://shown.example/path"),
+                read(root, 80, 190).links());
+    }
+
+    @Test public void aBlankImageChildCannotEraseItsContainingCardsOriginalText() {
+        Node root = node(0, 0, 400, 800, null);
+        Node card = node(0, 100, 400, 180, "repository title");
+        card.hrefs = List.of("https://actual.example/download");
+        card.children.add(node(20, 10, 100, 100, null)); root.children.add(card);
+        var result = read(root, 80, 190);
+        assertEquals("repository title", result.text());
+        assertEquals(List.of("https://actual.example/download"), result.links());
+    }
+
     @Test public void unmatchedWindowAndOutsidePointDoNotReturnWindowTitleOrWebDomain() {
         Node root = node(0, 0, 400, 800, "only other window");
         assertEquals(SystemAssistContent.Result.EMPTY,
@@ -232,6 +388,7 @@ public final class AssistContentExtractorAndroidTest {
     static final class Node implements AssistContentExtractor.Node {
         final int left, top, width, height;
         final CharSequence text;
+        CharSequence description;
         final List<Node> children = new ArrayList<>();
         int scrollY, inputType;
         boolean visible = true, blocked, editable;
@@ -252,6 +409,7 @@ public final class AssistContentExtractorAndroidTest {
         public int inputType() { return inputType; }
         public String className() { return className; }
         public CharSequence text() { return text; }
+        public CharSequence description() { return description; }
         public List<String> hrefs() { return hrefs; }
         public int children() { return children.size(); }
         public AssistContentExtractor.Node child(int index) { return children.get(index); }

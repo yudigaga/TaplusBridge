@@ -52,8 +52,13 @@ public final class TaplusModule extends XposedModule {
     }
 
     @Override public void onPackageReady(XposedModuleInterface.PackageReadyParam param) {
-        if (!apiSupported || !BridgeContract.HOST_PACKAGE.equals(param.getPackageName())
-                || !installAttempted.compareAndSet(false, true)) return;
+        if (!apiSupported) return;
+        if (!BridgeContract.HOST_PACKAGE.equals(param.getPackageName())) {
+            if (HostPolicy.validTarget(param.getPackageName()))
+                SourceSelectionHooks.install(this, param.getClassLoader(), param.getPackageName());
+            return;
+        }
+        if (!installAttempted.compareAndSet(false, true)) return;
         ClassLoader loader = param.getClassLoader();
         HostSourceScopeHooks.install(this, loader);
         try {
@@ -67,6 +72,7 @@ public final class TaplusModule extends XposedModule {
         installSourceTracking(loader);
         recognitionHooks = RecognitionHooks.install(this, loader, this::recommendationSource);
         HostScopeCaptureHooks.install(this, loader);
+        if(HostRecognitionMenuRetention.install(this,loader))HostRecognitionMenuHooks.install(this, loader);
         PortalLensHooks.install(this, loader);
         HostTranslationHooks.install(this, loader, this::recommendationSource);
         HostDragHooks.install(this, loader, recognitionHooks);
@@ -206,6 +212,10 @@ public final class TaplusModule extends XposedModule {
         extras.putString("url", webUrl);
         extras.putString("source", source);
         Bundle response = BridgeTransport.call(context, BridgeContract.PREPARE, extras);
+        if (response != null && "browser_unavailable".equals(response.getString("reason"))) {
+            android.widget.Toast.makeText(context, "所选浏览器当前不可用，请在模块内重新选择", android.widget.Toast.LENGTH_LONG).show();
+            return null;
+        }
         if (response != null) {
             @SuppressWarnings("deprecation") Intent direct = response.getParcelable("direct");
             if (direct != null) return direct;

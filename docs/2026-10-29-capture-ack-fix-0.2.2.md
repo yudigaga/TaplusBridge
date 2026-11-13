@@ -1,5 +1,7 @@
 # 0.2.2-dev 捕获确认回调修复
 
+> 本文中的本地归档路径不随源码仓库分发；公开发布产物请以 Releases 为准。
+
 日期：2026-10-29，Asia/Shanghai。
 
 用户已经正确勾选系统框架并重启。10:33归档证明0.2.1进入system_server、安装观察器并接收两次布防请求。仍提示勾选和重启，原因是模块匿名ResultReceiver跨进程解包失败，确认消息没有回到传送门；不能把这份日志解释成用户配置未生效。
@@ -22,7 +24,7 @@
 
 本次没有`capture stage=observed`。它不能证明原卡片不存在URL，也不能用`armed`代替宿主已收到确认。此时应先修复握手，而非根据缺失的观察结果扩大启动Hook或来源应用作用域。
 
-无正文、原URL、域名或nonce的结构化证据见[日志摘要](../artifacts/diagnostics/capture-20261029-103303.json)。归档没有整体提取，报告未保存聊天内容。
+无正文、原URL、域名或nonce的结构化证据见日志摘要（本地归档：`../artifacts/diagnostics/capture-20261029-103303.json`）。归档没有整体提取，报告未保存聊天内容。
 
 ## 修复
 
@@ -36,7 +38,7 @@
 
 ## 验证
 
-先添加实际入口回归：`HostCaptureAction.arm()`生成广播 → Intent经Parcel往返 → 接收ClassLoader拒绝模块类 → 读取ACK。修复前，定向测试报BadParcelableException，原因为ClassNotFoundException，与真机相同；原失败证据保存在[回归失败记录](../artifacts/ack-parcel-regression-red-0.2.2.xml)。
+先添加实际入口回归：`HostCaptureAction.arm()`生成广播 → Intent经Parcel往返 → 接收ClassLoader拒绝模块类 → 读取ACK。修复前，定向测试报BadParcelableException，原因为ClassNotFoundException，与真机相同；原失败证据保存在回归失败记录（本地归档：`../artifacts/ack-parcel-regression-red-0.2.2.xml`）。
 
 修复后，测试要求ACK实际类型是`ResultReceiver.class`，成功ACK驱动主线程关闭一次，重复ACK不重复关闭，且保留迟到、超时、拒绝和关闭失败的取消约束。Robolectric内置ShadowResultReceiver会绕过真实Binder路径，直接调用当前对象的空回调，因此本测试类替换该快捷Shadow，以SDK实现执行Binder/Handler路径，没有删除ACK行为断言。
 
@@ -47,7 +49,7 @@
 - APK v2签名及4字节对齐通过，无原生库。Android Debug证书SHA256：`4e06d06e242802a8b8e77f696079ddd78e3d615d0cf73b781f3a187abb51f980`。
 - 版本0.2.2-dev / versionCode 7，大小234459字节，APK SHA256：`666C00480E0FEBA5A9FE5019C464CFBA720CA237F5D798A525622B53462BCC04`。
 
-安装包：[TaplusBridge-0.2.2-dev.apk](../artifacts/TaplusBridge-0.2.2-dev.apk)。完整本地验证见[validation-0.2.2.json](../artifacts/validation-0.2.2.json)，对应JUnit、Lint、签名、对齐和清单在`artifacts/`。
+安装包：TaplusBridge-0.2.2-dev.apk（本地归档：`../artifacts/TaplusBridge-0.2.2-dev.apk`）。完整本地验证见validation-0.2.2.json（本地归档：`../artifacts/validation-0.2.2.json`），对应JUnit、Lint、签名、对齐和清单在`artifacts/`。
 
 ## 新版复测
 

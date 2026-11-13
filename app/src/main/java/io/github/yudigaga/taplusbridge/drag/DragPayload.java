@@ -11,6 +11,8 @@ import android.net.Uri;
 import android.os.CancellationSignal;
 import android.os.SystemClock;
 import android.text.Html;
+import android.text.Spanned;
+import android.text.style.URLSpan;
 import io.github.yudigaga.taplusbridge.hook.HostPolicy;
 import io.github.yudigaga.taplusbridge.capture.IntentObservation;
 import io.github.yudigaga.taplusbridge.recognition.LinkExtractor;
@@ -52,13 +54,23 @@ public final class DragPayload implements AutoCloseable {
         if (!HostPolicy.validPackage(source) || data == null || !supports(data.getDescription())
                 || data.getItemCount() < 1 || data.getItemCount() > MAX_ITEMS) throw new IOException("拖拽内容不受支持");
         StringBuilder text = new StringBuilder(), links = new StringBuilder();
+        LinkedHashSet<String> richTextLinks = new LinkedHashSet<>();
         Uri image = null;
         for (int i = 0; i < data.getItemCount(); i++) {
             cancelled.throwIfCanceled();
             ClipData.Item item = data.getItemAt(i);
             CharSequence supplied = item.getText();
             String html = item.getHtmlText();
-            if (supplied != null) append(text, supplied);
+            if (supplied != null) {
+                append(text, supplied);
+                if (supplied instanceof Spanned spanned) {
+                    URLSpan[] spans = spanned.getSpans(0, spanned.length(), URLSpan.class);
+                    for (int j = 0; j < Math.min(spans.length, LinkExtractor.MAX_RESULTS); j++) {
+                        String actual = spans[j].getURL();
+                        if (RouteLink.valid(actual) && richTextLinks.add(actual)) append(links, actual);
+                    }
+                }
+            }
             else if (html != null) {
                 if (html.length() > MAX_TEXT) throw new IOException("拖拽文字过长");
                 append(text, Html.fromHtml(html, Html.FROM_HTML_MODE_LEGACY));

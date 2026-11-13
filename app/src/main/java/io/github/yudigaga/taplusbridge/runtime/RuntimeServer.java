@@ -38,6 +38,8 @@ public final class RuntimeServer {
     public interface SourceCapture {
         Bundle take(int owner, Bundle request, RuntimeSnapshot config);
         void nativeResult(Bundle request);
+        default Bundle recognitionVisible(Bundle request, RuntimeSnapshot config) { return Bundle.EMPTY; }
+        default Bundle retainRecognition(Bundle request, RuntimeSnapshot config) { return Bundle.EMPTY; }
         default boolean linkReady() { return false; }
         default boolean ownsLinkPick(Bundle request) { return false; }
         default Bundle linkWindow(Bundle request, RuntimeSnapshot config, boolean ready) { return Bundle.EMPTY; }
@@ -203,6 +205,28 @@ public final class RuntimeServer {
                         && capture != null && capture.ownsLinkPick(input));
                 if (result.getBoolean("owned")) result.putString("identity", config.identity);
                 return result;
+            }
+            if ("recognition_visible".equals(method)) {
+                if (config == null || config.build != BuildConfig.VERSION_CODE || !config.enabled || !config.recognition
+                        || config.user != 0 || !config.sourceScope.managed || sourceCapture == null
+                        || input == null || input.size() != 2 || !(input.get("source") instanceof String source)
+                        || !HostPolicy.validTarget(source) || !config.sourceScope.allows(source)
+                        || !(input.get("shown_elapsed") instanceof Long shown)
+                        || shown < 0 || shown > SystemClock.elapsedRealtime()
+                        || SystemClock.elapsedRealtime() - shown > 10_000) return Bundle.EMPTY;
+                return sourceCapture.recognitionVisible(new Bundle(input), config);
+            }
+            if ("recognition_menu_retain".equals(method)) {
+                if (config == null || config.build != BuildConfig.VERSION_CODE || !config.enabled || !config.recognition
+                        || config.user != 0 || !config.sourceScope.managed || sourceCapture == null
+                        || input == null || input.size() != 3 || !(input.get("source") instanceof String source)
+                        || !HostPolicy.validTarget(source) || !config.sourceScope.allows(source)
+                        || !(input.get("activity") instanceof String activity) || activity.length() > 512
+                        || !activity.matches("[A-Za-z_$][A-Za-z0-9_$]*(?:\\.[A-Za-z_$][A-Za-z0-9_$]*)*")
+                        || !(input.get("shown_elapsed") instanceof Long shown) || shown < 0
+                        || shown > SystemClock.elapsedRealtime() || SystemClock.elapsedRealtime()-shown > 30_000)
+                    return Bundle.EMPTY;
+                return sourceCapture.retainRecognition(new Bundle(input),config);
             }
             if ("scope_capture_native".equals(method)) {
                 SourceCapture capture = sourceCapture; if (capture != null) capture.nativeResult(input);

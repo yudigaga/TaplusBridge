@@ -1,5 +1,7 @@
 # 0.15.3：修复方向拖拽结果被取链流程再次拦截
 
+> 本文中的本地归档路径不随源码仓库分发；公开发布产物请以 Releases 为准。
+
 日期：2026-11-03（Asia/Shanghai）。版本：0.15.3 / 35。范围见 [scope.md](scope.md)。用户要求修复执行问题并直接提供正式版；本次输出为长期密钥签名、启用 R8 的本地 Release APK。
 
 ## 日志证据与判断
@@ -32,9 +34,9 @@
 
 传送门 4.1.3 的 54 项宿主静态定义检查通过。外部 ContentCatcher SDK 仍仅有引用证据；静态合同不证明手机回调已执行。Release DEX 已核对包含本次回放阶段标记，API 102 元数据及作用域为 `com.miui.contentextension`、`system`，未打包 API 实现类。
 
-正式 APK：[TaplusBridge-0.15.3-release.apk](../artifacts/TaplusBridge-0.15.3-release.apk)，3,267,333 字节。SHA-256：`1FA3833C40594CB4CAAE3A665A7A288781CC2C80B8BFE0AEE2E2EBBA203A093E`。
+正式 APK：TaplusBridge-0.15.3-release.apk（本地归档：`../artifacts/TaplusBridge-0.15.3-release.apk`），3,267,333 字节。SHA-256：`1FA3833C40594CB4CAAE3A665A7A288781CC2C80B8BFE0AEE2E2EBBA203A093E`。
 
-APK v2 签名通过，证书 SHA-256 为 `2f3c681d676d8f763b191dea0714c399e21bbaa0e948f25289ebfbcf41d1aabd`，与 0.15.2 正式包一致。4 字节 ZIP 对齐、16 KiB 原生库 ZIP 对齐及各架构 ELF PT_LOAD 对齐通过。R8 mapping、测试 XML、lint、签名与对齐输出均已归档，见 [验证清单](../artifacts/validation-0.15.3.json) 和 [校验和](../artifacts/SHA256SUMS-0.15.3.txt)。
+APK v2 签名通过，证书 SHA-256 为 `2f3c681d676d8f763b191dea0714c399e21bbaa0e948f25289ebfbcf41d1aabd`，与 0.15.2 正式包一致。4 字节 ZIP 对齐、16 KiB 原生库 ZIP 对齐及各架构 ELF PT_LOAD 对齐通过。R8 mapping、测试 XML、lint、签名与对齐输出均已归档，见 验证清单（本地归档：`../artifacts/validation-0.15.3.json`） 和 校验和（本地归档：`../artifacts/SHA256SUMS-0.15.3.txt`）。
 
 本次没有运行全量测试，没有连接设备、安装、真机 Hook 复测或远程发布。不能将本地通过表述为手机执行已验收。
 

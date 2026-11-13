@@ -99,11 +99,24 @@ def collect(build, artifacts, version, code, warnings, variant="debug", certific
             assert descriptor not in classes and original not in renamed and not any(
                 frame.search(line) for line in mapping_lines), "Removed frozen-runtime code retained: " + original
             removed_frozen_code[original] = {"dex_definition_absent": True, "r8_mapping_absent": True}
-        for original in ("io.github.yudigaga.taplusbridge.runtime.RuntimeServer",
+        required_classes = ("io.github.yudigaga.taplusbridge.runtime.RuntimeServer",
                          "io.github.yudigaga.taplusbridge.runtime.ModuleProcessLifecycle",
                          "io.github.yudigaga.taplusbridge.runtime.BridgeTransport",
                          "io.github.libxposed.service.XposedService",
-                         "top.yukonga.miuix.kmp.basic.ScaffoldKt"):
+                         "top.yukonga.miuix.kmp.basic.ScaffoldKt")
+        if code >= 78:
+            required_classes += ("io.github.yudigaga.taplusbridge.hook.SourceSelectionHooks",
+                                 "io.github.yudigaga.taplusbridge.selection.SelectionActions",
+                                 "io.github.yudigaga.taplusbridge.browser.BrowserStore",
+                                 "io.github.yudigaga.taplusbridge.hook.HostActionTargets")
+        if code >= 79:
+            required_classes += ("io.github.yudigaga.taplusbridge.probe.RecognitionMenuController",
+                                 "io.github.yudigaga.taplusbridge.hook.HostRecognitionMenuHooks")
+        if code >= 80:
+            required_classes += ("io.github.yudigaga.taplusbridge.probe.RecognitionMenuRetention",
+                                 "io.github.yudigaga.taplusbridge.probe.MenuKeyInputHooks",
+                                 "io.github.yudigaga.taplusbridge.hook.HostRecognitionMenuRetention")
+        for original in required_classes:
             packaged = renamed.get(original, original)
             descriptor = "L" + packaged.replace(".", "/") + ";"
             if descriptor in classes:
@@ -175,6 +188,17 @@ def collect(build, artifacts, version, code, warnings, variant="debug", certific
         "root_shizuku_thaw_verified_on_device": False, "target_deep_links_verified_on_device": False,
         "release_signed_with_long_term_key": release, "remote_published": False,
         "wechat_or_source_app_hooked": False,
+        "source_selection_toolbar": {"code_included": code >= 78,
+                                     "requires_explicit_source_scope": True,
+                                     "supported_ui": "native readonly TextView floating ActionMode",
+                                     "device_verified": False},
+        "recognition_popup_cleanup": {"code_included": code >= 79,
+                                      "requires_source_app_scope": False,
+                                      "preserves_existing_windows": True,
+                                      "echo_retention": {"code_included": code >= 80,"max_age_ms": 250,
+                                                         "one_use": True,"requires_real_key_input_guard": True,
+                                                         "device_verified": False},
+                                      "device_verified": False},
         "real_screenshot_card_payload_verified": False,
         "system_capture_mode": "owner-user source capture and supplemental link probes; source launch interception restricted to an authenticated gesture",
         "probe_protocol": 2,

@@ -1,6 +1,8 @@
 # 115、迅雷、天翼与微云链接打开契约
 
-日期：2026-11-06，Asia/Shanghai。普通静态逆向，`flavor = null`。范围和授权见 [scope](../analysis/cloud-web-open-20261106/scope.md)，官网静态源码索引见 [contracts-index.json](../analysis/cloud-web-open-20261106/contracts-index.json)。索引记录原 URL、当前本地文件 SHA256、大小及字符位置；本文未使用真实分享内容、登录或下载接口。
+> 本文中的本地归档路径不随源码仓库分发；公开发布产物请以 Releases 为准。
+
+日期：2026-11-06，Asia/Shanghai。普通静态逆向，`flavor = null`。范围和授权见 scope（本地归档：`../analysis/cloud-web-open-20261106/scope.md`），官网静态源码索引见 contracts-index.json（本地归档：`../analysis/cloud-web-open-20261106/contracts-index.json`）。索引记录原 URL、当前本地文件 SHA256、大小及字符位置；本文未使用真实分享内容、登录或下载接口。
 
 本轮可确认两项保留完整分享 URL 的离线转交方式：115 APK 的内置浏览器入口，以及迅雷官方分享页为 Android 构造的 webview 入口。天翼与微云能唤起应用的证据存在，但当前证据不足以仅凭任意分享 URL 构造“在应用中打开当前分享”的入口，因此不应拿应用主页或需要线上文件信息的动作替代。
 

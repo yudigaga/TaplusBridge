@@ -8,6 +8,7 @@ import android.content.pm.ApplicationInfo
 import android.content.pm.ResolveInfo
 import android.graphics.Bitmap
 import android.graphics.Canvas
+import android.net.Uri
 import android.os.Bundle
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createEmptyComposeRule
@@ -33,6 +34,7 @@ import org.robolectric.android.controller.ActivityController
 import org.robolectric.annotation.Config
 import org.robolectric.annotation.GraphicsMode
 import org.robolectric.shadows.ShadowLooper
+import org.robolectric.shadows.ShadowToast
 
 /** Exercises the actual result-token Activity, selection controls and action side effects. */
 @RunWith(RobolectricTestRunner::class)
@@ -73,6 +75,78 @@ class DragChoiceActivityAndroidTest {
         compose.onNodeWithTag("drag.menu.item.1").assertIsOn()
         assertNull(Shadows.shadowOf(activity).nextStartedActivity)
         assertNull(clipboard.primaryClip)
+    }
+
+    @Test fun choosingABrowserStartsTheSingleRecognizedWebLinkOnce() {
+        val url = "https://article.example/read/123"
+        val targets = listOf("com.example.firstbrowser", "com.example.secondbrowser")
+        configureBrowserChoices(url, targets)
+        val activity = show(result("browser", "卡片标题", "", listOf(url)))
+        compose.onNodeWithText("选择浏览器").assertIsDisplayed()
+        assertNull(Shadows.shadowOf(activity).nextStartedActivity)
+        compose.onNodeWithTag("drag.menu.item.1").performClick()
+        val opened = Shadows.shadowOf(activity).nextStartedActivity
+        assertNotNull(opened)
+        assertEquals(Intent.ACTION_VIEW, opened.action)
+        assertEquals(url, opened.dataString)
+        assertEquals(targets[1], opened.`package`)
+        assertTrue(opened.hasCategory(Intent.CATEGORY_BROWSABLE))
+        assertNull(Shadows.shadowOf(activity).nextStartedActivity)
+        assertTrue(activity.isFinishing)
+    }
+
+    @Test fun aBrowserThatDisappearsWhileChoosingShowsFailureWithoutLaunching() {
+        val url = "https://article.example/read/123"
+        val targets = listOf("com.example.firstbrowser", "com.example.secondbrowser")
+        configureBrowserChoices(url, targets)
+        val activity = show(result("browser", "", "", listOf(url)))
+        Shadows.shadowOf(context.packageManager).setResolveInfosForIntent(
+            browserIntent(url, targets[1]), emptyList(),
+        )
+        compose.onNodeWithTag("drag.menu.item.1").performClick()
+        assertNull(Shadows.shadowOf(activity).nextStartedActivity)
+        assertEquals("浏览器无法打开该链接", ShadowToast.getTextOfLatestToast())
+        assertTrue(activity.isFinishing)
+    }
+
+    @Test fun savedBrowserOpensTheRecognizedUrlWithoutAskingAgain() {
+        val url = "https://article.example/read/123"
+        val targets = listOf("com.example.firstbrowser", "com.example.secondbrowser")
+        configureBrowserChoices(url, targets)
+        context.getSharedPreferences("taplus_bridge_browser", Context.MODE_PRIVATE).edit()
+            .putString("selected_package", targets[1]).commit()
+        val activity = show(result("browser", "", "", listOf(url)))
+        val opened = Shadows.shadowOf(activity).nextStartedActivity
+        assertNotNull("The saved browser must run directly", opened)
+        assertEquals(targets[1], opened.`package`)
+        assertEquals(url, opened.dataString)
+        assertTrue(opened.hasCategory(Intent.CATEGORY_BROWSABLE))
+        assertNull(Shadows.shadowOf(activity).nextStartedActivity)
+        assertTrue(activity.isFinishing)
+    }
+
+    @Test fun unavailableSavedBrowserShowsRecoveryWithoutSilentlyLaunchingTheRemainingBrowser() {
+        val url = "https://article.example/read/123"
+        configureBrowserChoices(url, listOf("com.example.remainingbrowser"))
+        context.getSharedPreferences("taplus_bridge_browser", Context.MODE_PRIVATE).edit()
+            .putString("selected_package", "com.example.uninstalledbrowser").commit()
+        val activity = show(result("browser", "", "", listOf(url)))
+        assertNull(Shadows.shadowOf(activity).nextStartedActivity)
+        assertEquals("所选浏览器当前不可用，请在模块内重新选择", ShadowToast.getTextOfLatestToast())
+        assertTrue(activity.isFinishing)
+    }
+
+    @Test fun savedBrowserThatCannotHandleTheRecognizedUrlDoesNotUseAnotherBrowser() {
+        val url = "https://article.example/read/123"
+        val targets = listOf("com.example.firstbrowser", "com.example.secondbrowser")
+        configureBrowserChoices(url, targets)
+        context.getSharedPreferences("taplus_bridge_browser", Context.MODE_PRIVATE).edit()
+            .putString("selected_package", targets[1]).commit()
+        Shadows.shadowOf(context.packageManager).setResolveInfosForIntent(browserIntent(url, targets[1]), emptyList())
+        val activity = show(result("browser", "", "", listOf(url)))
+        assertNull(Shadows.shadowOf(activity).nextStartedActivity)
+        assertEquals("所选浏览器当前不可用，请在模块内重新选择", ShadowToast.getTextOfLatestToast())
+        assertTrue(activity.isFinishing)
     }
 
     @Test fun choosingOneMagnetOpensItWithoutShowingAnotherLinkPicker() {
@@ -205,6 +279,27 @@ class DragChoiceActivityAndroidTest {
         })
     }
 
+    @Suppress("DEPRECATION") private fun configureBrowserChoices(url: String, targets: List<String>) {
+        val manager = Shadows.shadowOf(context.packageManager)
+        val browsers = targets.map { target ->
+            installTarget(target)
+            ResolveInfo().apply {
+                isDefault = true
+                activityInfo = ActivityInfo().apply {
+                    packageName = target; name = "$target.Browser"
+                    enabled = true; exported = true
+                    applicationInfo = context.packageManager.getApplicationInfo(target, 0)
+                }
+            }.also { manager.setResolveInfosForIntent(browserIntent(url, target), listOf(it)) }
+        }
+        manager.setResolveInfosForIntent(
+            Intent.makeMainSelectorActivity(Intent.ACTION_MAIN, Intent.CATEGORY_APP_BROWSER), browsers,
+        )
+    }
+
+    private fun browserIntent(url: String, target: String) =
+        Intent(Intent.ACTION_VIEW, Uri.parse(url)).addCategory(Intent.CATEGORY_BROWSABLE).setPackage(target)
+
     @Suppress("DEPRECATION") private fun installTarget(target: String) {
         val manager = Shadows.shadowOf(context.packageManager)
         manager.installPackage(PackageInfo().apply {
@@ -225,6 +320,7 @@ class DragChoiceActivityAndroidTest {
     @Before fun setup() {
         context = RuntimeEnvironment.getApplication()
         context.getSharedPreferences("config", Context.MODE_PRIVATE).edit().clear().commit()
+        context.getSharedPreferences("taplus_bridge_browser", Context.MODE_PRIVATE).edit().clear().commit()
         config = ConfigStore(context)
         config.setDragSettings(DragSettings(true, "share", "rules", "lens", "portal", false, emptyList()))
     }
@@ -355,6 +451,7 @@ class DragChoiceActivityAndroidTest {
             })
         }
         val activity = show(result("share", "", "", listOf("https://one.example/a")))
+        compose.waitUntil(5_000) { compose.onAllNodesWithTag("drag.menu.item.1").fetchSemanticsNodes().isNotEmpty() }
         compose.onNodeWithTag("drag.menu.execute").assertDoesNotExist()
         compose.onNodeWithTag("drag.menu.item.1").performClick()
         val send = Shadows.shadowOf(activity).nextStartedActivity

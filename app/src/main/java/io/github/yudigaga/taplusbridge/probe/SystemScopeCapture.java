@@ -68,6 +68,13 @@ public final class SystemScopeCapture implements RuntimeServer.SourceCapture {
     private final Supplier<RuntimeServer> runtime;
     private final ScopeCaptureWindow windows;
     private final PhysicalTouchState physical;
+    private final RecognitionMenuController recognitionMenus;
+    private final RecognitionMenuRetention menuRetention;
+    private volatile boolean menuNavigationGuardReady;
+    private record MenuTouch(ScopeCaptureWindow.Snapshot target, int device, long down, long input,
+                             long nativeAt, float slop) { }
+    private volatile MenuTouch menuTouch;
+    private volatile long invalidMenuInput = -1, validatedMenuRelease = -1;
     private final ScopeLongPress gesture = new ScopeLongPress();
     private final ScopeCaptureStore store = new ScopeCaptureStore();
     private ScopeCaptureWindow.Snapshot origin;
@@ -151,24 +158,116 @@ public final class SystemScopeCapture implements RuntimeServer.SourceCapture {
                        PhysicalTouchState physical, Executor imageEncoder) {
         this.module = module; this.worker = worker; this.context = context; this.atms = atms;
         this.runtime = runtime; this.physical = physical; this.windows = windows; this.imageEncoder = imageEncoder;
+        menuRetention = new RecognitionMenuRetention(inputGeneration::get,this::menuConfiguration,this::menuTouchValidated,
+                target -> {
+                    Context system=context.get();
+                    if(!unlocked(system))return false;
+                    try {
+                        var host=system.getPackageManager().getPackageInfo(HostPolicy.HOST_PACKAGE,0);
+                        return host.applicationInfo!=null && host.applicationInfo.enabled
+                                && HostPolicy.supportedVersion(host.versionName,host.getLongVersionCode())
+                                && windows.recognitionSourceCurrent(atms.get(),target,host.applicationInfo.uid);
+                    }catch(PackageManager.NameNotFoundException unavailable){return false;}
+                });
+        recognitionMenus = new RecognitionMenuController(worker, inputGeneration::get,
+                () -> {
+                    RuntimeServer server = runtime.get();
+                    return server == null ? null : server.sourceCaptureConfiguration();
+                }, this::menuTouchValidated,
+                this::dismissRecognitionMenu, outcome -> {
+                    if (module != null) module.log(4, "TaplusBridge", "recognition menu stage=finished reason=" + outcome);
+                });
+    }
+
+    private RuntimeSnapshot menuConfiguration() {
+        RuntimeServer server=runtime.get();return server==null?null:server.sourceCaptureConfiguration();
+    }
+
+    private String dismissRecognitionMenu(ScopeCaptureWindow.Snapshot target,java.util.function.BooleanSupplier current)
+            throws ReflectiveOperationException {
+        String outcome="unsupported";
+        try {
+            Context system=context.get();
+            if(!unlocked(system))return "stale";
+            var host=system.getPackageManager().getPackageInfo(HostPolicy.HOST_PACKAGE,0);
+            if(host.applicationInfo==null || !host.applicationInfo.enabled
+                    || !HostPolicy.supportedVersion(host.versionName,host.getLongVersionCode()))return outcome;
+            outcome=windows.dismissRecognitionMenu(atms.get(),target,host.applicationInfo.uid,
+                    ()->current.getAsBoolean() && unlocked(context.get()),()->{
+                        RuntimeSnapshot config=menuConfiguration();
+                        return current.getAsBoolean() && config!=null && menuRetention.arm(target,config.identity,
+                                inputGeneration.get(),recognitionMenus.shownElapsed(target),menuNavigationGuardReady);
+                    });
+            return outcome;
+        }catch(PackageManager.NameNotFoundException unavailable){return outcome;}
+        finally {if(!"sent".equals(outcome))menuRetention.cancel();}
+    }
+
+    public void setMenuNavigationGuardReady(boolean ready) {
+        menuNavigationGuardReady=ready;
+        if(!ready)menuRetention.cancel();
+    }
+
+    public void newKeyInput() {
+        invalidMenuInput=inputGeneration.get();
+        menuRetention.cancel();recognitionMenus.cancel();
     }
 
     /** Copy only touch primitives before returning to the system input dispatcher. */
     public void pointer(MotionEvent event, int display, boolean exclusiveAtEvent) {
+        int action = event.getActionMasked(), count = event.getPointerCount(), device = event.getDeviceId();
+        long down = event.getDownTime(), at = event.getEventTime();
+        long observedInput = action == MotionEvent.ACTION_DOWN ? inputGeneration.incrementAndGet() : inputGeneration.get();
+        if (action == MotionEvent.ACTION_DOWN) {
+            menuRetention.cancel();
+            menuTouch = null; invalidMenuInput = -1; validatedMenuRelease = -1;
+            recognitionMenus.cancel();
+        }
+        MenuTouch touch = menuTouch;
+        if (action == MotionEvent.ACTION_CANCEL || count != 1 || display != 0
+                || touch != null && (action == MotionEvent.ACTION_MOVE || action == MotionEvent.ACTION_UP)
+                && (device != touch.device || down != touch.down || !Float.isFinite(event.getRawX())
+                || !Float.isFinite(event.getRawY())
+                || Math.hypot(event.getRawX() - touch.target.x, event.getRawY() - touch.target.y) > touch.slop)) {
+            invalidMenuInput = observedInput;
+            menuRetention.cancel();
+            recognitionMenus.cancel();
+        }
         if (DragGestureGate.suppressLongPress()) {
+            menuRetention.cancel();
+            recognitionMenus.cancel();
             ScopeLinkProbe link = linkProbe; if (link != null) link.cancel();
             worker.post(this::cancel); return;
         }
-        int action = event.getActionMasked(), count = event.getPointerCount(), device = event.getDeviceId();
-        long observedInput = action == MotionEvent.ACTION_DOWN ? inputGeneration.incrementAndGet() : inputGeneration.get();
         if (action == MotionEvent.ACTION_DOWN) { store.clear(); pendingTarget = null; linkWindow = null; }
-        long down = event.getDownTime(), at = event.getEventTime();
         long eventElapsed = SystemClock.elapsedRealtime() - Math.max(0, SystemClock.uptimeMillis() - at);
         float x = event.getRawX(), y = event.getRawY();
         float x2 = count > 1 ? event.getRawX(1) : Float.NaN, y2 = count > 1 ? event.getRawY(1) : Float.NaN;
         ScopeLinkProbe link = linkProbe;
         if (link != null) link.pointer(action, count, x, y, down, at, slop);
-        worker.post(() -> event(display, device, down, at, eventElapsed, action, count, x, y, x2, y2, exclusiveAtEvent, observedInput));
+        worker.post(() -> {
+            event(display, device, down, at, eventElapsed, action, count, x, y, x2, y2, exclusiveAtEvent, observedInput);
+            if (action == MotionEvent.ACTION_UP) {
+                MenuTouch current = menuTouch;
+                if (current != null && current.input == observedInput && current.down == down && current.device == device
+                        && invalidMenuInput != observedInput && eventElapsed >= current.nativeAt
+                        && at <= SystemClock.uptimeMillis() && SystemClock.uptimeMillis() - at <= 300) {
+                    validatedMenuRelease = observedInput;
+                    recognitionMenus.released();
+                } else {
+                    invalidMenuInput = observedInput;
+                    menuRetention.cancel();
+                    recognitionMenus.cancel();
+                }
+            }
+        });
+    }
+
+    private boolean menuTouchValidated() {
+        MenuTouch touch = menuTouch;
+        return physical != null && touch != null && touch.input == inputGeneration.get()
+                && invalidMenuInput != touch.input && (physical.soleStream(0, touch.device, touch.down)
+                || validatedMenuRelease == touch.input && physical.released());
     }
 
     private void event(int display, int device, long down, long at, long eventElapsed, int action, int count,
@@ -186,6 +285,8 @@ public final class SystemScopeCapture implements RuntimeServer.SourceCapture {
                 && (action == MotionEvent.ACTION_MOVE || action == MotionEvent.ACTION_UP)
                 && Math.hypot(x - originalPoint.x, y - originalPoint.y) > slop) {
             sourcePointMoved = true; lastOrigin = originalPoint;
+            menuRetention.cancel();
+            recognitionMenus.cancel();
         }
         try {
             if (DragGestureGate.suppressLongPress()) { cancel(); return; }
@@ -216,6 +317,11 @@ public final class SystemScopeCapture implements RuntimeServer.SourceCapture {
                         : Long.MAX_VALUE;
                 gestureActive = true;
                 recognitionFeedbackSent = false;
+                if (mode == 1 && timeout >= 100 && timeout <= 5_000) {
+                    if (inputGeneration.get() == observedInput)
+                        menuTouch = new MenuTouch(origin,device,down,observedInput,downElapsed + timeout,slop);
+                    recognitionMenus.begin(origin, configuration, downElapsed, downElapsed + timeout, observedInput);
+                }
                 if (mode == 1) scheduleRecognitionFeedback(generation, configuration, device, down, recognitionAt);
                 SystemAssistContent content = assistContent;
                 if (mode == 1 && content != null && configuration.recognition)
@@ -477,6 +583,27 @@ public final class SystemScopeCapture implements RuntimeServer.SourceCapture {
             store.clear(); pendingTarget = null; return Bundle.EMPTY;
         }
     }
+    @Override public Bundle recognitionVisible(Bundle request, RuntimeSnapshot config) {
+        Bundle result = new Bundle();
+        if (request == null || request.size() != 2 || !(request.get("source") instanceof String source)
+                || !(request.get("shown_elapsed") instanceof Long shown)) return result;
+        result.putBoolean("accepted", recognitionMenus.shown(source, shown));
+        if (module != null) module.log(4,"TaplusBridge","recognition menu stage=visible outcome="
+                + (result.getBoolean("accepted") ? "accepted" : "rejected"));
+        return result;
+    }
+
+    @Override public Bundle retainRecognition(Bundle request,RuntimeSnapshot config) {
+        Bundle result=new Bundle();
+        if(request==null || request.size()!=3 || !(request.get("source") instanceof String source)
+                || !(request.get("activity") instanceof String activity)
+                || !(request.get("shown_elapsed") instanceof Long shown))return result;
+        boolean keep=menuNavigationGuardReady && menuRetention.claim(source,activity,shown);
+        result.putBoolean("keep",keep);
+        if(module!=null)module.log(4,"TaplusBridge","recognition menu stage=echo outcome="+(keep?"kept":"passed"));
+        return result;
+    }
+
     @Override public void nativeResult(Bundle request) {
         RuntimeServer server = runtime.get();
         RuntimeSnapshot latest = server == null ? null : server.sourceCaptureConfiguration();

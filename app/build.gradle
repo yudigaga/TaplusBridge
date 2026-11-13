@@ -14,8 +14,8 @@ android {
         applicationId 'io.github.yudigaga.taplusbridge'
         minSdk 28
         targetSdk 35
-        versionCode 75
-        versionName '0.15.43'
+        versionCode 82
+        versionName '0.15.50'
     }
     signingConfigs {
         taplusRelease {

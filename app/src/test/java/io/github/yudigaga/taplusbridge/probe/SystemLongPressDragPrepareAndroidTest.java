@@ -231,6 +231,56 @@ public final class SystemLongPressDragPrepareAndroidTest {
         assertEquals("translate", released.getString("action"));
     }
 
+    @Test public void eachNearEdgeSupportsShortContactAndTwoDpInwardReleaseAtEveryDensity() throws Exception {
+        float[][] paths = {{200,20,200,0,200,2},{200,780,200,800,200,798},
+                {20,400,0,400,2,400},{380,400,400,400,398,400}};
+        String[] directions = {"up", "down", "left", "right"};
+        String[] actions = {"portal", "share", "lens", "translate"};
+        for (float density : new float[]{1, 3}) for (int i = 0; i < paths.length; i++) {
+            var metrics = context.getResources().getDisplayMetrics();
+            metrics.widthPixels = Math.round(400 * density); metrics.heightPixels = Math.round(800 * density);
+            metrics.density = density; main.bounds.set(0, 0, metrics.widthPixels, metrics.heightPixels);
+            float[] p = paths[i];
+            pointer(MotionEvent.ACTION_DOWN, p[0] * density, p[1] * density);
+            ready(); Bundle proof = request(); transferToMask();
+            Bundle still = drag.poll(proof, runtime.dragConfiguration());
+            assertNull(still.getString("direction")); assertFalse(still.getBoolean("dragging"));
+            float jitterX = p[0] + Math.signum(p[2] - p[0]) * 2;
+            float jitterY = p[1] + Math.signum(p[3] - p[1]) * 2;
+            maskPointer(proof, MotionEvent.ACTION_MOVE, jitterX * density, jitterY * density);
+            Bundle jitter = drag.poll(proof, runtime.dragConfiguration());
+            assertNull(jitter.getString("direction")); assertFalse(jitter.getBoolean("dragging"));
+            maskPointer(proof, MotionEvent.ACTION_MOVE, p[2] * density, p[3] * density);
+            Bundle touching = drag.poll(proof, runtime.dragConfiguration());
+            assertEquals(directions[i], touching.getString("direction"));
+            assertTrue("short contact must advertise an active drag", touching.getBoolean("dragging"));
+            physicalRelease();
+            Bundle released = maskPointer(proof, MotionEvent.ACTION_UP, p[4] * density, p[5] * density);
+            assertEquals("released", released.getString("state"));
+            assertEquals(directions[i], released.getString("direction"));
+            assertEquals(actions[i], released.getString("action"));
+        }
+    }
+
+    @Test public void returningToTheNearEdgeOriginCancelsThePreviouslyTouchedAction() throws Exception {
+        float[][] paths = {{200,20,200,0},{200,780,200,800},{20,400,0,400},{380,400,400,400}};
+        String[] directions = {"up", "down", "left", "right"};
+        context.getResources().getDisplayMetrics().density = 1;
+        context.getResources().getDisplayMetrics().widthPixels = 400;
+        context.getResources().getDisplayMetrics().heightPixels = 800;
+        main.bounds.set(0, 0, 400, 800);
+        for (int i = 0; i < paths.length; i++) {
+            float[] p = paths[i]; pointer(MotionEvent.ACTION_DOWN, p[0], p[1]);
+            ready(); Bundle proof = request(); transferToMask();
+            maskPointer(proof, MotionEvent.ACTION_MOVE, p[2], p[3]);
+            assertEquals(directions[i], drag.poll(proof, runtime.dragConfiguration()).getString("direction"));
+            physicalRelease();
+            Bundle released = maskPointer(proof, MotionEvent.ACTION_UP, p[0], p[1]);
+            assertEquals("released", released.getString("state"));
+            assertNull(released.getString("direction")); assertFalse(released.getBoolean("dragging"));
+        }
+    }
+
     @Test public void authenticatedMoveReturnsOnlyTheMinimalAcknowledgment() throws Exception {
         ready(); Bundle proof = request(); transferToMask();
         Bundle response = maskPointer(proof, MotionEvent.ACTION_MOVE, 1070, 200);

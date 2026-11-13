@@ -704,9 +704,11 @@ class ArchiveAnalysisTest(unittest.TestCase):
                               "ready_haptic_requested", "takeover_succeeded"], result["observed_drag_gesture_stages"])
             self.assertTrue(all(set(event) == {"source", "line", "at", "process", "stage", "reason"}
                                 for event in events))
+            # The archive digest can coincidentally contain a three-digit coordinate.
+            metadata = {key: value for key, value in result.items() if key != "archive_sha256"}
             for private in ("private.package", "private.invalid", "SECRET_", "123", "456",
                             "PRIVATE_STAGE", "overlay_transfer_failed exception="):
-                self.assertNotIn(private, json.dumps(result))
+                self.assertNotIn(private, json.dumps(metadata))
 
 
 if __name__ == "__main__":

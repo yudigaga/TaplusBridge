@@ -115,6 +115,23 @@ public final class HostProbeWindowAndroidTest {
         assertEquals(1f, service.mMainFloatView.wmParams.alpha, 0f);
     }
 
+    @Test public void passthroughReleasesFocusableHostPanelsUntilTheLeaseCloses() throws Exception {
+        service.mMainFloatView.mMainView.setVisibility(View.VISIBLE);
+        service.mMainFloatView.wmParams.flags &= ~WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
+        int original = service.mMainFloatView.wmParams.flags;
+        try (AutoCloseable ignored = passthroughOwnedWindows(service)) {
+            assertNotEquals("source focus must be restored before the fallback click", 0,
+                    service.mMainFloatView.wmParams.flags & WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE);
+        }
+        assertEquals(original, service.mMainFloatView.wmParams.flags);
+        try (HostProbeWindow window = prepare()) {
+            window.passthrough();
+            assertNotEquals("native probes must also release covering panel focus", 0,
+                    service.mMainFloatView.wmParams.flags & WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE);
+        }
+        assertEquals(original, service.mMainFloatView.wmParams.flags);
+    }
+
     @Test public void systemFallbackWithNoAttachedOwnedWindowsIsANoop() throws Exception {
         service.mSplashFloatView.mMainView.attached = false;
         service.mMainFloatView.mMainView.attached = false;

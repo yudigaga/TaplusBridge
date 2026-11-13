@@ -173,7 +173,8 @@ MODULE_SCOPE_LINK = re.compile(re.escape(MODULE_TAG) + r"[^\]\r\n]+\]\s+(scope l
 HOST_SCOPE_LINK = re.compile(HOST_LOGCAT_PREFIX + r"(scope link stage=.*)$")
 DRAG_GESTURE_STAGES = frozenset((
     "installed", "armed", "claimed", "cancelled", "timeout", "direction", "released", "imported",
-    "import_failed", "claim_failed", "content_skipped", "content_upgraded", "content_upgrade_failed",
+    "import_failed", "import_payload", "import_declined", "import_failure_detail", "consume_rejected",
+    "claim_failed", "content_skipped", "content_upgraded", "content_upgrade_failed",
     "overlay_requested", "overlay_attach_failed", "overlay_transferred", "overlay_transfer_failed",
     "overlay_skipped_after_release", "takeover_succeeded", "takeover_failed", "orphaned_takeover_reset",
     "links_attached",
@@ -197,6 +198,8 @@ DRAG_GESTURE_REASONS = frozenset((
     "host_window_attach_failed",
     "host_window_update_failed", "runtime_unavailable", "system_transfer_not_accepted",
     "host_transfer_unexpected_failure",
+    "gesture_invalid", "disabled", "invalid_request", "gesture_expired", "invalid_payload",
+    "empty_content", "import_unavailable", "recycled_image", "image_encode", "image_size",
 ))
 DRAG_GESTURE_MESSAGE = re.compile(r"drag gesture(?: host)? stage=([a-z_]+)(?=\\s|$)")
 MODULE_DRAG_GESTURE = re.compile(re.escape(MODULE_TAG) + r"[^\\]\\r\\n]+\\]\\s+(drag gesture(?: host)? stage=.*)$")
@@ -325,7 +328,14 @@ def drag_gesture_metadata(message):
         if failure:
             simple = failure.group(1).rsplit(".", 1)[-1]
             reason = simple if simple in EXCEPTIONS else "OTHER"
-    return {"stage": match.group(1), "reason": reason}
+    result = {"stage": match.group(1), "reason": reason}
+    if match.group(1) == "import_payload":
+        for field in ("text_present", "image_present", "link_present"):
+            flag = re.search(r"(?:^|\s)" + field + r"=(true|false)(?=\s|$)", message)
+            if not flag:
+                return None
+            result[field] = flag.group(1) == "true"
+    return result
 
 
 def probe_metadata(line, stage):

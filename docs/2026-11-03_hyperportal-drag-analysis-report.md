@@ -1,5 +1,7 @@
 # HyperPortal 拖拽链路静态分析
 
+> 本文中的本地归档路径不随源码仓库分发；公开发布产物请以 Releases 为准。
+
 > 日期：2026-11-03（Asia/Shanghai）
 > 目标：HyperPortal.apk，com.github.leaf.hyperportal v1.0（versionCode 1）
 > SHA-256：6F340FAE3EF88192A563617D290457435B5BBFD2261CA6811B5F811DE2DD3378
@@ -59,10 +61,10 @@ PortalService 另建 type 2038 窗口并注册拖拽监听。JADX 未能还原 l
 | E-id | source_ref | repro_command | content_hash |
 |---|---|---|---|
 | E-APK | ../../HyperPortal.apk，包名/版本来自 analysis/HyperPortal/apktool/apktool.yml | Get-FileHash .\HyperPortal.apk -Algorithm SHA256 | 6F340FAE3EF88192A563617D290457435B5BBFD2261CA6811B5F811DE2DD3378 |
-| E-SYS | [v21.java](../../analysis/HyperPortal/jadx/sources/defpackage/v21.java#L30)、[y21.java](../../analysis/HyperPortal/jadx/sources/defpackage/y21.java#L400) | rg -n application/x-dragshare analysis/HyperPortal/jadx/sources/defpackage/v21.java | same APK SHA-256 |
-| E-UI | [j31.java](../../analysis/HyperPortal/jadx/sources/defpackage/j31.java#L193)、[e31.java](../../analysis/HyperPortal/jadx/sources/defpackage/e31.java#L15) | rg -n viewContent analysis/HyperPortal/jadx/sources/defpackage/j31.java | same APK SHA-256 |
-| E-APP | [PortalService.smali](../../analysis/HyperPortal/apktool/smali/com/github/leaf/hyperportal/PortalService.smali#L5159) | rg -n coerceToText analysis/HyperPortal/apktool/smali/com/github/leaf/hyperportal/PortalService.smali | same APK SHA-256 |
-| E-CC | [v21.java](../../analysis/HyperPortal/jadx/sources/defpackage/v21.java#L132)、[y21.java](../../analysis/HyperPortal/jadx/sources/defpackage/y21.java#L475) | rg -n com.miui.contentcatcher analysis/HyperPortal/jadx/sources/defpackage/v21.java | same APK SHA-256 |
+| E-SYS | v21.java（本地归档：`../../analysis/HyperPortal/jadx/sources/defpackage/v21.java#L30`）、y21.java（本地归档：`../../analysis/HyperPortal/jadx/sources/defpackage/y21.java#L400`） | rg -n application/x-dragshare analysis/HyperPortal/jadx/sources/defpackage/v21.java | same APK SHA-256 |
+| E-UI | j31.java（本地归档：`../../analysis/HyperPortal/jadx/sources/defpackage/j31.java#L193`）、e31.java（本地归档：`../../analysis/HyperPortal/jadx/sources/defpackage/e31.java#L15`） | rg -n viewContent analysis/HyperPortal/jadx/sources/defpackage/j31.java | same APK SHA-256 |
+| E-APP | PortalService.smali（本地归档：`../../analysis/HyperPortal/apktool/smali/com/github/leaf/hyperportal/PortalService.smali#L5159`） | rg -n coerceToText analysis/HyperPortal/apktool/smali/com/github/leaf/hyperportal/PortalService.smali | same APK SHA-256 |
+| E-CC | v21.java（本地归档：`../../analysis/HyperPortal/jadx/sources/defpackage/v21.java#L132`）、y21.java（本地归档：`../../analysis/HyperPortal/jadx/sources/defpackage/y21.java#L475`） | rg -n com.miui.contentcatcher analysis/HyperPortal/jadx/sources/defpackage/v21.java | same APK SHA-256 |
 
 ### Findings
 

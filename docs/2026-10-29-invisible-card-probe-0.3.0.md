@@ -1,5 +1,7 @@
 # 0.3.0-dev 无感识别卡片
 
+> 本文中的本地归档路径不随源码仓库分发；公开发布产物请以 Releases 为准。
+
 日期：2026-10-29，Asia/Shanghai。
 
 本版本按用户确认的不可见点击方案实现候选：在传送门点“无感识别此卡片”，系统确认探测能力后，内部触发原卡片点击，在支持的启动入口消费请求并取得网址，再将结果交回保留的传送门浮窗，生成真实目标应用名称和图标。用户不用再点微信原卡片，只有点击目标应用卡片后才打开或解冻目标。
@@ -8,7 +10,7 @@
 
 ## 安装与使用
 
-1. 覆盖安装[TaplusBridge-0.3.0-dev.apk](../artifacts/TaplusBridge-0.3.0-dev.apk)，versionCode 8，沿用原开发证书。
+1. 覆盖安装TaplusBridge-0.3.0-dev.apk（本地归档：`../artifacts/TaplusBridge-0.3.0-dev.apk`），versionCode 8，沿用原开发证书。
 2. 保留“传送门 + 系统框架”勾选并重启，让system_server加载新版代码。不勾选微信或QQ。
 3. 开启模块总开关、增强链接识别和“显示无感识别操作”。目标被冻结时，预先配置Root或冰箱授权；系统侧输入本身不通过Root命令执行。
 4. 在默认屏竖屏环境长按原分享卡片，选择传送门中的“无感识别此卡片”。首版从这个明确操作触发，不在所有无URL消息上自动盲点，也不要求手动点原卡片。
@@ -61,7 +63,7 @@ InputManager事件指定来源UID与默认display，使用WAIT_FOR_FINISHED等�
 - APK v2签名、4字节对齐通过，无原生库。Android Debug证书SHA256：`4e06d06e242802a8b8e77f696079ddd78e3d615d0cf73b781f3a187abb51f980`。
 - APK大小398242字节，SHA256：`6EA9C9F871FDD1FA1ABDD6AD8646B2353812985D57792D860E723235987E5307`。
 
-机器可读证据：[validation-0.3.0.json](../artifacts/validation-0.3.0.json)。逐项JUnit、Lint、Python、签名、对齐和最终清单均位于`artifacts/`对应版本文件。
+机器可读证据：validation-0.3.0.json（本地归档：`../artifacts/validation-0.3.0.json`）。逐项JUnit、Lint、Python、签名、对齐和最终清单均位于`artifacts/`对应版本文件。
 
 ## 必须保留的验证边界
 

@@ -1,5 +1,7 @@
 # 0.2.1-dev 系统框架作用域修复
 
+> 本文中的本地归档路径不随源码仓库分发；公开发布产物请以 Releases 为准。
+
 日期：2026-10-29，Asia/Shanghai。
 
 > 后续10:33用户日志已确认0.2.1正确进入系统框架，原先的勾选和重启操作有效；捕获失败来自ACK匿名Parcelable解包异常，详见[0.2.2捕获确认修复](2026-10-29-capture-ack-fix-0.2.2.md)。以下验证限制按0.2.1交付时的事实保留。
@@ -23,7 +25,7 @@ system
 
 ## 安装与确认
 
-1. 覆盖安装[TaplusBridge-0.2.1-dev.apk](../artifacts/TaplusBridge-0.2.1-dev.apk)，versionCode 6，沿用原开发证书。
+1. 覆盖安装TaplusBridge-0.2.1-dev.apk（本地归档：`../artifacts/TaplusBridge-0.2.1-dev.apk`），versionCode 6，沿用原开发证书。
 2. 在LSPosed中勾选“传送门”和“系统框架”，取消旧版误选的“安卓系统”，然后重启手机。不勾选微信或QQ。
 3. 确认模块日志出现`build=0.2.1-dev/6; system_server=true`，随后出现`System framework callback reached`、`System one-shot observation hook installed`和`System observation command channel ready`。这些是期望日志，目前未在手机上确认。
 4. 长按原卡片触发传送门，选择“捕获接下来打开的卡片”。等待已准备提示后，15秒内点击原卡片，再到模块查看捕获结果。
@@ -38,6 +40,6 @@ system
 - 宿主39项DEX定义契约通过，APK v2签名与4字节对齐通过，无原生库。Android Debug证书SHA256：`4e06d06e242802a8b8e77f696079ddd78e3d615d0cf73b781f3a187abb51f980`。
 - APK大小233591字节，SHA256：`4DF3ECB5C1754DC331EC7F4F26FB9852040F583DC0C80059C8F023A0CE56752F`。
 
-完整证据见[validation-0.2.1.json](../artifacts/validation-0.2.1.json)，测试、Lint、清单、签名和对齐输出在`artifacts/`对应版本文件中。0.2.0 APK和验证文件保留为历史事实，不能作为框架作用域正确的证据。
+完整证据见validation-0.2.1.json（本地归档：`../artifacts/validation-0.2.1.json`），测试、Lint、清单、签名和对齐输出在`artifacts/`对应版本文件中。0.2.0 APK和验证文件保留为历史事实，不能作为框架作用域正确的证据。
 
 ADB列表为空，未安装手机、未验证本次system_server回调及命令通道，也未确认原卡片的真实URL字段。未运行设备仪器测试，未验证Root/冰箱及目标内容落点，未使用长期密钥构建正式版或远程发布；本地IceBridge保持只读。

@@ -116,6 +116,7 @@ final class HostLongPressDrag {
         volatile boolean systemLinkRequested;
         boolean canonicalPayload;
         boolean nativeProbeAvailable;
+        boolean nativeProbeStarted;
         volatile boolean nativeProbeFinished;
         List<String> recognizedLinks = List.of();
         Held(Context context, Object service, Object result, String text, Bitmap image, Lease lease) {
@@ -297,7 +298,7 @@ final class HostLongPressDrag {
     }
 
     private void process(Held held, Lease lease) {
-        if (!owns(held)) return;
+        if (!owns(held) || held.imported) return;
         if (lease == null || "cancelled".equals(lease.state)) { discard(held); return; }
         if (!held.dataReady) {
             long now = SystemClock.elapsedRealtime();
@@ -311,24 +312,30 @@ final class HostLongPressDrag {
         if ("released".equals(lease.state)) {
             if (lease.direction == null || "none".equals(lease.action)) discard(held);
             else {
-                synchronized (this) { held.text = withCardLink(held.text, lease.cardLink()); }
-                boolean linkComplete = held.nativeProbeAvailable ? held.nativeProbeFinished : lease.linkComplete();
-                if (lease.linkProbe() && !linkComplete
-                        && needsCatcherLink(lease.action(), held.text)) {
-                    if (held.linkWaitUntil == 0) held.linkWaitUntil = linkWaitDeadline(SystemClock.elapsedRealtime());
-                    if (!held.nativeProbeAvailable && lease.linkProbe() && !held.systemLinkRequested) {
-                        held.systemLinkRequested = true;
-                        main.post(() -> {
-                            if (!owns(held)) return;
-                            removePreview(held);
-                            worker.execute(() -> requestPreparedLink(held));
-                        });
+                boolean requestLink = false, waiting = false;
+                synchronized (this) {
+                    if (!owns(held) || held.imported) return;
+                    held.text = withCardLink(held.text, lease.cardLink());
+                    boolean linkComplete = held.nativeProbeStarted ? held.nativeProbeFinished : lease.linkComplete();
+                    if (lease.linkProbe() && !linkComplete && needsCatcherLink(lease.action(), held.text)) {
+                        if (held.linkWaitUntil == 0) held.linkWaitUntil = linkWaitDeadline(SystemClock.elapsedRealtime());
+                        // Geometry only permits a native probe; the first actual claimant owns source input.
+                        if (!held.nativeProbeStarted && !held.systemLinkRequested) {
+                            held.systemLinkRequested = true; requestLink = true;
+                        }
+                        waiting = waitingForCardLink(lease.action(), held.text, held.linkWaitUntil,
+                                SystemClock.elapsedRealtime());
                     }
-                    if (waitingForCardLink(lease.action(), held.text, held.linkWaitUntil,
-                            SystemClock.elapsedRealtime())) {
-                        worker.schedule(() -> poll(held), 40, TimeUnit.MILLISECONDS);
-                        return;
-                    }
+                    if (!waiting) held.imported = true;
+                }
+                if (requestLink) main.post(() -> {
+                    if (!owns(held)) return;
+                    removePreview(held);
+                    worker.execute(() -> requestPreparedLink(held));
+                });
+                if (waiting) {
+                    worker.schedule(() -> poll(held), 40, TimeUnit.MILLISECONDS);
+                    return;
                 }
                 importContent(held, lease);
             }
@@ -422,9 +429,18 @@ final class HostLongPressDrag {
         event("links_attached", null);
     }
 
+    synchronized boolean claimNativeProbe(Object service, Object result) {
+        Held held = current;
+        if (held == null) return true;
+        if (held.imported || held.service != service || (held.nativePick != result && held.result != result)
+                || !held.nativeProbeAvailable || held.systemLinkRequested || held.nativeProbeStarted) return false;
+        held.nativeProbeStarted = true;
+        return true;
+    }
+
     synchronized void nativeProbeCompleted(Object service, Object result) {
         Held held = current;
-        if (held == null || held.imported || held.service != service
+        if (held == null || held.imported || !held.nativeProbeStarted || held.service != service
                 || (held.nativePick != result && held.result != result)) return;
         held.nativeProbeFinished = true;
     }
@@ -548,9 +564,12 @@ final class HostLongPressDrag {
     private void importContent(Held held, Lease lease) {
         File image = null;
         try {
-            if (!owns(held) || held.imported) return;
-            held.imported = true;
+            if (!owns(held)) return;
             String text = held.text;
+            if (module != null) module.log(4, "TaplusBridge", "drag gesture host stage=import_payload"
+                    + " text_present=" + (text != null && !text.isBlank())
+                    + " image_present=" + (held.image != null)
+                    + " link_present=" + !LinkExtractor.extract(text).isEmpty());
             if (held.image != null) image = writeImage(held.context, held.image);
             if (image == null && (text == null || text.isBlank())) throw new IOException("empty_content");
             long retryUntil = SystemClock.elapsedRealtime() + 1_000;
@@ -584,6 +603,7 @@ final class HostLongPressDrag {
                     });
                     event("imported", null); return;
                 }
+                eventReason("import_declined", importDeclineReason(response == null ? null : response.getString("reason")));
                 if (response == null || !"runtime_unavailable".equals(response.getString("reason"))
                         || SystemClock.elapsedRealtime() >= retryUntil) throw new IOException("import_unavailable");
                 // A short Binder reconnect wait stays off the host UI thread.
@@ -592,6 +612,7 @@ final class HostLongPressDrag {
         } catch (Exception unavailable) {
             if (finish(held)) {
                 event("import_failed", unavailable.getClass().getSimpleName());
+                if (unavailable instanceof IOException) eventReason("import_failure_detail", importIoReason(unavailable.getMessage()));
                 main.post(() -> {
                     try { Toast.makeText(held.context, "拖拽操作未完成，请重新长按", Toast.LENGTH_SHORT).show(); }
                     catch (RuntimeException ignored) { }
@@ -601,6 +622,20 @@ final class HostLongPressDrag {
         } catch (OutOfMemoryError unavailable) {
             if (finish(held)) event("import_failed", "OutOfMemoryError");
         } finally { if (image != null && !image.delete()) image.deleteOnExit(); }
+    }
+
+    private static String importDeclineReason(String reason) {
+        return switch (reason == null ? "" : reason) {
+            case "disabled", "invalid_request", "runtime_unavailable", "gesture_expired", "invalid_payload" -> reason;
+            default -> "unknown";
+        };
+    }
+
+    private static String importIoReason(String reason) {
+        return switch (reason == null ? "" : reason) {
+            case "empty_content", "import_unavailable", "recycled_image", "image_encode", "image_size" -> reason;
+            default -> "unknown";
+        };
     }
 
     @android.annotation.SuppressLint("RtlHardcoded")
