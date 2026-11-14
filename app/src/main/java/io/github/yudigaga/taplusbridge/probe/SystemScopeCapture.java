@@ -72,7 +72,7 @@ public final class SystemScopeCapture implements RuntimeServer.SourceCapture {
     private final RecognitionMenuRetention menuRetention;
     private volatile boolean menuNavigationGuardReady;
     private record MenuTouch(ScopeCaptureWindow.Snapshot target, int device, long down, long input,
-                             long nativeAt, float slop) { }
+                             long recognitionAt, float slop) { }
     private volatile MenuTouch menuTouch;
     private volatile long invalidMenuInput = -1, validatedMenuRelease = -1;
     private final ScopeLongPress gesture = new ScopeLongPress();
@@ -250,7 +250,7 @@ public final class SystemScopeCapture implements RuntimeServer.SourceCapture {
             if (action == MotionEvent.ACTION_UP) {
                 MenuTouch current = menuTouch;
                 if (current != null && current.input == observedInput && current.down == down && current.device == device
-                        && invalidMenuInput != observedInput && eventElapsed >= current.nativeAt
+                        && invalidMenuInput != observedInput && eventElapsed >= current.recognitionAt
                         && at <= SystemClock.uptimeMillis() && SystemClock.uptimeMillis() - at <= 300) {
                     validatedMenuRelease = observedInput;
                     recognitionMenus.released();
@@ -266,6 +266,7 @@ public final class SystemScopeCapture implements RuntimeServer.SourceCapture {
     private boolean menuTouchValidated() {
         MenuTouch touch = menuTouch;
         return physical != null && touch != null && touch.input == inputGeneration.get()
+                && SystemClock.elapsedRealtime() >= touch.recognitionAt
                 && invalidMenuInput != touch.input && (physical.soleStream(0, touch.device, touch.down)
                 || validatedMenuRelease == touch.input && physical.released());
     }
@@ -319,8 +320,8 @@ public final class SystemScopeCapture implements RuntimeServer.SourceCapture {
                 recognitionFeedbackSent = false;
                 if (mode == 1 && timeout >= 100 && timeout <= 5_000) {
                     if (inputGeneration.get() == observedInput)
-                        menuTouch = new MenuTouch(origin,device,down,observedInput,downElapsed + timeout,slop);
-                    recognitionMenus.begin(origin, configuration, downElapsed, downElapsed + timeout, observedInput);
+                        menuTouch = new MenuTouch(origin,device,down,observedInput,recognitionAt,slop);
+                    recognitionMenus.begin(origin, configuration, downElapsed, downElapsed + timeout, recognitionAt, observedInput);
                 }
                 if (mode == 1) scheduleRecognitionFeedback(generation, configuration, device, down, recognitionAt);
                 SystemAssistContent content = assistContent;

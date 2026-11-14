@@ -23,6 +23,7 @@ import io.github.yudigaga.taplusbridge.hook.HostRecognitionMenuHooksAndroidTest.
 import io.github.yudigaga.taplusbridge.hook.HostRecognitionMenuRetentionAndroidTest.FakeCallback;
 import io.github.yudigaga.taplusbridge.bridge.BridgeContract;
 import io.github.yudigaga.taplusbridge.config.ConfigStore;
+import io.github.yudigaga.taplusbridge.config.DragSettings;
 import io.github.yudigaga.taplusbridge.config.SourceScopePolicy;
 import io.github.yudigaga.taplusbridge.runtime.RuntimeServer;
 import io.github.yudigaga.taplusbridge.runtime.RuntimeSnapshot;
@@ -63,6 +64,7 @@ public final class SystemScopeMenuIntegrationAndroidTest {
         context.getSharedPreferences("config",0).edit().clear().commit();
         var settings = new ConfigStore(context);
         settings.setEnabled(true); settings.setRecognitionEnabled(true);
+        settings.setDragSettings(new DragSettings(false,"portal","share","lens","translate",false,List.of(),100,100));
         assertTrue(settings.saveSourceScope(SourceScopePolicy.Mode.BLACKLIST,List.of(),List.of(),false,false));
         var stored = context.getSharedPreferences("menu_integration_test",0);
         stored.edit().clear().putString(RuntimeSnapshot.KEY,RuntimeSnapshot.from(context)).commit();
@@ -169,9 +171,71 @@ public final class SystemScopeMenuIntegrationAndroidTest {
         return runtime.handle(HOST_UID,"recognition_visible",shown);
     }
 
-    @Test public void actualPointerAndHostVisibilityCloseTheNewMenuWhileTheFingerIsStillHeld() {
+    @Test public void nativePhaseVisibilityWaitsUntilTheExactModuleRecognitionDeadline() {
         pointer(MotionEvent.ACTION_DOWN);
         ShadowSystemClock.advanceBy(Duration.ofMillis(101));
+        var callback = newMenu();
+        assertTrue("the native host's early visible card must be remembered",visible(SystemClock.elapsedRealtime()).getBoolean("accepted"));
+        ShadowLooper.idleMainLooper();
+        assertEquals("native long press must preserve its source menu",0,callback.calls);
+        ShadowLooper.idleMainLooper(98,java.util.concurrent.TimeUnit.MILLISECONDS);
+        assertEquals("the module recognition stage has not started at 199 ms",0,callback.calls);
+        ShadowLooper.idleMainLooper(1,java.util.concurrent.TimeUnit.MILLISECONDS);
+        assertEquals("the same early card closes the menu at the 200 ms recognition boundary",1,callback.calls);
+    }
+
+    @Test public void aNativePhaseReleaseCannotAuthorizeALaterRecognitionNotification() {
+        pointer(MotionEvent.ACTION_DOWN);
+        ShadowSystemClock.advanceBy(Duration.ofMillis(149));
+        pointer(MotionEvent.ACTION_UP);
+        var callback = newMenu();
+        ShadowSystemClock.advanceBy(Duration.ofMillis(52));
+        visible(SystemClock.elapsedRealtime());
+        ShadowLooper.idleMainLooper(2_000,java.util.concurrent.TimeUnit.MILLISECONDS);
+        assertEquals("a native-only gesture cannot close a later source menu",0,callback.calls);
+    }
+
+    @Test public void anUpQueuedBeforeTheRecognitionDeadlineKeepsItsPhysicalReleaseTime() {
+        delayedPhysicalRelease(true);
+    }
+
+    @Test public void anUpDeliveredAfterTheRecognitionDeadlineKeepsItsPhysicalReleaseTime() {
+        delayedPhysicalRelease(false);
+    }
+
+    private void delayedPhysicalRelease(boolean queuedBeforeDeadline) {
+        pointer(MotionEvent.ACTION_DOWN);
+        ShadowSystemClock.advanceBy(Duration.ofMillis(101));
+        var callback = newMenu();
+        assertTrue(visible(SystemClock.elapsedRealtime()).getBoolean("accepted"));
+        ShadowSystemClock.advanceBy(Duration.ofMillis(98));
+        long releasedUptime = SystemClock.uptimeMillis();
+        physical.event(0,0,down,releasedUptime,MotionEvent.ACTION_UP,releasedUptime);
+        physical.markReleasedElapsed(SystemClock.elapsedRealtime());
+        MotionEvent up = MotionEvent.obtain(down,releasedUptime,MotionEvent.ACTION_UP,50,200,0);
+        try {
+            if (queuedBeforeDeadline) capture.pointer(up,0,true);
+            ShadowSystemClock.advanceBy(Duration.ofMillis(2));
+            ShadowLooper.idleMainLooper();
+            assertEquals("physical UP at 199 ms cannot become a held gesture at 201 ms",0,callback.calls);
+            if (!queuedBeforeDeadline) capture.pointer(up,0,true);
+            ShadowLooper.idleMainLooper(2_000,java.util.concurrent.TimeUnit.MILLISECONDS);
+            assertEquals("processing the original early UP later must never close the source menu",0,callback.calls);
+        } finally { up.recycle(); }
+    }
+
+    @Test public void firstRecognitionVisibilityAtTheDragDeadlineCanCloseTheSourceMenu() {
+        pointer(MotionEvent.ACTION_DOWN);
+        ShadowSystemClock.advanceBy(Duration.ofMillis(300));
+        var callback = newMenu();
+        assertTrue(visible(SystemClock.elapsedRealtime()).getBoolean("accepted"));
+        ShadowLooper.idleMainLooper();
+        assertEquals("the 300 ms drag stage has already reached module recognition",1,callback.calls);
+    }
+
+    @Test public void actualPointerAndHostVisibilityCloseTheNewMenuWhileTheFingerIsStillHeld() {
+        pointer(MotionEvent.ACTION_DOWN);
+        ShadowSystemClock.advanceBy(Duration.ofMillis(201));
         var callback = newMenu();
         assertTrue(visible(SystemClock.elapsedRealtime()).getBoolean("accepted"));
         ShadowLooper.idleMainLooper(); assertEquals("a visible recognition card must replace the new menu immediately",1,callback.calls);
@@ -193,7 +257,7 @@ public final class SystemScopeMenuIntegrationAndroidTest {
 
     @Test public void physicalUpAloneCannotAuthorizeCleanupBeforeItsFinalCoordinatesAreValidated() {
         pointer(MotionEvent.ACTION_DOWN);
-        ShadowSystemClock.advanceBy(Duration.ofMillis(101));
+        ShadowSystemClock.advanceBy(Duration.ofMillis(201));
         var callback = newMenu();
         long now = SystemClock.uptimeMillis();
         physical.event(0,0,down,now,MotionEvent.ACTION_UP,now);
@@ -206,7 +270,7 @@ public final class SystemScopeMenuIntegrationAndroidTest {
     }
 
     @Test public void overlayMenuCloseEchoPreservesTheSameRecognitionModelOnce() throws Exception {
-        pointer(MotionEvent.ACTION_DOWN);ShadowSystemClock.advanceBy(Duration.ofMillis(101));
+        pointer(MotionEvent.ACTION_DOWN);ShadowSystemClock.advanceBy(Duration.ofMillis(201));
         var callback=newMenu();atms.mWindowManager.mRoot.display.mCurrentFocus.backInfo.priority=1_000_000;
         long shown=SystemClock.elapsedRealtime();FakeSplash splash=hostShown(shown);
         FakeResult original=FakeService.mCatcherResult;
@@ -218,7 +282,7 @@ public final class SystemScopeMenuIntegrationAndroidTest {
     }
 
     @Test public void aRealKeyAfterModuleMenuCloseCannotBeSwallowedAsItsEcho() throws Exception {
-        pointer(MotionEvent.ACTION_DOWN);ShadowSystemClock.advanceBy(Duration.ofMillis(101));
+        pointer(MotionEvent.ACTION_DOWN);ShadowSystemClock.advanceBy(Duration.ofMillis(201));
         var callback=newMenu();long shown=SystemClock.elapsedRealtime();FakeSplash splash=hostShown(shown);
         assertTrue(visible(shown).getBoolean("accepted"));ShadowLooper.idleMainLooper();assertEquals(1,callback.calls);
         capture.newKeyInput();
@@ -228,7 +292,7 @@ public final class SystemScopeMenuIntegrationAndroidTest {
 
     @Test public void noMenuCallbackIsDispatchedWhenTheRealKeyBarrierIsUnavailable() {
         capture.setMenuNavigationGuardReady(false);
-        pointer(MotionEvent.ACTION_DOWN);ShadowSystemClock.advanceBy(Duration.ofMillis(101));
+        pointer(MotionEvent.ACTION_DOWN);ShadowSystemClock.advanceBy(Duration.ofMillis(201));
         var callback=newMenu();assertTrue(visible(SystemClock.elapsedRealtime()).getBoolean("accepted"));
         ShadowLooper.idleMainLooper();assertEquals(0,callback.calls);
     }

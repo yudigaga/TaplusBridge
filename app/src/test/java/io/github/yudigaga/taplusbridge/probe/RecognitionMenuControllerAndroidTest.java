@@ -44,7 +44,7 @@ public final class RecognitionMenuControllerAndroidTest {
     private ScopeCaptureWindow.Snapshot target;
     private Class<?> type;
     private Object controller;
-    private long began, readyAt;
+    private long began, nativeAt, readyAt;
     private String outcome = "sent";
     private Consumer<BooleanSupplier> duringClose = ignored -> {};
 
@@ -109,10 +109,15 @@ public final class RecognitionMenuControllerAndroidTest {
     }
 
     private void begin() throws Exception {
+        begin(100, 500);
+    }
+
+    private void begin(long nativeDelay, long recognitionDelay) throws Exception {
         began = SystemClock.elapsedRealtime();
-        readyAt = began + 500;
+        nativeAt = began + nativeDelay;
+        readyAt = began + recognitionDelay;
         call("begin", new Class<?>[]{ScopeCaptureWindow.Snapshot.class, RuntimeSnapshot.class,
-                long.class, long.class, long.class}, target, configuration.get(), began, readyAt, input.get());
+                long.class, long.class, long.class, long.class}, target, configuration.get(), began, nativeAt, readyAt, input.get());
         ShadowLooper.idleMainLooper();
     }
 
@@ -134,6 +139,46 @@ public final class RecognitionMenuControllerAndroidTest {
 
     private void advance(long millis) {
         ShadowLooper.shadowMainLooper().idleFor(Duration.ofMillis(millis));
+    }
+
+    @Test public void anEarlyNativeCardWaitsUntilTheExactRecognitionDeadline() throws Exception {
+        validateTouch();
+        advance(100);
+        long firstShown = SystemClock.elapsedRealtime();
+        assertTrue(shown(SOURCE, firstShown));
+        ShadowLooper.idleMainLooper();
+        assertTrue(attempts.isEmpty());
+        assertEquals(firstShown, (long) (Long) call("shownElapsed", new Class<?>[]{ScopeCaptureWindow.Snapshot.class}, target));
+        advance(399);
+        assertTrue(attempts.isEmpty());
+        advance(1);
+        assertEquals(1, attempts.size());
+    }
+
+    @Test public void waitingForRecognitionDoesNotConsumeTheMenuObservationWindow() throws Exception {
+        begin(100, 2_000);
+        outcome = "none";
+        validateTouch();
+        advance(100);
+        assertTrue(shown(SOURCE, SystemClock.elapsedRealtime()));
+        ShadowLooper.idleMainLooper();
+        advance(1_899);
+        assertTrue("No menu observation may start in the native stage", attempts.isEmpty());
+        advance(1);
+        assertEquals(1, attempts.size());
+        outcome = "sent";
+        advance(100);
+        assertEquals(2, attempts.size());
+    }
+
+    @Test public void earlyVisibilityCannotSurviveCancellationIntoTheRecognitionStage() throws Exception {
+        validateTouch();
+        advance(100);
+        assertTrue(shown(SOURCE, SystemClock.elapsedRealtime()));
+        ShadowLooper.idleMainLooper();
+        call("cancel", new Class<?>[0]);
+        advance(5_000);
+        assertTrue(attempts.isEmpty());
     }
 
     @Test public void visibleUiClosesTheOriginalCandidateOnceWhileItsHeldTouchRemainsValidated() throws Exception {
@@ -187,12 +232,12 @@ public final class RecognitionMenuControllerAndroidTest {
         assertEquals(-1L, (long) (Long) call("shownElapsed", new Class<?>[]{ScopeCaptureWindow.Snapshot.class}, target));
     }
 
-    @Test public void wrongSourceAndPreReadyOrFutureVisibilityCannotAuthorizeClosing() throws Exception {
+    @Test public void wrongSourceAndPreNativeOrFutureVisibilityCannotAuthorizeClosing() throws Exception {
         validateTouch();
         advance(500);
         assertFalse(shown("com.example.other", SystemClock.elapsedRealtime()));
         assertFalse(shown(SOURCE, began - 1));
-        assertFalse(shown(SOURCE, readyAt - 1));
+        assertFalse(shown(SOURCE, nativeAt - 1));
         assertFalse(shown(SOURCE, SystemClock.elapsedRealtime() + 1));
         advance(5_000);
         assertTrue(attempts.isEmpty());

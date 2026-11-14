@@ -148,9 +148,9 @@ public final class SystemProbe {
                             boolean transferredStream = directional != null && directional.transferredPointer(display, readDevice,
                                     motion.getDownTime(), motion.getActionMasked());
                             if (transferredStream) {
-                                recordTransferredTouch(physical, display, readDevice, motion.getDownTime(),
-                                        motion.getEventTime(), motion.getActionMasked(), SystemClock.uptimeMillis(),
-                                        SystemClock.elapsedRealtime());
+                                recordPhysicalTouch(physical, display, readDevice, motion.getDownTime(),
+                                        motion.getEventTime(), motion.getActionMasked(), SystemClock.elapsedRealtime(),
+                                        SystemClock.uptimeMillis());
                                 return chain.proceed();
                             }
                             if (realMainInput && motion.getActionMasked() == MotionEvent.ACTION_DOWN) {
@@ -159,10 +159,9 @@ public final class SystemProbe {
                                 if (previous != null) worker.post(() -> fail(previous, "source_changed"));
                             }
                             boolean soleBefore = physical.soleStream(display, readDevice, motion.getDownTime());
-                            physical.event(display, readDevice, motion.getDownTime(), motion.getEventTime(),
-                                    motion.getActionMasked(), SystemClock.uptimeMillis());
-                            if (motion.getActionMasked() == MotionEvent.ACTION_UP && physical.released())
-                                physical.markReleasedElapsed(SystemClock.elapsedRealtime());
+                            recordPhysicalTouch(physical, display, readDevice, motion.getDownTime(),
+                                    motion.getEventTime(), motion.getActionMasked(), SystemClock.elapsedRealtime(),
+                                    SystemClock.uptimeMillis());
                             boolean dragging = DragGestureGate.suppressLongPress();
                             SystemScopeCapture scoped = scopeCapture;
                             if (directional != null && (motion.getSource() & InputDevice.SOURCE_TOUCHSCREEN) == InputDevice.SOURCE_TOUCHSCREEN
@@ -688,10 +687,12 @@ public final class SystemProbe {
         if (failure instanceof SourceWindowAccess.Unavailable) return "window_unavailable";
         return fallback;
     }
-    static void recordTransferredTouch(PhysicalTouchState physical, int display, int device, long downAt,
-                                       long eventAt, int action, long nowUptime, long nowElapsed) {
+    static void recordPhysicalTouch(PhysicalTouchState physical, int display, int device, long downAt,
+                                    long eventAt, int action, long nowElapsed, long nowUptime) {
         physical.event(display, device, downAt, eventAt, action, nowUptime);
-        if (action == MotionEvent.ACTION_UP && physical.released()) physical.markReleasedElapsed(nowElapsed);
+        // Sample elapsed before uptime so queueing or clock-read delays cannot extend the physical hold.
+        if (action == MotionEvent.ACTION_UP && physical.released())
+            physical.markReleasedElapsed(nowElapsed - Math.max(0, nowUptime - eventAt));
     }
     private static void send(ResultReceiver receiver, int code, Bundle data) {
         try { if (receiver != null) receiver.send(code, data); } catch (RuntimeException ignored) { }

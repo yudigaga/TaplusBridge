@@ -1,6 +1,8 @@
 # TaplusBridge
 
-当前正式版：**0.15.50 / 82** · [下载 APK](https://github.com/yudigaga/TaplusBridge/releases/latest) · [更新说明](docs/release-notes-0.15.50-release.md)
+当前正式版：**0.15.51 / 83** · [下载 APK](https://github.com/yudigaga/TaplusBridge/releases/latest) · [更新说明](docs/release-notes-0.15.51-release.md)
+
+0.15.51 修正来源新弹窗的关闭时机：仅在模块长按识别或拖动阶段到达后尝试关闭，系统原生长按阶段保留；提前松手不会在之后补发关闭。见[阶段边界说明](docs/2026-11-14-popup-stage-boundary.md)。
 
 基于 libxposed API 102 的传送门增强模块。把识别到的链接交给规则指定的应用，提供长按识别、四方向拖动、翻译和 Google Lens 识图，支持通过 Root 或 Shizuku 解冻目标应用。
 
@@ -24,13 +26,13 @@
 - **Google Lens**：点击识图后上传选中图片，在模块结果页查看和切换模式，复用本轮图片会话。
 - **按需运行**：本体与 Lens 进程空闲约 3 秒退出；模块保持启用，系统与宿主中的必要 Hook 继续监听。
 
-0.15.50 在本轮已有有效链接且 OCR、分词满足完成条件时，减少等待在线附加推荐造成的动作延迟；没有有效链接的卡片仍保留必要等待。累计变化及验证范围见[本版更新说明](docs/release-notes-0.15.50-release.md)。
+0.15.50 起，在本轮已有有效链接且 OCR、分词满足完成条件时，减少等待在线附加推荐造成的动作延迟；没有有效链接的卡片仍保留必要等待。此前累计变化见 [0.15.50 更新说明](docs/release-notes-0.15.50-release.md)。
 
 ## 使用与文档
 
 - [使用指南](docs/usage.md)：设置保存、来源名单、三段计时、补点、浏览器、选字工具条、翻译与 Lens。
 - [文档索引](docs/README.md)：当前指南、本版技术记录及历史版本记录。
-- [0.15.50 构建与发布验证](docs/2026-11-13-release-0.15.50.md)：签名、R8、对齐和测试证据。
+- [0.15.51 构建与发布验证](docs/2026-11-14-release-0.15.51.md)：签名、R8、对齐和测试证据。
 
 隐藏桌面图标后，可从 **LSPosed → TaplusBridge → 模块设置**重新进入，在「概览 → 运行与授权」恢复图标。隐藏图标不关闭模块。
 

@@ -20,7 +20,7 @@ public final class RecognitionMenuController {
     }
 
     private record Candidate(ScopeCaptureWindow.Snapshot target, RuntimeSnapshot config,
-                             long began, long readyAt, long input) { }
+                             long began, long nativeAt, long readyAt, long input) { }
     private record Visible(Candidate candidate, long shownElapsed) { }
 
     private final Handler worker;
@@ -47,13 +47,13 @@ public final class RecognitionMenuController {
     }
 
     public void begin(ScopeCaptureWindow.Snapshot target, RuntimeSnapshot config,
-                      long began, long readyAt, long inputSequence) {
+                      long began, long nativeAt, long readyAt, long inputSequence) {
         onWorker(() -> {
             clear();
             long now = SystemClock.elapsedRealtime();
             if (target == null || config == null || began < 0 || began > now
-                    || readyAt < began || readyAt - began >= MAX_AGE) return;
-            Candidate candidate = new Candidate(target, config, began, readyAt, inputSequence);
+                    || nativeAt < began || readyAt < nativeAt || readyAt - began >= MAX_AGE) return;
+            Candidate candidate = new Candidate(target, config, began, nativeAt, readyAt, inputSequence);
             current = candidate;
             if (!stillCurrent(candidate)) { clear(); return; }
             worker.postDelayed(poll, MAX_AGE - (now - began));
@@ -66,7 +66,7 @@ public final class RecognitionMenuController {
     public boolean shown(String source, long shownElapsed) {
         Candidate candidate = current;
         if (candidate == null || !candidate.target.source.equals(source)
-                || shownElapsed < candidate.readyAt || shownElapsed > SystemClock.elapsedRealtime()
+                || shownElapsed < candidate.nativeAt || shownElapsed > SystemClock.elapsedRealtime()
                 || !stillCurrent(candidate)) return false;
         // Even callers already on worker enqueue so a host UI notification never closes synchronously.
         worker.post(() -> {
@@ -97,6 +97,8 @@ public final class RecognitionMenuController {
         long now = SystemClock.elapsedRealtime();
         long remaining = MAX_AGE - (now - candidate.began);
         if (visible == null) { worker.postDelayed(poll, remaining); return; }
+        // The native card may appear early; it cannot authorize closing a menu before recognition.
+        if (now < candidate.readyAt) { worker.postDelayed(poll, candidate.readyAt - now); return; }
         if (!touchValidated.getAsBoolean()) {
             worker.postDelayed(poll, Math.min(POLL, remaining));
             return;
@@ -106,7 +108,8 @@ public final class RecognitionMenuController {
         String result;
         try {
             result = closer.close(candidate.target,
-                    () -> stillCurrent(candidate) && touchValidated.getAsBoolean());
+                    () -> SystemClock.elapsedRealtime() >= candidate.readyAt
+                            && stillCurrent(candidate) && touchValidated.getAsBoolean());
         } catch (ReflectiveOperationException | RuntimeException unavailable) {
             result = "unsupported";
         }

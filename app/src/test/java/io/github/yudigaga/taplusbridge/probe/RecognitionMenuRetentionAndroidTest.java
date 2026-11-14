@@ -302,7 +302,7 @@ public final class RecognitionMenuRetentionAndroidTest {
                     return "sent";
                 }, ignored -> {}));
         long now = SystemClock.elapsedRealtime();
-        controller.get().begin(target, configuration.get(), now, now, input.get());
+        controller.get().begin(target, configuration.get(), now, now, now, input.get());
         ShadowLooper.idleMainLooper();
         assertTrue(controller.get().shown(target.source, shown));
         ShadowLooper.idleMainLooper();
