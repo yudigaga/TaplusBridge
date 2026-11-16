@@ -1,4 +1,16 @@
+<p align="center">
+  <img src="docs/assets/readme-banner.svg" alt="TaplusBridge · 长按识别，顺手流转。" width="100%" />
+</p>
+
 # TaplusBridge
+
+[下载正式版](https://github.com/yudigaga/TaplusBridge/releases/latest) · [问题反馈](https://github.com/yudigaga/TaplusBridge/issues) · [文档目录](docs/README.md)
+
+| 识别 | 流转 | 扩展 |
+| --- | --- | --- |
+| 原生文字、页面结构、OCR 与剪贴板 | 域名和协议规则、目标应用与四向动作 | 翻译、Google Lens 与按需解冻 |
+
+---
 
 当前正式版：**0.15.51 / 83** · [下载 APK](https://github.com/yudigaga/TaplusBridge/releases/latest) · [更新说明](docs/release-notes-0.15.51-release.md)
 
