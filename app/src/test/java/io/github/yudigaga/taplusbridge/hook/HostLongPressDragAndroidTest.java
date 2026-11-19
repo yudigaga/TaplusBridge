@@ -10,6 +10,7 @@ import android.graphics.PointF;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.ParcelFileDescriptor;
 import android.os.SystemClock;
 import android.net.Uri;
 import android.view.WindowManager;
@@ -18,9 +19,11 @@ import io.github.libxposed.api.XposedModule;
 import io.github.yudigaga.taplusbridge.drag.RainbowDragView;
 import io.github.yudigaga.taplusbridge.bridge.BridgeContract;
 import io.github.yudigaga.taplusbridge.config.RecognitionChannels;
+import io.github.yudigaga.taplusbridge.runtime.IRuntimeBridge;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
+import java.io.FileNotFoundException;
 import java.lang.reflect.Field;
 import java.lang.reflect.Proxy;
 import java.util.HashMap;
@@ -36,6 +39,9 @@ import org.robolectric.RuntimeEnvironment;
 import org.robolectric.shadows.ShadowLooper;
 import org.robolectric.annotation.Config;
 import org.robolectric.annotation.GraphicsMode;
+import org.robolectric.annotation.Implementation;
+import org.robolectric.annotation.Implements;
+import org.robolectric.shadows.ShadowParcelFileDescriptor;
 import static org.junit.Assert.*;
 
 @RunWith(RobolectricTestRunner.class)
@@ -206,16 +212,17 @@ public final class HostLongPressDragAndroidTest {
         var calls = new java.util.concurrent.atomic.AtomicInteger();
         var checked = new java.util.concurrent.CountDownLatch(1);
         Class<?> bridgeType = Class.forName("io.github.yudigaga.taplusbridge.runtime.IRuntimeBridge");
-        Object remote = Proxy.newProxyInstance(bridgeType.getClassLoader(), new Class<?>[]{bridgeType},
-                (target, method, args) -> {
-                    if (!"call".equals(method.getName())) return null;
-                    if ("drag_gesture_link".equals(args[0])) {
-                        assertNull("mask must be gone before source input", type.getDeclaredField("preview").get(held));
-                        calls.incrementAndGet(); checked.countDown();
-                        Bundle accepted = new Bundle(); accepted.putBoolean("accepted", true); return accepted;
-                    }
-                    return null;
-                });
+        Object remote = new IRuntimeBridge.Stub() {
+            @Override public Bundle call(String method, Bundle request) {
+                if ("drag_gesture_link".equals(method)) {
+                    try { assertNull("mask must be gone before source input", type.getDeclaredField("preview").get(held)); }
+                    catch (ReflectiveOperationException invalidFixture) { throw new AssertionError(invalidFixture); }
+                    calls.incrementAndGet(); checked.countDown();
+                    Bundle accepted = new Bundle(); accepted.putBoolean("accepted", true); return accepted;
+                }
+                return null;
+            }
+        };
         var install = Class.forName("io.github.yudigaga.taplusbridge.runtime.RuntimeClient")
                 .getDeclaredMethod("testBridge", bridgeType); install.setAccessible(true); install.invoke(null, remote);
         var process = HostLongPressDrag.class.getDeclaredMethod("process", type, HostLongPressDrag.Lease.class);
@@ -240,8 +247,9 @@ public final class HostLongPressDragAndroidTest {
 
     private static void installBridge(Bundle response) throws Exception {
         Class<?> type = Class.forName("io.github.yudigaga.taplusbridge.runtime.IRuntimeBridge");
-        Object remote = response == null ? null : Proxy.newProxyInstance(type.getClassLoader(), new Class<?>[]{type},
-                (target, method, args) -> "call".equals(method.getName()) ? response : null);
+        Object remote = response == null ? null : new IRuntimeBridge.Stub() {
+            @Override public Bundle call(String method, Bundle request) { return response; }
+        };
         var install = Class.forName("io.github.yudigaga.taplusbridge.runtime.RuntimeClient")
                 .getDeclaredMethod("testBridge", type); install.setAccessible(true); install.invoke(null, remote);
     }
@@ -295,8 +303,9 @@ public final class HostLongPressDragAndroidTest {
         Field current = HostLongPressDrag.class.getDeclaredField("current"); current.setAccessible(true); current.set(observer, held);
         Class<?> bridge = Class.forName("io.github.yudigaga.taplusbridge.runtime.IRuntimeBridge");
         var response = new java.util.concurrent.atomic.AtomicReference<>(Bundle.EMPTY);
-        Object remote = Proxy.newProxyInstance(bridge.getClassLoader(), new Class<?>[]{bridge},
-                (target, method, args) -> "call".equals(method.getName()) ? response.get() : null);
+        Object remote = new IRuntimeBridge.Stub() {
+            @Override public Bundle call(String method, Bundle request) { return response.get(); }
+        };
         var install = Class.forName("io.github.yudigaga.taplusbridge.runtime.RuntimeClient")
                 .getDeclaredMethod("testBridge", bridge); install.setAccessible(true);
         install.invoke(null, remote);
@@ -749,10 +758,52 @@ public final class HostLongPressDragAndroidTest {
 
     private record ImportAttempt(List<String> events, RecordingImportProvider provider) { }
 
+    @Test @Config(shadows = SlowImageDescriptor.class)
+    public void importIpcDurationExcludesOpeningAndClosingItsImageDescriptor() throws Exception {
+        Bitmap image = Bitmap.createBitmap(12, 14, Bitmap.Config.ARGB_8888);
+        Bundle declined = new Bundle(); declined.putString("reason", "module_disabled");
+        long began = SystemClock.elapsedRealtime();
+        try {
+            ImportAttempt attempt = failedImport(RuntimeEnvironment.getApplication(), null, image, declined, 25, null);
+            List<String> calls = attempt.events.stream().filter(event -> event.contains("stage=native_import ")).toList();
+            assertEquals(1, calls.size()); assertTrue(calls.get(0).endsWith(" ipc_ms=25"));
+            assertTrue("The descriptor delays must actually surround the call", SystemClock.elapsedRealtime() - began >= 175);
+            assertEquals(1, attempt.provider.importCalls); assertTrue(attempt.provider.importImage);
+        } finally { if (!image.isRecycled()) image.recycle(); }
+    }
+
+    @Test public void synchronousImportFailureStillReportsItsCallDurationWithoutExceptionText() throws Exception {
+        ImportAttempt attempt = failedImport(RuntimeEnvironment.getApplication(), "private-import-body", null, null,
+                35, new IllegalStateException("private-import-exception " + TOKEN));
+        List<String> calls = attempt.events.stream().filter(event -> event.contains("stage=native_import ")).toList();
+        assertEquals(1, calls.size()); assertTrue(calls.get(0).endsWith(" ipc_ms=35"));
+        assertTrue(attempt.events.contains("drag gesture host stage=import_failed exception=IllegalStateException"));
+        String logged = String.join("\n", attempt.events);
+        assertFalse(logged.contains("private-import")); assertFalse(logged.contains(TOKEN));
+    }
+
+    @Implements(ParcelFileDescriptor.class)
+    public static final class SlowImageDescriptor extends ShadowParcelFileDescriptor {
+        @Implementation protected static ParcelFileDescriptor open(File file, int mode) throws FileNotFoundException {
+            org.robolectric.shadows.ShadowSystemClock.advanceBy(java.time.Duration.ofMillis(75));
+            return ShadowParcelFileDescriptor.open(file, mode);
+        }
+        @Override @Implementation protected void close() throws IOException {
+            try { super.close(); }
+            finally { org.robolectric.shadows.ShadowSystemClock.advanceBy(java.time.Duration.ofMillis(75)); }
+        }
+    }
+
     private static ImportAttempt failedImport(Context context, String text, Bitmap image, Bundle response) throws Exception {
+        return failedImport(context, text, image, response, 0, null);
+    }
+
+    private static ImportAttempt failedImport(Context context, String text, Bitmap image, Bundle response,
+                                               long callMillis, RuntimeException failure) throws Exception {
         RecordingImportProvider provider = Robolectric.buildContentProvider(RecordingImportProvider.class)
                 .create(BridgeContract.AUTHORITY).get();
         provider.importResponse = response;
+        provider.importMillis = callMillis; provider.importFailure = failure;
         org.robolectric.shadows.ShadowContentResolver.registerProviderInternal(BridgeContract.AUTHORITY, provider);
         List<String> events = new ArrayList<>();
         XposedModule module = new XposedModule() { };
@@ -883,13 +934,20 @@ public final class HostLongPressDragAndroidTest {
         var actions = new java.util.concurrent.CopyOnWriteArrayList<Integer>();
         var xs = new java.util.concurrent.CopyOnWriteArrayList<Float>();
         Class<?> bridgeType = Class.forName("io.github.yudigaga.taplusbridge.runtime.IRuntimeBridge");
-        Object remote = Proxy.newProxyInstance(bridgeType.getClassLoader(), new Class<?>[]{bridgeType}, (target, method, args) -> {
-            if (!"call".equals(method.getName())) return null;
-            if (!"drag_gesture_update".equals(args[0])) return Bundle.EMPTY;
-            Bundle request = (Bundle) args[1]; actions.add(request.getInt("action")); xs.add(request.getFloat("x"));
-            if (actions.size() == 1) { entered.countDown(); unblock.await(3, java.util.concurrent.TimeUnit.SECONDS); }
-            return Bundle.EMPTY;
-        });
+        Object remote = new IRuntimeBridge.Stub() {
+            @Override public Bundle call(String method, Bundle request) throws android.os.RemoteException {
+                if (!"drag_gesture_update".equals(method)) return Bundle.EMPTY;
+                actions.add(request.getInt("action")); xs.add(request.getFloat("x"));
+                if (actions.size() == 1) {
+                    entered.countDown();
+                    try { unblock.await(3, java.util.concurrent.TimeUnit.SECONDS); }
+                    catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt(); throw new android.os.RemoteException("fixture interrupted");
+                    }
+                }
+                return Bundle.EMPTY;
+            }
+        };
         var install = Class.forName("io.github.yudigaga.taplusbridge.runtime.RuntimeClient").getDeclaredMethod("testBridge", bridgeType);
         install.setAccessible(true); install.invoke(null, remote);
         var worker = (java.util.concurrent.ScheduledExecutorService) org.robolectric.util.ReflectionHelpers.getField(observer, "worker");
@@ -929,13 +987,20 @@ public final class HostLongPressDragAndroidTest {
         var actions = new java.util.concurrent.CopyOnWriteArrayList<Integer>();
         var xs = new java.util.concurrent.CopyOnWriteArrayList<Float>();
         Class<?> bridgeType = Class.forName("io.github.yudigaga.taplusbridge.runtime.IRuntimeBridge");
-        Object remote = Proxy.newProxyInstance(bridgeType.getClassLoader(), new Class<?>[]{bridgeType}, (target, method, args) -> {
-            if (!"call".equals(method.getName())) return null;
-            if (!"drag_gesture_update".equals(args[0])) return Bundle.EMPTY;
-            Bundle request = (Bundle) args[1]; actions.add(request.getInt("action")); xs.add(request.getFloat("x"));
-            if (actions.size() == 1) { entered.countDown(); unblock.await(3, java.util.concurrent.TimeUnit.SECONDS); }
-            return Bundle.EMPTY;
-        });
+        Object remote = new IRuntimeBridge.Stub() {
+            @Override public Bundle call(String method, Bundle request) throws android.os.RemoteException {
+                if (!"drag_gesture_update".equals(method)) return Bundle.EMPTY;
+                actions.add(request.getInt("action")); xs.add(request.getFloat("x"));
+                if (actions.size() == 1) {
+                    entered.countDown();
+                    try { unblock.await(3, java.util.concurrent.TimeUnit.SECONDS); }
+                    catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt(); throw new android.os.RemoteException("fixture interrupted");
+                    }
+                }
+                return Bundle.EMPTY;
+            }
+        };
         var install = Class.forName("io.github.yudigaga.taplusbridge.runtime.RuntimeClient").getDeclaredMethod("testBridge", bridgeType);
         install.setAccessible(true); install.invoke(null, remote);
         var worker = (java.util.concurrent.ScheduledExecutorService) org.robolectric.util.ReflectionHelpers.getField(observer, "worker");
@@ -980,6 +1045,8 @@ public final class HostLongPressDragAndroidTest {
         boolean importImage;
         int importCalls;
         Bundle importResponse;
+        long importMillis;
+        RuntimeException importFailure;
         int policyReads;
         RecognitionChannels channels = RecognitionChannels.defaults();
         @Override public boolean onCreate() { return true; }
@@ -993,6 +1060,8 @@ public final class HostLongPressDragAndroidTest {
             importCalls++;
             importText = extras.getString("text");
             importImage = extras.get("fd") instanceof android.os.ParcelFileDescriptor;
+            if (importMillis > 0) org.robolectric.shadows.ShadowSystemClock.advanceBy(java.time.Duration.ofMillis(importMillis));
+            if (importFailure != null) throw importFailure;
             if (importResponse != null) {
                 if ("runtime_unavailable".equals(importResponse.getString("reason")))
                     org.robolectric.shadows.ShadowSystemClock.advanceBy(java.time.Duration.ofSeconds(2));

@@ -88,7 +88,14 @@ public final class RecognitionHooks {
 
     /** Read only the exact live pick; a completed or replaced pick cannot supply another drag's links. */
     DragSnapshot dragSnapshot(Object service, Object result, long expectedEpoch) {
-        boolean serverEnabled = RecognitionPolicy.read(hostContext()).enabled(Channel.SERVER);
+        return dragSnapshot(service, result, expectedEpoch, null);
+    }
+
+    DragSnapshot dragSnapshot(Object service, Object result, long expectedEpoch,
+                              java.util.function.Consumer<RecognitionPolicy.State> observePolicy) {
+        RecognitionPolicy.State policy = RecognitionPolicy.current(hostContext());
+        if (observePolicy != null) observePolicy.accept(policy);
+        boolean serverEnabled = policy.channels().enabled(Channel.SERVER);
         synchronized (sessionLock) {
             if (!active || dragPick == null || !dragPick.matches(service, result, expectedEpoch)) return null;
             boolean waiting = false;

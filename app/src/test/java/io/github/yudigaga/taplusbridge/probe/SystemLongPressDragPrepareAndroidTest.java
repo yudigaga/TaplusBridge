@@ -21,6 +21,7 @@ import android.os.UserManager;
 import android.provider.Settings;
 import android.view.MotionEvent;
 import android.view.ViewConfiguration;
+import android.view.WindowManager;
 import io.github.libxposed.api.XposedModule;
 import io.github.yudigaga.taplusbridge.config.ConfigStore;
 import io.github.yudigaga.taplusbridge.config.DragSettings;
@@ -34,6 +35,8 @@ import java.lang.reflect.Constructor;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
 import org.junit.Before;
 import org.junit.Test;
@@ -59,6 +62,9 @@ public final class SystemLongPressDragPrepareAndroidTest {
     private SharedPreferences stored;
     private RuntimeServer runtime;
     private SystemLongPressDrag drag;
+    private Handler worker;
+    private ScopeCaptureWindow windows;
+    private SystemScopeCapture scope;
     private PhysicalTouchState physical;
     private ScopeCaptureWindowAndroidTest.Atms atms;
     private ScopeCaptureWindowAndroidTest.Window main;
@@ -92,7 +98,7 @@ public final class SystemLongPressDragPrepareAndroidTest {
         host.applicationInfo = new ApplicationInfo(); host.applicationInfo.packageName = host.packageName;
         host.applicationInfo.uid = HOST_UID; host.applicationInfo.enabled = true;
         ((org.robolectric.shadows.ShadowPackageManager) org.robolectric.shadow.api.Shadow.extract(context.getPackageManager())).installPackage(host);
-        Handler worker = new Handler(Looper.getMainLooper());
+        worker = new Handler(Looper.getMainLooper());
         runtime = new RuntimeServer(context, worker, () -> stored, ignored -> {});
         physical = new PhysicalTouchState();
         atms = new ScopeCaptureWindowAndroidTest.Atms(); main = new ScopeCaptureWindowAndroidTest.Window();
@@ -103,7 +109,7 @@ public final class SystemLongPressDragPrepareAndroidTest {
         task.topActivity = main.mActivityRecord.mActivityComponent;
         ((org.robolectric.shadows.ShadowActivityManager) org.robolectric.shadow.api.Shadow.extract(
                 context.getSystemService(ActivityManager.class))).setTasks(List.of(task));
-        ScopeCaptureWindow windows = new ScopeCaptureWindow(ScopeCaptureWindowAndroidTest.Atms.class,
+        windows = new ScopeCaptureWindow(ScopeCaptureWindowAndroidTest.Atms.class,
                 new ScopeCaptureWindow.CaptureBackend() {
                     public Class<?> surfaceType() { return Object.class; }
                     public Bitmap capture(Object surface, Object[] excluded, int uid, Rect crop, float scale) {
@@ -135,13 +141,159 @@ public final class SystemLongPressDragPrepareAndroidTest {
         physical.event(0, 0, down, now, action, now);
         if (action == MotionEvent.ACTION_UP) physical.markReleasedElapsed(SystemClock.elapsedRealtime());
         MotionEvent event = MotionEvent.obtain(down, now, action, x, y, 0);
-        try { drag.pointer(event, 0, exclusive); } finally { event.recycle(); }
+        try {
+            if (scope != null) scope.pointer(event, 0, exclusive);
+            drag.pointer(event, 0, exclusive);
+        } finally { event.recycle(); }
         ShadowLooper.idleMainLooper();
     }
 
     private Bundle request() { Bundle request = new Bundle(); request.putString("token", starts.get(starts.size() - 1).getStringExtra("drag_token")); return request; }
     private Bundle prepare() { return runtime.handle(HOST_UID, "drag_gesture_prepare", request()); }
     private void ready() { ShadowLooper.idleMainLooper(200, java.util.concurrent.TimeUnit.MILLISECONDS); }
+
+    private void recordingGesture(SourceRecordingState.Source recording) {
+        pointer(MotionEvent.ACTION_UP, 50, 200);
+        ShadowSystemClock.advanceBy(Duration.ofMillis(1));
+        settings.setRecognitionEnabled(true);
+        assertTrue(settings.saveSourceScope(SourceScopePolicy.Mode.BLACKLIST, List.of(), List.of(), true, false));
+        Settings.System.putInt(context.getContentResolver(), "content_catcher_network_enabled_content_extension", 1);
+        publish();
+        scope = new SystemScopeCapture(null, worker, () -> context, () -> atms, () -> runtime,
+                windows, physical, Runnable::run, uid -> {
+                    assertFalse("Recording access must be outside the WMS lock",
+                            Thread.holdsLock(atms.mWindowManager.mGlobalLock));
+                    return recording.observe(uid);
+                });
+        runtime.setSourceCapture(scope);
+        drag.setRecordingGuard(scope::protectsDrag);
+        pointer(MotionEvent.ACTION_DOWN, 50, 200);
+        ready();
+    }
+
+    private Bundle recordingRisk() {
+        Bundle request = new Bundle();
+        request.putString("source", main.mAttrs.packageName);
+        request.putString("activity", main.mActivityRecord.mActivityComponent.getClassName());
+        return runtime.handle(HOST_UID, "scope_recording_risk", request);
+    }
+
+    private Bundle readyMask(Bundle proof) { return readyMask(proof, () -> {}); }
+
+    private Bundle readyMask(Bundle proof, Runnable beforeVisibilityCheck) {
+        var mask = new ScopeCaptureWindowAndroidTest.Window();
+        mask.mOwnerUid = HOST_UID;
+        mask.mActivityRecord = null;
+        mask.mAttrs.packageName = HostPolicy.HOST_PACKAGE;
+        mask.mAttrs.type = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY;
+        mask.mAttrs.width = WindowManager.LayoutParams.MATCH_PARENT;
+        mask.mAttrs.height = WindowManager.LayoutParams.MATCH_PARENT;
+        mask.mAttrs.setTitle(DragSettings.MASK_WINDOW_PREFIX + proof.getString("token"));
+        mask.beforeVisibilityCheck = beforeVisibilityCheck;
+        var display = atms.mWindowManager.mRoot.display;
+        display.hit = mask;
+        display.mCurrentFocus = mask;
+        return runtime.handle(HOST_UID, "drag_gesture_overlay_ready", proof);
+    }
+
+    @Test public void confirmedRecordingRetiresTheIssuedPrepareTokenEvenAfterRecordingStops() throws Exception {
+        AtomicBoolean recording = new AtomicBoolean();
+        recordingGesture(uid -> recording.get()
+                ? new SourceRecordingState.Observation(uid, SystemClock.elapsedRealtime())
+                : SourceRecordingState.UNKNOWN);
+        Bundle proof = request();
+        recording.set(true);
+        assertTrue(recordingRisk().getBoolean("protected"));
+        recording.set(false);
+
+        Bundle denied = runtime.handle(HOST_UID, "drag_gesture_prepare", proof);
+        Bundle capture = denied.getBundle("capture");
+        if (capture != null && capture.get("fd") instanceof ParcelFileDescriptor fd) fd.close();
+        assertEquals("The old prepare request must not capture the recording source", 0, captures);
+        assertTrue(denied.isEmpty());
+        assertEquals("cancelled", runtime.handle(HOST_UID, "drag_gesture_poll", proof).getString("state"));
+    }
+
+    @Test public void recordingStartingAfterPreparePreventsTheActualInputTransfer() throws Exception {
+        AtomicBoolean recording = new AtomicBoolean();
+        recordingGesture(uid -> recording.get()
+                ? new SourceRecordingState.Observation(uid, SystemClock.elapsedRealtime())
+                : SourceRecordingState.UNKNOWN);
+        Bundle proof = request();
+        Bundle prepared = prepare().getBundle("capture");
+        assertNotNull(prepared);
+        if (prepared.get("fd") instanceof ParcelFileDescriptor fd) fd.close();
+        recording.set(true);
+        ShadowLooper.idleMainLooper(100, java.util.concurrent.TimeUnit.MILLISECONDS);
+
+        Bundle ready = readyMask(proof);
+        assertEquals("The mask must not acquire the recording source's touch", 0,
+                atms.mWindowManager.mInputManager.calls);
+        assertFalse(ready.getBoolean("accepted"));
+        assertFalse(drag.transferred());
+    }
+
+    @Test public void recordingEvidenceFromAnotherUidDoesNotPreventNormalTakeover() {
+        recordingGesture(uid -> new SourceRecordingState.Observation(uid + 1, SystemClock.elapsedRealtime()));
+        Bundle proof = request();
+        ShadowLooper.idleMainLooper(100, java.util.concurrent.TimeUnit.MILLISECONDS);
+
+        assertTrue(readyMask(proof).getBoolean("accepted"));
+        assertEquals(1, atms.mWindowManager.mInputManager.calls);
+    }
+
+    @Test public void recordingStartingDuringMaskValidationStillPreventsTransferOutsideWms() {
+        AtomicBoolean recording = new AtomicBoolean();
+        recordingGesture(uid -> recording.get()
+                ? new SourceRecordingState.Observation(uid, SystemClock.elapsedRealtime())
+                : SourceRecordingState.UNKNOWN);
+        Bundle proof = request();
+        ShadowLooper.idleMainLooper(100, java.util.concurrent.TimeUnit.MILLISECONDS);
+        AtomicInteger visibilityChecks = new AtomicInteger();
+
+        Bundle ready = readyMask(proof, () -> {
+            // First validate the source behind the mask, then repeat it before checking the mask itself.
+            if (visibilityChecks.incrementAndGet() == 3) {
+                assertTrue(Thread.holdsLock(atms.mWindowManager.mGlobalLock));
+                recording.set(true);
+            }
+        });
+        assertTrue("The recording must become active inside the final window inspection", recording.get());
+        assertEquals("No input handoff may follow the final positive recording check", 0,
+                atms.mWindowManager.mInputManager.calls);
+        assertFalse(ready.getBoolean("accepted"));
+    }
+
+    @Test public void physicalReleaseAheadOfTheDragWorkerPreventsTransferOfTheOldStream() {
+        ready();
+        Bundle proof = request();
+        ShadowLooper.idleMainLooper(100, java.util.concurrent.TimeUnit.MILLISECONDS);
+        physicalRelease();
+
+        assertFalse(readyMask(proof).getBoolean("accepted"));
+        assertEquals(0, atms.mWindowManager.mInputManager.calls);
+    }
+
+    @Test public void disablingDragDuringTheFinalRecordingCheckRejectsTheOldToken() {
+        AtomicBoolean disableOnObservation = new AtomicBoolean();
+        recordingGesture(uid -> {
+            if (!disableOnObservation.compareAndSet(true, false)) return SourceRecordingState.UNKNOWN;
+            settings.setDragSettings(new DragSettings(false, "portal", "share", "lens", "translate", false,
+                    List.of(), 100, 100));
+            publish();
+            assertNull(runtime.dragConfiguration());
+            return new SourceRecordingState.Observation(uid, SystemClock.elapsedRealtime());
+        });
+        Bundle proof = request();
+        ShadowLooper.idleMainLooper(100, java.util.concurrent.TimeUnit.MILLISECONDS);
+        disableOnObservation.set(true);
+
+        Bundle ready = readyMask(proof);
+        assertFalse("The configuration must change during the final recording check", disableOnObservation.get());
+        assertEquals("The disabled policy must prevent the old token from transferring input", 0,
+                atms.mWindowManager.mInputManager.calls);
+        assertFalse(ready.getBoolean("accepted"));
+    }
 
     private void transferToMask() throws Exception {
         java.lang.reflect.Field active = SystemLongPressDrag.class.getDeclaredField("current"); active.setAccessible(true);

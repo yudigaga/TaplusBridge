@@ -2,6 +2,7 @@ package io.github.yudigaga.taplusbridge.hook;
 
 import android.content.Context;
 import android.os.Bundle;
+import android.os.SystemClock;
 import android.graphics.Rect;
 import android.os.Parcelable;
 import io.github.yudigaga.taplusbridge.config.RecognitionChannels;
@@ -13,9 +14,19 @@ import java.util.Map;
 final class RecognitionPolicy {
     private RecognitionPolicy() {}
 
-    record State(RecognitionChannels channels, boolean managed) {
+    record State(RecognitionChannels channels, boolean managed, String identity, long readMillis, String status) {
+        State(RecognitionChannels channels, boolean managed) {
+            this(channels, managed, "", 0, managed ? "ready" : "publication_unavailable");
+        }
         boolean disabled(Channel channel) { return managed && !channels.enabled(channel); }
         boolean commerceDisabled() { return disabled(Channel.CLIPBOARD) || disabled(Channel.SERVER); }
+        String diagnosticFields() {
+            String published = identity.matches("[A-Za-z0-9_-]{16,128}") ? identity : "unavailable";
+            StringBuilder enabled = new StringBuilder();
+            for (Channel channel : Channel.values()) enabled.append(channels.enabled(channel) ? '1' : '0');
+            return " policy_identity=" + published + " policy_status=" + status + " policy_ipc_ms=" + readMillis
+                    + " channel_bits=" + enabled;
+        }
     }
 
     static RecognitionChannels read(Context context) {
@@ -23,16 +34,24 @@ final class RecognitionPolicy {
     }
 
     static State current(Context context) {
-        State unavailable = new State(RecognitionChannels.disabled(), false);
-        if (context == null) return unavailable;
+        if (context == null) return unavailable("context_unavailable", 0);
+        long readMillis = 0;
         try {
-            Bundle result = BridgeTransport.call(context, RecognitionChannels.KEY, Bundle.EMPTY);
+            Bundle result;
+            long callBegan = SystemClock.elapsedRealtime();
+            try { result = BridgeTransport.call(context, RecognitionChannels.KEY, Bundle.EMPTY); }
+            finally { readMillis = Math.max(0, SystemClock.elapsedRealtime() - callBegan); }
+            // Field validation and channel parsing happen after the synchronous call timer has stopped.
             if (result == null || !result.getBoolean("active")
                     || !(result.get("identity") instanceof String identity) || identity.isBlank()
                     || identity.length() > 128 || !(result.get("channels") instanceof String channels))
-                return unavailable;
-            return new State(RecognitionChannels.parse(channels), true);
-        } catch (RuntimeException failure) { return unavailable; }
+                return unavailable("publication_unavailable", readMillis);
+            return new State(RecognitionChannels.parse(channels), true, identity, readMillis, "ready");
+        } catch (RuntimeException failure) { return unavailable("transport_unavailable", readMillis); }
+    }
+
+    private static State unavailable(String reason, long readMillis) {
+        return new State(RecognitionChannels.disabled(), false, "", readMillis, reason);
     }
 
     static Map<?, ?> properties(Object result) {

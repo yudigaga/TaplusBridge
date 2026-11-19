@@ -6,9 +6,9 @@ import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageInfo;
 import android.os.Bundle;
 import android.os.SystemClock;
+import io.github.yudigaga.taplusbridge.runtime.IRuntimeBridge;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
-import java.lang.reflect.Proxy;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
@@ -47,12 +47,12 @@ public final class HostRecognitionMenuRetentionAndroidTest {
         host.applicationInfo.enabled = true;
         ((ShadowPackageManager) Shadow.extract(context.getPackageManager())).installPackage(host);
         response = new Bundle(); response.putBoolean("keep", true);
-        Class<?> bridge = Class.forName("io.github.yudigaga.taplusbridge.runtime.IRuntimeBridge");
-        Object remote = Proxy.newProxyInstance(bridge.getClassLoader(), new Class<?>[]{bridge}, (target, method, args) -> {
-            if (!"call".equals(method.getName())) return null;
-            assertEquals("recognition_menu_retain", args[0]);
-            requests.add(new Bundle((Bundle) args[1])); return response;
-        });
+        Object remote = new IRuntimeBridge.Stub() {
+            @Override public Bundle call(String method, Bundle request) {
+                assertEquals("recognition_menu_retain", method);
+                requests.add(new Bundle(request)); return response;
+            }
+        };
         installBridge(remote);
     }
 

@@ -33,4 +33,36 @@ public final class SourceScopeGateTest {
         assertThrows(ReflectiveOperationException.class, () -> SourceScopeGate.presentation(
                 SourceScopePolicy.unmanaged(), "com.example.any", () -> { throw new ReflectiveOperationException(); }));
     }
+
+    @Test public void anExactProtectedInteractionAddsOnlyAnAllowlistPreservingVeto() {
+        var scope = SourceScopePolicy.of(SourceScopePolicy.Mode.WHITELIST, Set.of(),
+                Set.of("com.example.allowed"));
+        assertEquals("forbidden", SourceScopeGate.managedPresentation(scope, "com.example.allowed", true));
+        assertEquals("forbidden", SourceScopeGate.managedPresentation(scope, "com.example.other", true));
+    }
+
+    @Test public void unknownInteractionEvidenceLeavesTheExistingManagedDecisionUnchanged() {
+        var scope = SourceScopePolicy.of(SourceScopePolicy.Mode.WHITELIST, Set.of(),
+                Set.of("com.example.allowed"));
+        assertEquals("normal", SourceScopeGate.managedPresentation(scope, "com.example.allowed", false));
+        assertEquals("forbidden", SourceScopeGate.managedPresentation(scope, "com.example.other", false));
+    }
+
+    @Test public void aBlockedSourceDoesNotStartTheBestEffortInteractionQuery() {
+        var scope = SourceScopePolicy.of(SourceScopePolicy.Mode.BLACKLIST, Set.of("com.example.blocked"), Set.of());
+        AtomicInteger queries = new AtomicInteger();
+        assertEquals("forbidden", SourceScopeGate.managedPresentation(scope, "com.example.blocked", () -> {
+            queries.incrementAndGet(); return true;
+        }));
+        assertEquals(0, queries.get());
+    }
+
+    @Test public void unknownQueryResultPreservesAnAllowedManagedPresentation() {
+        var scope = SourceScopePolicy.of(SourceScopePolicy.Mode.BLACKLIST, Set.of(), Set.of());
+        AtomicInteger queries = new AtomicInteger();
+        assertEquals("normal", SourceScopeGate.managedPresentation(scope, "com.example.allowed", () -> {
+            queries.incrementAndGet(); return false;
+        }));
+        assertEquals(1, queries.get());
+    }
 }

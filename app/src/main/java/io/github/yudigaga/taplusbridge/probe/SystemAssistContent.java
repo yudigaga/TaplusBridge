@@ -26,6 +26,7 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
+import java.util.function.BooleanSupplier;
 import java.util.function.Supplier;
 
 /** Optional framework assist data for one already qualified source gesture; never injects input. */
@@ -90,9 +91,11 @@ public final class SystemAssistContent {
         boolean requested, complete;
         long deadline, expires;
         Result result = Result.EMPTY;
-        Run(ScopeCaptureWindow.Snapshot target, RuntimeSnapshot config, long down, long began, long recognitionAt, int device) {
+        volatile BooleanSupplier notRevoked;
+        Run(ScopeCaptureWindow.Snapshot target, RuntimeSnapshot config, long down, long began, long recognitionAt,
+            int device, BooleanSupplier notRevoked) {
             this.target = target; this.config = config; this.down = down; this.began = began; this.recognitionAt = recognitionAt;
-            this.device = device;
+            this.device = device; this.notRevoked=notRevoked;
         }
     }
 
@@ -134,6 +137,12 @@ public final class SystemAssistContent {
 
     public void arm(ScopeCaptureWindow.Snapshot target, RuntimeSnapshot config, long downUptime,
                     long beganElapsed, long recognitionAt, int device) {
+        arm(target,config,downUptime,beganElapsed,recognitionAt,device,()->true);
+    }
+
+    void arm(ScopeCaptureWindow.Snapshot target, RuntimeSnapshot config, long downUptime,
+             long beganElapsed, long recognitionAt, int device, BooleanSupplier notRevoked) {
+        Objects.requireNonNull(notRevoked);
         long now = SystemClock.elapsedRealtime(), uptime = SystemClock.uptimeMillis();
         if (backend == null || !valid(target, config) || downUptime < 0 || downUptime > uptime
                 || beganElapsed < 0 || beganElapsed > now || now - beganElapsed > RESULT_TTL
@@ -141,9 +150,15 @@ public final class SystemAssistContent {
                 || physical != null && (device < 0 || !physical.soleStream(0, device, downUptime))) return;
         Run run;
         synchronized (lock) {
-            if (matchesDown(active, target, config, downUptime) && active.device == device) return;
+            if (matchesDown(active, target, config, downUptime) && active.device == device) {
+                if(active.target==target){
+                    BooleanSupplier previous=active.notRevoked;
+                    active.notRevoked=()->previous.getAsBoolean() && notRevoked.getAsBoolean();
+                }
+                return;
+            }
             if (active != null) active.result = Result.EMPTY;
-            active = run = new Run(target, config, downUptime, beganElapsed, recognitionAt, device);
+            active = run = new Run(target, config, downUptime, beganElapsed, recognitionAt, device, notRevoked);
         }
         worker.postDelayed(() -> request(run), Math.max(0, recognitionAt - now));
         worker.postDelayed(() -> expire(run), Math.max(0, beganElapsed + RESULT_TTL - now));
@@ -187,6 +202,18 @@ public final class SystemAssistContent {
             if (matchesDown(active, target, config, downUptime) && !active.requested) active = null;
         }
     }
+
+    /** Scope veto retires this exact owner, including an already requested or parsed result. */
+    void cancelOwner(ScopeCaptureWindow.Snapshot target, RuntimeSnapshot config, int device, long downUptime) {
+        synchronized (lock) {
+            Run run = active;
+            if (run != null && run.target == target && config != null
+                    && run.config.identity.equals(config.identity) && run.device == device && run.down == downUptime) {
+                run.result = Result.EMPTY;
+                active = null;
+            }
+        }
+    }
     public void cancel() { synchronized (lock) { if (active != null) active.result = Result.EMPTY; active = null; } }
 
     private void request(Run run) {
@@ -199,6 +226,7 @@ public final class SystemAssistContent {
                 run.expires = Math.min(run.began + RESULT_TTL, SystemClock.elapsedRealtime() + RESULT_TTL);
             }
             worker.postDelayed(() -> timeout(run), RESPONSE_TIMEOUT);
+            if(!run.notRevoked.getAsBoolean())return;
             if (!backend.request(run.target, data -> receive(run, data))) finish(run, Result.EMPTY, "unavailable");
             else log("requested");
         } catch (ReflectiveOperationException | RuntimeException unavailable) { finish(run, Result.EMPTY, "unavailable"); }
@@ -249,7 +277,8 @@ public final class SystemAssistContent {
     }
     private boolean live(Run run) {
         long now = SystemClock.elapsedRealtime();
-        return valid(run.target, run.config) && physicalMatches(run) && run.began <= now && now - run.began < RESULT_TTL
+        return run.notRevoked.getAsBoolean() && valid(run.target, run.config) && run.notRevoked.getAsBoolean()
+                && physicalMatches(run) && run.began <= now && now - run.began < RESULT_TTL
                 && (!run.requested || run.complete ? run.expires == 0 || now <= run.expires : now <= run.deadline);
     }
     private boolean physicalMatches(Run run) {

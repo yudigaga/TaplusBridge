@@ -360,8 +360,14 @@ public final class ScopeCaptureWindow {
 
     /** Same guarded transfer with a fixed, content-free failure reason for diagnostics. */
     public TransferResult transferTouchToMaskDetailed(Object atms, Snapshot original, int hostUid, String title) {
+        return transferTouchToMaskDetailed(atms, original, hostUid, title, () -> true);
+    }
+
+    /** Recheck the gesture after window inspection and outside the WMS monitor. */
+    public TransferResult transferTouchToMaskDetailed(Object atms, Snapshot original, int hostUid, String title,
+                                                       BooleanSupplier allowTransfer) {
         try {
-            return transferTouchToMaskChecked(atms, original, hostUid, title);
+            return transferTouchToMaskChecked(atms, original, hostUid, title, allowTransfer);
         } catch (RuntimeException rejected) {
             return TransferResult.failure(checkedWindowReason(rejected.getMessage()));
         } catch (ReflectiveOperationException unavailable) {
@@ -369,8 +375,8 @@ public final class ScopeCaptureWindow {
         }
     }
 
-    private TransferResult transferTouchToMaskChecked(Object atms, Snapshot original, int hostUid, String title)
-            throws ReflectiveOperationException {
+    private TransferResult transferTouchToMaskChecked(Object atms, Snapshot original, int hostUid, String title,
+                                                       BooleanSupplier allowTransfer) throws ReflectiveOperationException {
         if (original == null || original.display != 0 || hostUid < 10000 || hostUid >= 100000
                 || title == null || title.length() > 128) return TransferResult.failure("drag_transfer_request");
         Object service = service(atms), monitor = globalLock.get(service), sourceWindow = original.window;
@@ -413,7 +419,7 @@ public final class ScopeCaptureWindow {
             if (rejected[0] != null) throw rejected[0];
             if (matches[0] != 1 || channels[0] == null || channels[1] == null) throw rejected("drag_mask_missing");
         }
-        return transferInputGestureDetailed(service, channels[0], channels[1]);
+        return transferInputGestureDetailed(service, channels[0], channels[1], allowTransfer);
     }
 
     public static String diagnosticWindowReason(String value) {
@@ -651,13 +657,15 @@ public final class ScopeCaptureWindow {
         catch (NoSuchFieldException ignored) { return null; }
     }
 
-    private static TransferResult transferInputGestureDetailed(Object windowManager, Object from, Object to) {
+    private static TransferResult transferInputGestureDetailed(Object windowManager, Object from, Object to,
+                                                               BooleanSupplier allowTransfer) {
         boolean foundApi = false;
         try {
             Object input = optionalField(windowManager.getClass(), "mInputManager", windowManager);
             Method transfer = input == null ? null : findTransfer(input.getClass(), from, to);
             if (transfer != null) {
                 foundApi = true;
+                if (!allowTransfer.getAsBoolean()) return TransferResult.failure("drag_transfer_veto");
                 if (invokeTransfer(transfer, input, from, to)) return TransferResult.success();
             }
             ClassLoader loader = windowManager.getClass().getClassLoader();
@@ -669,6 +677,7 @@ public final class ScopeCaptureWindow {
                 transfer = internal == null ? null : findTransfer(internal.getClass(), from, to);
                 if (transfer != null) {
                     foundApi = true;
+                    if (!allowTransfer.getAsBoolean()) return TransferResult.failure("drag_transfer_veto");
                     if (invokeTransfer(transfer, internal, from, to)) return TransferResult.success();
                 }
             } catch (ClassNotFoundException | NoSuchMethodException unavailable) { }

@@ -33,6 +33,7 @@ import io.github.yudigaga.taplusbridge.capture.CaptureBroker;
 import io.github.yudigaga.taplusbridge.capture.CaptureLease;
 import io.github.yudigaga.taplusbridge.capture.IntentObservation;
 import io.github.yudigaga.taplusbridge.drag.DragGestureGate;
+import io.github.yudigaga.taplusbridge.drag.DragTrace;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.util.List;
@@ -139,6 +140,18 @@ public final class SystemProbe {
                             }
                             boolean realMainInput = display == 0 && !physical.isInjected(display, readDevice,
                                     motion.getDownTime(), SystemClock.uptimeMillis());
+                            SystemScopeCapture scoped = scopeCapture;
+                            boolean touchscreen = (motion.getSource() & InputDevice.SOURCE_TOUCHSCREEN)
+                                    == InputDevice.SOURCE_TOUCHSCREEN;
+                            long observedMenuEpoch = scoped == null ? 0 : scoped.menuPointerAtHook(realMainInput,
+                                    touchscreen, motion.getActionMasked());
+                            boolean tracePhysical = realMainInput && (motion.getActionMasked() == MotionEvent.ACTION_DOWN
+                                    || motion.getActionMasked() == MotionEvent.ACTION_UP
+                                    || motion.getActionMasked() == MotionEvent.ACTION_CANCEL);
+                            long receivedElapsed = 0, receivedUptime = 0;
+                            if (tracePhysical) {
+                                receivedElapsed = SystemClock.elapsedRealtime(); receivedUptime = SystemClock.uptimeMillis();
+                            }
                             if (realMainInput && motion.getActionMasked() == MotionEvent.ACTION_DOWN) {
                                 DragGestureGate.physicalDown(display, readDevice, motion.getDownTime());
                             }
@@ -151,6 +164,7 @@ public final class SystemProbe {
                                 recordPhysicalTouch(physical, display, readDevice, motion.getDownTime(),
                                         motion.getEventTime(), motion.getActionMasked(), SystemClock.elapsedRealtime(),
                                         SystemClock.uptimeMillis());
+                                if (tracePhysical) logPhysicalEvent(motion, readDevice, receivedElapsed, receivedUptime);
                                 return chain.proceed();
                             }
                             if (realMainInput && motion.getActionMasked() == MotionEvent.ACTION_DOWN) {
@@ -163,15 +177,19 @@ public final class SystemProbe {
                                     motion.getEventTime(), motion.getActionMasked(), SystemClock.elapsedRealtime(),
                                     SystemClock.uptimeMillis());
                             boolean dragging = DragGestureGate.suppressLongPress();
-                            SystemScopeCapture scoped = scopeCapture;
-                            if (directional != null && (motion.getSource() & InputDevice.SOURCE_TOUCHSCREEN) == InputDevice.SOURCE_TOUCHSCREEN
-                                    && !physical.isInjected(display, readDevice, motion.getDownTime(), SystemClock.uptimeMillis()))
+                            boolean sourceTouch = touchscreen
+                                    && !physical.isInjected(display, readDevice, motion.getDownTime(), SystemClock.uptimeMillis());
+                            boolean soleNow = sourceTouch && physical.soleStream(display, readDevice, motion.getDownTime());
+                            boolean down = motion.getActionMasked() == MotionEvent.ACTION_DOWN;
+                            // Publish the recording owner before drag can prepare this same DOWN.
+                            if (scoped != null && sourceTouch && down)
+                                scoped.pointer(motion, display, soleNow, observedMenuEpoch);
+                            if (directional != null && sourceTouch)
                                 directional.pointer(motion, display, motion.getActionMasked() == MotionEvent.ACTION_UP
                                         ? soleBefore && physical.released()
-                                        : physical.soleStream(display, readDevice, motion.getDownTime()));
-                            if (scoped != null && (motion.getSource() & InputDevice.SOURCE_TOUCHSCREEN) == InputDevice.SOURCE_TOUCHSCREEN
-                                    && !physical.isInjected(display, readDevice, motion.getDownTime(), SystemClock.uptimeMillis()))
-                                scoped.pointer(motion, display, physical.soleStream(display, readDevice, motion.getDownTime()));
+                                        : soleNow);
+                            if (scoped != null && sourceTouch && !down)
+                                scoped.pointer(motion, display, soleNow, observedMenuEpoch);
                             Session waiting = session;
                             if (dragging && waiting != null) {
                                 worker.post(() -> fail(waiting, "dragging"));
@@ -182,10 +200,13 @@ public final class SystemProbe {
                             if (realMainInput && motion.getActionMasked() == MotionEvent.ACTION_UP
                                     && (directional == null || !directional.transferred()))
                                 DragGestureGate.physicalInputUp();
+                            if (tracePhysical) logPhysicalEvent(motion, readDevice, receivedElapsed, receivedUptime);
                         }
                     } catch (Throwable unreadable) {
                         if (readDevice == null) physical.unknown();
                         else physical.uncertainDevice(readDevice, SystemClock.uptimeMillis());
+                        SystemScopeCapture scoped = scopeCapture;
+                        if (scoped != null) scoped.menuInputUnknown();
                         if (physicalReadFailureReported.compareAndSet(false, true)) {
                             String type = unreadable instanceof java.lang.reflect.InvocationTargetException ? "InvocationTargetException"
                                     : unreadable instanceof ReflectiveOperationException ? "ReflectiveOperationException"
@@ -213,6 +234,7 @@ public final class SystemProbe {
         }
         try {
             scopeCapture = new SystemScopeCapture(module, worker, () -> system, () -> atmsInstance, () -> runtime, atms, physical);
+            if (longPressDrag != null) longPressDrag.setRecordingGuard(scopeCapture::protectsDrag);
             scopeCapture.setMenuNavigationGuardReady(MenuKeyInputHooks.install(module,loader,()->scopeCapture));
             module.log(4, TAG, "Scope capture system hooks installed");
         } catch (ReflectiveOperationException | RuntimeException unavailable) {
@@ -352,6 +374,7 @@ public final class SystemProbe {
                                     long dismissAt = SystemClock.uptimeMillis();
                                     boolean sent = false;
                                     try {
+                                        scopeCapture.validateLinkTargetBehind(target, hostUid());
                                         sent = adapter.injectTarget(target.uid, target.display, planned.dismissX(),
                                                 planned.dismissY(), MotionEvent.ACTION_DOWN, dismissAt);
                                         if (!sent) throw new IllegalStateException("input_failed");
@@ -366,6 +389,7 @@ public final class SystemProbe {
                                         throw new IllegalStateException("popup_not_dismissed");
                                     scopeCapture.validateLinkTargetBehind(target, hostUid());
                                 }
+                                scopeCapture.validateLinkTargetBehind(target, hostUid());
                             }
                             return adapter.injectTarget(target.uid, target.display, target.x, target.y, action, downAt);
                         },
@@ -687,6 +711,16 @@ public final class SystemProbe {
         if (failure instanceof SourceWindowAccess.Unavailable) return "window_unavailable";
         return fallback;
     }
+    private void logPhysicalEvent(MotionEvent motion, int device, long receivedElapsed, long receivedUptime) {
+        try {
+            DragTrace trace = new DragTrace(device, motion.getDownTime(),
+                    receivedElapsed - Math.max(0, receivedUptime - motion.getDownTime()));
+            module.log(4, TAG, "drag delivery stage=physical_event" + trace.fields(receivedElapsed)
+                    + " action=" + motion.getActionMasked() + " input_delivery_ms="
+                    + Math.max(0, receivedUptime - motion.getEventTime()));
+        } catch (RuntimeException ignored) { }
+    }
+
     static void recordPhysicalTouch(PhysicalTouchState physical, int display, int device, long downAt,
                                     long eventAt, int action, long nowElapsed, long nowUptime) {
         physical.event(display, device, downAt, eventAt, action, nowUptime);

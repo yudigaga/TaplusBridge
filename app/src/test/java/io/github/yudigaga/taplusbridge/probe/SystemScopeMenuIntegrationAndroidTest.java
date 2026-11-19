@@ -14,6 +14,7 @@ import android.os.PowerManager;
 import android.os.SystemClock;
 import android.os.UserManager;
 import android.provider.Settings;
+import android.view.InputDevice;
 import android.view.MotionEvent;
 import android.view.WindowManager;
 import io.github.yudigaga.taplusbridge.hook.HostRecognitionMenuHooksAndroidTest.FakeSplash;
@@ -27,10 +28,10 @@ import io.github.yudigaga.taplusbridge.config.DragSettings;
 import io.github.yudigaga.taplusbridge.config.SourceScopePolicy;
 import io.github.yudigaga.taplusbridge.runtime.RuntimeServer;
 import io.github.yudigaga.taplusbridge.runtime.RuntimeSnapshot;
+import io.github.yudigaga.taplusbridge.runtime.IRuntimeBridge;
 import java.time.Duration;
 import java.util.List;
 import java.lang.reflect.Method;
-import java.lang.reflect.Proxy;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -99,8 +100,9 @@ public final class SystemScopeMenuIntegrationAndroidTest {
 
     private void bridge(boolean connected) throws Exception {
         Class<?> type=Class.forName("io.github.yudigaga.taplusbridge.runtime.IRuntimeBridge");
-        Object remote=connected?Proxy.newProxyInstance(type.getClassLoader(),new Class<?>[]{type},(owner,method,args)->
-                method.getName().equals("call")?runtime.handle(HOST_UID,(String)args[0],(Bundle)args[1]):null):null;
+        Object remote=connected?new IRuntimeBridge.Stub(){
+            @Override public Bundle call(String method,Bundle request){return runtime.handle(HOST_UID,method,request);}
+        }:null;
         Method setter=Class.forName("io.github.yudigaga.taplusbridge.runtime.RuntimeClient").getDeclaredMethod("testBridge",type);
         setter.setAccessible(true);setter.invoke(null,remote);
     }
@@ -149,6 +151,8 @@ public final class SystemScopeMenuIntegrationAndroidTest {
         physical.event(0,0,down,now,action,now);
         if (action == MotionEvent.ACTION_UP) physical.markReleasedElapsed(SystemClock.elapsedRealtime());
         MotionEvent event = MotionEvent.obtain(down,now,action,x,y,0);
+        event.setSource(InputDevice.SOURCE_TOUCHSCREEN);
+        assertEquals(InputDevice.SOURCE_TOUCHSCREEN,event.getSource());
         try { capture.pointer(event,0,true); } finally { event.recycle(); }
         ShadowLooper.idleMainLooper();
     }
@@ -171,7 +175,7 @@ public final class SystemScopeMenuIntegrationAndroidTest {
         return runtime.handle(HOST_UID,"recognition_visible",shown);
     }
 
-    @Test public void nativePhaseVisibilityWaitsUntilTheExactModuleRecognitionDeadline() {
+    @Test public void nativePhaseVisibilityWaitsForAReleaseAtTheModuleRecognitionDeadline() {
         pointer(MotionEvent.ACTION_DOWN);
         ShadowSystemClock.advanceBy(Duration.ofMillis(101));
         var callback = newMenu();
@@ -181,7 +185,11 @@ public final class SystemScopeMenuIntegrationAndroidTest {
         ShadowLooper.idleMainLooper(98,java.util.concurrent.TimeUnit.MILLISECONDS);
         assertEquals("the module recognition stage has not started at 199 ms",0,callback.calls);
         ShadowLooper.idleMainLooper(1,java.util.concurrent.TimeUnit.MILLISECONDS);
-        assertEquals("the same early card closes the menu at the 200 ms recognition boundary",1,callback.calls);
+        assertEquals("reaching recognition while still held must preserve the source menu",0,callback.calls);
+        pointer(MotionEvent.ACTION_UP);
+        assertEquals("the same early card may close the menu after a validated 200 ms release",1,callback.calls);
+        ShadowLooper.idleMainLooper(2_000,java.util.concurrent.TimeUnit.MILLISECONDS);
+        assertEquals(1,callback.calls);
     }
 
     @Test public void aNativePhaseReleaseCannotAuthorizeALaterRecognitionNotification() {
@@ -213,6 +221,8 @@ public final class SystemScopeMenuIntegrationAndroidTest {
         physical.event(0,0,down,releasedUptime,MotionEvent.ACTION_UP,releasedUptime);
         physical.markReleasedElapsed(SystemClock.elapsedRealtime());
         MotionEvent up = MotionEvent.obtain(down,releasedUptime,MotionEvent.ACTION_UP,50,200,0);
+        up.setSource(InputDevice.SOURCE_TOUCHSCREEN);
+        assertEquals(InputDevice.SOURCE_TOUCHSCREEN,up.getSource());
         try {
             if (queuedBeforeDeadline) capture.pointer(up,0,true);
             ShadowSystemClock.advanceBy(Duration.ofMillis(2));
@@ -224,21 +234,23 @@ public final class SystemScopeMenuIntegrationAndroidTest {
         } finally { up.recycle(); }
     }
 
-    @Test public void firstRecognitionVisibilityAtTheDragDeadlineCanCloseTheSourceMenu() {
+    @Test public void firstRecognitionVisibilityAtTheDragDeadlineStillWaitsForRelease() {
         pointer(MotionEvent.ACTION_DOWN);
         ShadowSystemClock.advanceBy(Duration.ofMillis(300));
         var callback = newMenu();
         assertTrue(visible(SystemClock.elapsedRealtime()).getBoolean("accepted"));
         ShadowLooper.idleMainLooper();
-        assertEquals("the 300 ms drag stage has already reached module recognition",1,callback.calls);
+        assertEquals("the drag deadline cannot authorize closing a held source menu",0,callback.calls);
+        pointer(MotionEvent.ACTION_UP);
+        assertEquals("a validated release after recognition may close the source menu",1,callback.calls);
     }
 
-    @Test public void actualPointerAndHostVisibilityCloseTheNewMenuWhileTheFingerIsStillHeld() {
+    @Test public void actualPointerAndHostVisibilityWaitForTheValidatedFinalUp() {
         pointer(MotionEvent.ACTION_DOWN);
         ShadowSystemClock.advanceBy(Duration.ofMillis(201));
         var callback = newMenu();
         assertTrue(visible(SystemClock.elapsedRealtime()).getBoolean("accepted"));
-        ShadowLooper.idleMainLooper(); assertEquals("a visible recognition card must replace the new menu immediately",1,callback.calls);
+        ShadowLooper.idleMainLooper(); assertEquals("a visible card cannot close a menu while the finger is still held",0,callback.calls);
         pointer(MotionEvent.ACTION_UP);
         assertEquals(1,callback.calls);
         assertFalse(visible(SystemClock.elapsedRealtime()).getBoolean("accepted"));
@@ -274,7 +286,8 @@ public final class SystemScopeMenuIntegrationAndroidTest {
         var callback=newMenu();atms.mWindowManager.mRoot.display.mCurrentFocus.backInfo.priority=1_000_000;
         long shown=SystemClock.elapsedRealtime();FakeSplash splash=hostShown(shown);
         FakeResult original=FakeService.mCatcherResult;
-        assertTrue(visible(shown).getBoolean("accepted"));ShadowLooper.idleMainLooper();assertEquals(1,callback.calls);
+        assertTrue(visible(shown).getBoolean("accepted"));ShadowLooper.idleMainLooper();assertEquals(0,callback.calls);
+        pointer(MotionEvent.ACTION_UP);assertEquals(1,callback.calls);
         FakeCallback hostCallback=ReflectionHelpers.callConstructor(FakeCallback.class,ClassParameter.from(FakeService.class,splash.mService));
         assertTrue(deliverControl(hostCallback,backControl()));
         assertSame(original,FakeService.mCatcherResult);assertFalse(FakeService.sIsTaskFinished);
@@ -284,7 +297,8 @@ public final class SystemScopeMenuIntegrationAndroidTest {
     @Test public void aRealKeyAfterModuleMenuCloseCannotBeSwallowedAsItsEcho() throws Exception {
         pointer(MotionEvent.ACTION_DOWN);ShadowSystemClock.advanceBy(Duration.ofMillis(201));
         var callback=newMenu();long shown=SystemClock.elapsedRealtime();FakeSplash splash=hostShown(shown);
-        assertTrue(visible(shown).getBoolean("accepted"));ShadowLooper.idleMainLooper();assertEquals(1,callback.calls);
+        assertTrue(visible(shown).getBoolean("accepted"));ShadowLooper.idleMainLooper();assertEquals(0,callback.calls);
+        pointer(MotionEvent.ACTION_UP);assertEquals(1,callback.calls);
         capture.newKeyInput();
         FakeCallback hostCallback=ReflectionHelpers.callConstructor(FakeCallback.class,ClassParameter.from(FakeService.class,splash.mService));
         assertFalse(deliverControl(hostCallback,backControl()));assertTrue(FakeService.sIsTaskFinished);
@@ -294,6 +308,7 @@ public final class SystemScopeMenuIntegrationAndroidTest {
         capture.setMenuNavigationGuardReady(false);
         pointer(MotionEvent.ACTION_DOWN);ShadowSystemClock.advanceBy(Duration.ofMillis(201));
         var callback=newMenu();assertTrue(visible(SystemClock.elapsedRealtime()).getBoolean("accepted"));
+        pointer(MotionEvent.ACTION_UP);
         ShadowLooper.idleMainLooper();assertEquals(0,callback.calls);
     }
 }

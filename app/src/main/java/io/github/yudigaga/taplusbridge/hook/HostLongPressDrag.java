@@ -22,6 +22,7 @@ import io.github.yudigaga.taplusbridge.config.RecognitionChannels.Channel;
 import io.github.yudigaga.taplusbridge.capture.IntentObservation;
 import io.github.yudigaga.taplusbridge.drag.RainbowDragView;
 import io.github.yudigaga.taplusbridge.drag.EdgeDragTarget;
+import io.github.yudigaga.taplusbridge.drag.DragTrace;
 import io.github.yudigaga.taplusbridge.runtime.BridgeTransport;
 import io.github.yudigaga.taplusbridge.runtime.RuntimeClient;
 import io.github.yudigaga.taplusbridge.runtime.CaptureIo;
@@ -44,6 +45,15 @@ import java.util.regex.Pattern;
 
 /** Prepares one drag from native picks or a system gesture while original native picks continue. */
 final class HostLongPressDrag {
+    private static final ThreadLocal<DragTrace> deliveryTrace = new ThreadLocal<>();
+    static DragTrace deliveringTrace() {
+        DragTrace trace = deliveryTrace.get(); return trace == null ? DragTrace.unavailable() : trace;
+    }
+    static void deliverTraced(DragTrace trace, Runnable delivery) {
+        DragTrace previous = deliveryTrace.get(); deliveryTrace.set(trace);
+        try { delivery.run(); }
+        finally { if (previous == null) deliveryTrace.remove(); else deliveryTrace.set(previous); }
+    }
     interface Delivery { void accept(Context context, Object service, String token, Object nativeResult); }
     private static final long TIMEOUT = 30_000;
     private static final String NUMBER = "(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?";
@@ -99,6 +109,7 @@ final class HostLongPressDrag {
         String text;
         Bitmap image;
         final String source, token, identity;
+        final DragTrace trace;
         final float originX, originY, width, height, density;
         RainbowDragView preview;
         WindowManager windows;
@@ -124,6 +135,7 @@ final class HostLongPressDrag {
             this.service = service; this.nativePick = result; this.result = result; this.text = text; this.image = image;
             this.recognitionAt = lease.recognitionAt();
             source = lease.source; token = lease.token; identity = lease.identity;
+            trace = lease.trace();
             originX = lease.originX(); originY = lease.originY(); width = lease.width();
             height = lease.height(); density = lease.density();
             canonicalPayload = result == null;
@@ -134,7 +146,8 @@ final class HostLongPressDrag {
     record Lease(String token, String source, String identity, String state, float x, float y,
                  float originX, float originY, String direction, String action,
                  float width, float height, float density, Map<String, String> actions, boolean dragging,
-                 String cardLink, long nativeAt, long recognitionAt, long dragAt, boolean linkProbe, boolean linkComplete) {
+                 String cardLink, long nativeAt, long recognitionAt, long dragAt, boolean linkProbe, boolean linkComplete,
+                 DragTrace trace) {
         boolean recognitionReady(long now) { return now >= recognitionAt; }
         boolean dragReady(long now) { return now >= dragAt; }
     }
@@ -581,7 +594,13 @@ final class HostLongPressDrag {
                 try (ParcelFileDescriptor fd = image == null ? null
                         : ParcelFileDescriptor.open(image, ParcelFileDescriptor.MODE_READ_ONLY)) {
                     if (fd != null) request.putParcelable("fd", fd);
-                    response = BridgeTransport.call(held.context, "drag_import", request);
+                    long importBegan = SystemClock.elapsedRealtime();
+                    try { response = BridgeTransport.call(held.context, "drag_import", request); }
+                    finally {
+                        long importMillis = Math.max(0, SystemClock.elapsedRealtime() - importBegan);
+                        if (module != null) module.log(4, "TaplusBridge", "drag delivery stage=native_import"
+                                + held.trace.fields(SystemClock.elapsedRealtime()) + " ipc_ms=" + importMillis);
+                    }
                 }
                 String token = response == null ? null : response.getString("token");
                 if (validToken(token)) {
@@ -596,7 +615,8 @@ final class HostLongPressDrag {
                                 discard(held); return;
                             }
                             if (finish(held)) try {
-                                delivery.accept(held.context, held.service, token, held.canonicalPayload ? null : held.result);
+                                deliverTraced(held.trace, () -> delivery.accept(held.context, held.service, token,
+                                        held.canonicalPayload ? null : held.result));
                             }
                             catch (RuntimeException unavailable) { event("delivery_failed", unavailable.getClass().getSimpleName()); }
                         }
@@ -838,7 +858,7 @@ final class HostLongPressDrag {
             return new Lease(token, source, identity, state, x, y, originX, originY, direction, action,
                     width, height, density, Map.copyOf(actions), response.getBoolean("dragging"),
                     response.getString("card_link"), nativeAt, recognitionAt, dragAt, response.getBoolean("link_probe"),
-                    response.getBoolean("link_complete"));
+                    response.getBoolean("link_complete"), DragTrace.read(response));
         } catch (RuntimeException invalid) { return null; }
     }
 

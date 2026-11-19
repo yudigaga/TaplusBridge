@@ -980,9 +980,10 @@ public final class ScopeCaptureWindowAndroidTest {
         Object layer = new Object(); boolean showing = true; final List<Window> descendants = new ArrayList<>();
         long surfaceGeneration;
         FakeBackInfo backInfo; int backReads; Runnable beforeBackRead = () -> {}; RuntimeException backFailure;
+        Runnable beforeVisibilityCheck = () -> {};
         Window() { mAttrs.type = 1; mAttrs.packageName = SOURCE; mAttrs.flags = 0; }
         Rect getFrame() { return bounds; } Window getParentWindow() { return parent; }
-        boolean isVisible() { return showing; }
+        boolean isVisible() { beforeVisibilityCheck.run(); return showing; }
         FakeBackInfo getOnBackInvokedCallbackInfo() {
             if (backFailure != null) throw backFailure;
             backReads++; beforeBackRead.run(); return backInfo;

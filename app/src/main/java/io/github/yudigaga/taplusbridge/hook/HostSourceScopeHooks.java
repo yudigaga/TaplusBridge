@@ -15,6 +15,7 @@ import io.github.libxposed.api.XposedModule;
 import io.github.yudigaga.taplusbridge.config.SourceScopePolicy;
 import io.github.yudigaga.taplusbridge.BuildConfig;
 import io.github.yudigaga.taplusbridge.runtime.BridgeTransport;
+import io.github.yudigaga.taplusbridge.runtime.RuntimeClient;
 import io.github.yudigaga.taplusbridge.runtime.RuntimeSnapshot;
 import io.github.yudigaga.taplusbridge.runtime.SourceScopePublisher;
 import java.lang.reflect.Field;
@@ -137,11 +138,13 @@ public final class HostSourceScopeHooks {
                             diagnostic("host_gate", "unmanaged", policy, source);
                             return chain.proceed();
                         }
-                        boolean denied = !policy.allows(source);
+                        String decision = SourceScopeGate.managedPresentation(policy, source,
+                                () -> presentationPolicy.reached() && queryProtectedInteraction(context, source, chain, policy));
+                        boolean denied = "forbidden".equals(decision);
                         forbidden.setBoolean(chain.getThisObject(), denied);
                         diagnostic("host_gate", denied ? "denied" : "allowed", policy, source);
                         // Managed scope replaces the old app, Activity and touch-area restriction table.
-                        return SourceScopeGate.managedPresentation(policy, source);
+                        return decision;
                     } catch (ReflectiveOperationException | RuntimeException failure) {
                         diagnostic("host_gate", "unavailable", null, source);
                         report(failure); forbidden.setBoolean(chain.getThisObject(), true); return "forbidden";
@@ -169,6 +172,54 @@ public final class HostSourceScopeHooks {
 
     private SourceScopePolicy policy(Context context) {
         return presentationPolicy.read(() -> readPolicy(context));
+    }
+
+    static Bundle recordingRiskRequest(String source, XposedInterface.Chain chain) {
+        String activity = (String) chain.getArg(2);
+        if (source == null || activity == null) return null;
+        Bundle request = new Bundle();
+        request.putString("source", source);
+        request.putString("activity", activity);
+        return request;
+    }
+
+    private boolean queryProtectedInteraction(Context context, String source, XposedInterface.Chain chain,
+                                              SourceScopePolicy policy) {
+        boolean pointPresent = chain.getArg(3) instanceof Point;
+        Bundle request = recordingRiskRequest(source, chain);
+        if (request == null) {
+            diagnostic("recording_risk", pointOutcome("request_invalid", pointPresent), policy, source);
+            return false;
+        }
+        try {
+            RuntimeClient.CallResult result = RuntimeClient.callScopeRecordingRisk(context, request);
+            String outcome;
+            boolean protectedInteraction = false;
+            if (result == null) {
+                outcome = "unknown";
+            } else if (result.state() == RuntimeClient.CallState.NOT_CONNECTED) {
+                outcome = "not_connected";
+            } else if (result.state() != RuntimeClient.CallState.REPLIED) {
+                outcome = "unknown";
+            } else if (result.response() != null && result.response().isEmpty()) {
+                outcome = "no_positive_evidence";
+            } else if (result.response() == null || result.response().size() != 1
+                    || !(result.response().get("protected") instanceof Boolean)) {
+                outcome = "invalid_reply";
+            } else {
+                protectedInteraction = result.response().getBoolean("protected");
+                outcome = protectedInteraction ? "protected" : "not_protected";
+            }
+            diagnostic("recording_risk", pointOutcome(outcome, pointPresent), policy, source);
+            return protectedInteraction;
+        } catch (RuntimeException unavailable) {
+            diagnostic("recording_risk", pointOutcome("unavailable", pointPresent), policy, source);
+            return false;
+        }
+    }
+
+    private static String pointOutcome(String outcome, boolean pointPresent) {
+        return outcome + (pointPresent ? "_point_present" : "_point_missing");
     }
 
     private SourceScopePolicy readPolicy(Context context) {
@@ -224,9 +275,11 @@ public final class HostSourceScopeHooks {
         module.log(5, "TaplusBridge", "Source app scope preserved published state: " + failure.getClass().getSimpleName());
     }
     private void diagnostic(String stage, String outcome, SourceScopePolicy policy, String source) {
-        module.log(4, "TaplusBridge", "source scope stage=" + stage + " outcome=" + outcome
-                + " mode=" + (policy == null ? "UNKNOWN" : policy.mode.name())
-                + " source=" + sourceKind(source));
+        try {
+            module.log(4, "TaplusBridge", "source scope stage=" + stage + " outcome=" + outcome
+                    + " mode=" + (policy == null ? "UNKNOWN" : policy.mode.name())
+                    + " source=" + sourceKind(source));
+        } catch (RuntimeException ignored) { }
     }
     private static String sourceKind(String source) {
         if (source == null) return "unknown";

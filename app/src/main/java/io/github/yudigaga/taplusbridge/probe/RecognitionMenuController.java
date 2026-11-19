@@ -62,6 +62,14 @@ public final class RecognitionMenuController {
 
     public void cancel() { onWorker(this::clear); }
 
+    /** A queued input revocation must leave a later gesture's candidate intact. */
+    public void cancelStale() {
+        onWorker(() -> {
+            Candidate candidate = current;
+            if (candidate != null && candidate.input != inputGeneration.getAsLong()) clear();
+        });
+    }
+
     /** Authentication stays at the Binder boundary; this only matches its gesture lease. */
     public boolean shown(String source, long shownElapsed) {
         Candidate candidate = current;
@@ -86,7 +94,7 @@ public final class RecognitionMenuController {
                 ? shown.shownElapsed : -1;
     }
 
-    /** A validated held stream or stable UP may wake the observer before its next poll. */
+    /** A fully validated UP may wake the observer before its next poll. */
     public void released() { onWorker(this::check); }
 
     private void check() {
@@ -128,7 +136,8 @@ public final class RecognitionMenuController {
                 || SystemClock.elapsedRealtime() - candidate.began >= MAX_AGE) return false;
         RuntimeSnapshot latest = configuration.get();
         return latest != null && latest.usable() && latest.enabled && latest.recognition
-                && latest.identity.equals(candidate.config.identity) && latest.sourceScope.allows(candidate.target.source);
+                && latest.identity.equals(candidate.config.identity) && latest.sourceScope.allows(candidate.target.source)
+                && current == candidate && inputGeneration.getAsLong() == candidate.input;
     }
 
     private void finish(String outcome) {

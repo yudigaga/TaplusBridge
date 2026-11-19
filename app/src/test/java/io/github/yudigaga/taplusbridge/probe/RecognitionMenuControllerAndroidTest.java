@@ -79,7 +79,7 @@ public final class RecognitionMenuControllerAndroidTest {
                     if (method.getDeclaringClass() == Object.class) return null;
                     attempts.add((ScopeCaptureWindow.Snapshot) arguments[0]);
                     BooleanSupplier current = (BooleanSupplier) arguments[1];
-                    assertTrue("Dismissal boundary starts with current, validated touch", current.getAsBoolean());
+                    assertTrue("Dismissal boundary starts with a current, release-authorized gesture", current.getAsBoolean());
                     duringClose.accept(current);
                     return outcome;
                 });
@@ -132,6 +132,7 @@ public final class RecognitionMenuControllerAndroidTest {
     }
 
     private void validateTouch() throws Exception {
+        // This synthetic gate tests controller scheduling; installed-Hook tests establish physical UP eligibility.
         touchValidated.set(true);
         call("released", new Class<?>[0]);
         ShadowLooper.idleMainLooper();
@@ -181,13 +182,30 @@ public final class RecognitionMenuControllerAndroidTest {
         assertTrue(attempts.isEmpty());
     }
 
-    @Test public void visibleUiClosesTheOriginalCandidateOnceWhileItsHeldTouchRemainsValidated() throws Exception {
+    @Test public void visibleUiClosesTheOriginalCandidateOnceAfterReleaseValidation() throws Exception {
         touchValidated.set(true);
         assertTrue(visible());
         assertTrue("Binder visibility notification must only enqueue the close", attempts.isEmpty());
         ShadowLooper.idleMainLooper();
         assertEquals(1, attempts.size());
         assertSame(target, attempts.get(0));
+        advance(5_000);
+        assertEquals(1, attempts.size());
+    }
+
+    @Test public void aVisibleHeldCandidateWaitsUntilItsReleaseIsAuthorized() throws Exception {
+        advance(100);
+        assertTrue(shown(SOURCE, SystemClock.elapsedRealtime()));
+        ShadowLooper.idleMainLooper();
+        assertTrue(attempts.isEmpty());
+        advance(399);
+        assertTrue(attempts.isEmpty());
+        advance(1);
+        assertTrue("Recognition alone cannot authorize a held candidate", attempts.isEmpty());
+        advance(2_000);
+        assertTrue("Polling must keep waiting for the final release authorization", attempts.isEmpty());
+        validateTouch();
+        assertEquals(1, attempts.size());
         advance(5_000);
         assertEquals(1, attempts.size());
     }
@@ -298,6 +316,44 @@ public final class RecognitionMenuControllerAndroidTest {
         assertTrue(visible());
         ShadowLooper.idleMainLooper();
         assertEquals(1, attempts.size());
+    }
+
+    @Test public void staleCancellationQueuedBeforeANewCandidateCannotClearThatCandidate() throws Exception {
+        input.incrementAndGet();
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        Thread cancellation = new Thread(() -> {
+            try { call("cancelStale", new Class<?>[0]); }
+            catch (Throwable error) { failure.set(error); }
+        });
+        cancellation.setDaemon(true);
+        cancellation.start(); cancellation.join(2_000);
+        assertFalse(cancellation.isAlive());
+        if (failure.get() != null) throw new AssertionError(failure.get());
+        long replacementInput = input.incrementAndGet();
+        began = nativeAt = readyAt = SystemClock.elapsedRealtime();
+        new Handler(Looper.getMainLooper()).postAtFrontOfQueue(() -> {
+            try {
+                call("begin", new Class<?>[]{ScopeCaptureWindow.Snapshot.class, RuntimeSnapshot.class,
+                        long.class, long.class, long.class, long.class}, target, configuration.get(),
+                        began, nativeAt, readyAt, replacementInput);
+            } catch (Exception error) { throw new AssertionError(error); }
+        });
+        ShadowLooper.idleMainLooper();
+        touchValidated.set(true);
+        assertTrue(shown(SOURCE, SystemClock.elapsedRealtime()));
+        ShadowLooper.idleMainLooper();
+        assertEquals("Only the replacement candidate may close", 1, attempts.size());
+    }
+
+    @Test public void staleCancellationClearsTheOldVisibleCandidate() throws Exception {
+        assertTrue(visible());
+        ShadowLooper.idleMainLooper();
+        input.incrementAndGet();
+        call("cancelStale", new Class<?>[0]);
+        ShadowLooper.idleMainLooper();
+        assertEquals(-1L, (long) (Long) call("shownElapsed",
+                new Class<?>[]{ScopeCaptureWindow.Snapshot.class}, target));
+        assertTrue(attempts.isEmpty());
     }
 
     @Test public void duplicateVisibilityCannotResendATerminalDismissal() throws Exception {

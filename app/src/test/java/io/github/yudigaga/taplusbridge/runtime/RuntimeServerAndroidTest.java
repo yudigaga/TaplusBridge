@@ -714,8 +714,155 @@ public final class RuntimeServerAndroidTest {
         assertEquals(1,capture.retentionClaims);
     }
 
+    @Test public void configurationIdentityChangesInvalidateRetentionBeforeDisabledGateAndSnapshotPublication() {
+        assertTrue(config.saveSourceScope(SourceScopePolicy.Mode.BLACKLIST,List.of(),List.of(),true));publish();
+        String originalRaw=stored.getString(RuntimeSnapshot.KEY,null);
+        FakeSourceCapture capture=new FakeSourceCapture();server.setSourceCapture(capture);
+        RuntimeSnapshot original=server.sourceCaptureConfiguration();assertNotNull(original);
+        Bundle request=recognitionRetentionRequest();
+        assertTrue(server.handle(HOST_UID,"recognition_menu_retain",request).getBoolean("keep"));
+        assertEquals(1,capture.retentionClaims);assertEquals(0,capture.retentionInvalidations);
+
+        config.setEnabled(false);publish();
+        capture.onRetentionInvalidation=()->assertSame(original,cachedSnapshot());
+        assertFalse(server.handle(HOST_UID,"recognition_menu_retain",request).getBoolean("keep"));
+        assertEquals(1,capture.retentionInvalidations);assertEquals(1,capture.retentionClaims);
+        RuntimeSnapshot disabled=cachedSnapshot();assertNotNull(disabled);assertFalse(disabled.enabled);
+        assertNotEquals(original.identity,disabled.identity);
+
+        stored.edit().putString(RuntimeSnapshot.KEY,originalRaw).commit();
+        capture.onRetentionInvalidation=()->assertSame(disabled,cachedSnapshot());
+        assertTrue(server.handle(HOST_UID,"recognition_menu_retain",request).getBoolean("keep"));
+        assertEquals(2,capture.retentionInvalidations);assertEquals(2,capture.retentionClaims);
+        assertEquals(original.identity,capture.lastConfig.identity);
+    }
+
+    @Test public void sameRawSnapshotCacheHitsDoNotInvalidateRecognitionRetention() {
+        assertTrue(config.saveSourceScope(SourceScopePolicy.Mode.BLACKLIST,List.of(),List.of(),true));publish();
+        FakeSourceCapture capture=new FakeSourceCapture();server.setSourceCapture(capture);
+        RuntimeSnapshot original=server.sourceCaptureConfiguration();assertNotNull(original);
+        Bundle request=recognitionRetentionRequest();
+        assertTrue(server.handle(HOST_UID,"recognition_menu_retain",request).getBoolean("keep"));
+        stored.edit().putString(RuntimeSnapshot.KEY,original.encode()).commit();
+        assertSame(original,server.sourceCaptureConfiguration());
+        assertSame(original,server.sourceContentConfiguration());
+        assertTrue(server.handle(HOST_UID,"recognition_menu_retain",request).getBoolean("keep"));
+        assertEquals(2,capture.retentionClaims);assertEquals(0,capture.retentionInvalidations);
+    }
+
+    @Test public void unauthorizedRecognitionRetentionDoesNotReadConfigurationOrInvalidate() {
+        assertTrue(config.saveSourceScope(SourceScopePolicy.Mode.BLACKLIST,List.of(),List.of(),true));publish();
+        int[] preferenceReads={0};
+        server=new RuntimeServer(context,new Handler(Looper.getMainLooper()),()->{preferenceReads[0]++;return stored;},s->{});
+        FakeSourceCapture capture=new FakeSourceCapture();server.setSourceCapture(capture);
+        Bundle request=recognitionRetentionRequest();
+        assertTrue(server.handle(HOST_UID,"recognition_menu_retain",request).getBoolean("keep"));
+        int readsBeforeUnauthorized=preferenceReads[0];
+        config.setEnabled(false);publish();
+        for(int uid:new int[]{MODULE_UID,22001,121001,1000,0}) {
+            assertEquals("unauthorized",server.handle(uid,"recognition_menu_retain",request).getString("reason"));
+            assertEquals(readsBeforeUnauthorized,preferenceReads[0]);
+            assertEquals(0,capture.retentionInvalidations);assertEquals(1,capture.retentionClaims);
+        }
+        assertNull(server.sourceCaptureConfiguration());
+        assertEquals(1,capture.retentionInvalidations);assertEquals(1,capture.retentionClaims);
+    }
+
+    @Test public void malformedRecognitionRetentionEchoesDoNotConsumeOrInvalidateCurrentConfiguration() {
+        assertTrue(config.saveSourceScope(SourceScopePolicy.Mode.BLACKLIST,List.of(TARGET),List.of(),true));publish();
+        FakeSourceCapture capture=new FakeSourceCapture();server.setSourceCapture(capture);
+        assertNotNull(server.sourceCaptureConfiguration());
+        Bundle request=recognitionRetentionRequest();
+        Bundle blockedSource=new Bundle(request);blockedSource.putString("source",TARGET);
+        Bundle malformedActivity=new Bundle(request);malformedActivity.putString("activity",SOURCE+"/MainActivity");
+        Bundle wrongShownType=new Bundle(request);wrongShownType.putInt("shown_elapsed",0);
+        Bundle futureShown=new Bundle(request);futureShown.putLong("shown_elapsed",android.os.SystemClock.elapsedRealtime()+1);
+        Bundle extra=new Bundle(request);extra.putString("token","not-authority");
+        for(Bundle invalid:List.of(blockedSource,malformedActivity,wrongShownType,futureShown,extra)) {
+            assertFalse(server.handle(HOST_UID,"recognition_menu_retain",invalid).getBoolean("keep"));
+            assertEquals(0,capture.retentionClaims);assertEquals(0,capture.retentionInvalidations);
+        }
+        assertTrue(server.handle(HOST_UID,"recognition_menu_retain",request).getBoolean("keep"));
+        assertEquals(1,capture.retentionClaims);assertEquals(0,capture.retentionInvalidations);
+    }
+
+    @Test public void missingAndMalformedSnapshotsInvalidateRetentionWithoutPublishingOrConsuming() {
+        assertTrue(config.saveSourceScope(SourceScopePolicy.Mode.BLACKLIST,List.of(),List.of(),true));publish();
+        String originalRaw=stored.getString(RuntimeSnapshot.KEY,null);
+        for(String unavailableRaw:new String[]{null,"not-json"}) {
+            stored.edit().putString(RuntimeSnapshot.KEY,originalRaw).commit();
+            server=new RuntimeServer(context,new Handler(Looper.getMainLooper()),()->stored,s->{});
+            FakeSourceCapture capture=new FakeSourceCapture();server.setSourceCapture(capture);
+            Bundle request=recognitionRetentionRequest();
+            assertTrue(server.handle(HOST_UID,"recognition_menu_retain",request).getBoolean("keep"));
+            RuntimeSnapshot original=cachedSnapshot();assertNotNull(original);
+            capture.onRetentionInvalidation=()->assertSame(original,cachedSnapshot());
+            if(unavailableRaw==null)stored.edit().remove(RuntimeSnapshot.KEY).commit();
+            else stored.edit().putString(RuntimeSnapshot.KEY,unavailableRaw).commit();
+
+            assertFalse(server.handle(HOST_UID,"recognition_menu_retain",request).getBoolean("keep"));
+            assertEquals(1,capture.retentionInvalidations);assertEquals(1,capture.retentionClaims);
+            assertSame(original,cachedSnapshot());
+            stored.edit().putString(RuntimeSnapshot.KEY,originalRaw).commit();
+            assertSame(original,server.sourceCaptureConfiguration());
+            assertEquals(1,capture.retentionInvalidations);assertEquals(1,capture.retentionClaims);
+        }
+    }
+
+    @Test public void unavailableModuleInvalidatesRecognitionRetentionBeforeReturningNull() {
+        assertTrue(config.saveSourceScope(SourceScopePolicy.Mode.BLACKLIST,List.of(),List.of(),true));publish();
+        FakeSourceCapture capture=new FakeSourceCapture();server.setSourceCapture(capture);
+        Bundle request=recognitionRetentionRequest();
+        assertTrue(server.handle(HOST_UID,"recognition_menu_retain",request).getBoolean("keep"));
+        RuntimeSnapshot original=cachedSnapshot();assertNotNull(original);
+        capture.onRetentionInvalidation=()->assertSame(original,cachedSnapshot());
+        ((org.robolectric.shadows.ShadowPackageManager)org.robolectric.shadow.api.Shadow.extract(context.getPackageManager())).removePackage(BridgeContract.APP_PACKAGE);
+
+        assertNull(server.sourceCaptureConfiguration());
+        assertEquals(1,capture.retentionInvalidations);assertEquals(1,capture.retentionClaims);
+        assertSame(original,cachedSnapshot());
+        install(BridgeContract.APP_PACKAGE,MODULE_UID,false,"1",1);
+        assertSame(original,server.sourceCaptureConfiguration());
+        assertEquals(1,capture.retentionInvalidations);assertEquals(1,capture.retentionClaims);
+    }
+
+    @Test public void snapshotReadFailuresInvalidateRecognitionRetentionBeforeReturningNull() {
+        assertTrue(config.saveSourceScope(SourceScopePolicy.Mode.BLACKLIST,List.of(),List.of(),true));publish();
+        boolean[] unavailable={false};
+        server=new RuntimeServer(context,new Handler(Looper.getMainLooper()),()->{
+            if(unavailable[0])throw new IllegalStateException("framework preferences unavailable");return stored;
+        },s->{});
+        FakeSourceCapture capture=new FakeSourceCapture();server.setSourceCapture(capture);
+        Bundle request=recognitionRetentionRequest();
+        assertTrue(server.handle(HOST_UID,"recognition_menu_retain",request).getBoolean("keep"));
+        RuntimeSnapshot original=cachedSnapshot();assertNotNull(original);
+        capture.onRetentionInvalidation=()->assertSame(original,cachedSnapshot());
+        unavailable[0]=true;
+
+        assertNull(server.sourceCaptureConfiguration());
+        assertEquals(1,capture.retentionInvalidations);assertEquals(1,capture.retentionClaims);
+        assertSame(original,cachedSnapshot());
+        unavailable[0]=false;
+        assertSame(original,server.sourceCaptureConfiguration());
+        assertEquals(1,capture.retentionInvalidations);assertEquals(1,capture.retentionClaims);
+    }
+
+    private Bundle recognitionRetentionRequest() {
+        Bundle request=new Bundle();request.putString("source",SOURCE);request.putString("activity",SOURCE+".MainActivity");
+        request.putLong("shown_elapsed",android.os.SystemClock.elapsedRealtime());return request;
+    }
+
+    private RuntimeSnapshot cachedSnapshot() {
+        try {
+            var field=RuntimeServer.class.getDeclaredField("snapshot");field.setAccessible(true);
+            return (RuntimeSnapshot)field.get(server);
+        }catch(ReflectiveOperationException unavailable){throw new AssertionError(unavailable);}
+    }
+
     static final class FakeSourceCapture implements RuntimeServer.SourceCapture {
         int takes,nativeResults,lastOwner,ownershipChecks,recognitionShows,retentionClaims;
+        int retentionInvalidations;
+        Runnable onRetentionInvalidation;
         Bundle lastRequest,lastNativeRequest;
         RuntimeSnapshot lastConfig;
         public Bundle take(int owner,Bundle request,RuntimeSnapshot config) {
@@ -732,6 +879,9 @@ public final class RuntimeServerAndroidTest {
         public Bundle retainRecognition(Bundle request,RuntimeSnapshot config) {
             retentionClaims++;lastRequest=new Bundle(request);lastConfig=config;
             Bundle response=new Bundle();response.putBoolean("keep",true);return response;
+        }
+        public void invalidateRecognitionRetention() {
+            retentionInvalidations++;if(onRetentionInvalidation!=null)onRetentionInvalidation.run();
         }
         public boolean ownsLinkPick(Bundle request) {
             ownershipChecks++; lastRequest = request == null ? null : new Bundle(request); return true;

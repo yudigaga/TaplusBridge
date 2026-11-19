@@ -75,8 +75,16 @@ public final class SystemLongPressDrag implements RuntimeServer.DragGestures {
     private Runnable directedRelease;
     private CardLinks cardLinks;
     private volatile io.github.yudigaga.taplusbridge.probe.SystemAssistContent assistContent;
+    private volatile RecordingGuard recordingGuard;
     public void setAssistContent(io.github.yudigaga.taplusbridge.probe.SystemAssistContent content) { assistContent = content; }
     public void setOnDirectedRelease(Runnable listener) { directedRelease = listener; }
+
+    @FunctionalInterface
+    public interface RecordingGuard {
+        boolean protects(ScopeCaptureWindow.Snapshot target, RuntimeSnapshot config, int device, long down);
+    }
+
+    public void setRecordingGuard(RecordingGuard guard) { recordingGuard = guard; }
 
     /** Reads the card URL the same way a stationary long press does, after the finger is up. */
     public interface CardLinks {
@@ -104,13 +112,14 @@ public final class SystemLongPressDrag implements RuntimeServer.DragGestures {
         boolean linkComplete;
         boolean nativeUrlAvailable;
         boolean consumed;
-        boolean transferred;
+        volatile boolean transferred;
         volatile boolean inputRevoked;
         CaptureIo.Write captureWrite;
         boolean sourceMovedBeforeTransfer;
         boolean dragFeedbackSent;
         boolean prepareStarted;
         boolean prepared;
+        boolean previewChecked;
         boolean cardClickDue;
         long releasedAt;
         Run(ScopeCaptureWindow.Snapshot target, RuntimeSnapshot config, LongPressDirection gesture, long began,
@@ -236,7 +245,10 @@ public final class SystemLongPressDrag implements RuntimeServer.DragGestures {
                         metrics.widthPixels, metrics.heightPixels, metrics.density));
                 Run pending = current;
                 var content = assistContent;
-                if (content != null && config.recognition) content.arm(target, config, down, began, stages.recognitionAt(), device);
+                if (content != null && config.recognition) {
+                    if (cancelForRecording(pending)) return;
+                    content.arm(target, config, down, began, stages.recognitionAt(), device);
+                }
                 worker.postDelayed(() -> startPrepare(pending), Math.max(0, stages.recognitionAt() - nowElapsed));
                 worker.postDelayed(() -> expire(pending), 30_001);
                 return;
@@ -282,24 +294,35 @@ public final class SystemLongPressDrag implements RuntimeServer.DragGestures {
                 && physical != null && physical.soleStream(0, run.gesture.device(), run.gesture.downAt());
     }
 
-    private synchronized void startPrepare(Run run) {
-        if (run.prepareStarted || !held(run, configuration())) return;
-        if (SystemClock.elapsedRealtime() < run.stages.recognitionAt()) return;
+    private boolean canStartPrepare(Run run) {
+        return !run.prepareStarted && held(run, configuration())
+                && SystemClock.elapsedRealtime() >= run.stages.recognitionAt();
+    }
+
+    private void startPrepare(Run run) {
+        synchronized (this) { if (!canStartPrepare(run)) return; }
         try {
             Context system = context.get();
             var host = system.getPackageManager().getPackageInfo(HostPolicy.HOST_PACKAGE, 0);
             if (host.applicationInfo == null || !host.applicationInfo.enabled
                     || !HostPolicy.supportedVersion(host.versionName, host.getLongVersionCode())) return;
             windows.validateBehindHost(atms.get(), run.target, host.applicationInfo.uid);
-            ensureToken(run);
-            run.prepareStarted = true;
-            Intent start = new Intent(ACTION_PREPARE).setComponent(new ComponentName(HostPolicy.HOST_PACKAGE,
-                    "com.miui.contentextension.services.TextContentExtensionService"));
-            start.putExtra("drag_token", run.token);
-            if (system.startService(start) == null) { cancelRun(run, "prepare_service_unavailable"); return; }
-            log("prepare_requested");
+            if (cancelForRecording(run)) return;
+            synchronized (this) {
+                if (!canStartPrepare(run)) return;
+                ensureToken(run);
+                run.prepareStarted = true;
+                if (module != null) module.log(4, "TaplusBridge", "drag delivery stage=recognition_ready"
+                        + new DragTrace(run.gesture.device(), run.gesture.downAt(), run.began).fields(SystemClock.elapsedRealtime())
+                        + " boundary=system policy_identity=" + run.config.identity);
+                Intent start = new Intent(ACTION_PREPARE).setComponent(new ComponentName(HostPolicy.HOST_PACKAGE,
+                        "com.miui.contentextension.services.TextContentExtensionService"));
+                start.putExtra("drag_token", run.token);
+                if (system.startService(start) == null) { cancelRun(run, "prepare_service_unavailable"); return; }
+                log("prepare_requested");
+            }
         } catch (android.content.pm.PackageManager.NameNotFoundException | ReflectiveOperationException | RuntimeException unavailable) {
-            cancelRun(run, "prepare_unavailable");
+            synchronized (this) { cancelRun(run, "prepare_unavailable"); }
         }
     }
 
@@ -332,6 +355,7 @@ public final class SystemLongPressDrag implements RuntimeServer.DragGestures {
             Context system = context.get();
             int hostUid = system.getPackageManager().getApplicationInfo(HostPolicy.HOST_PACKAGE, 0).uid;
             windows.validateBehindHost(atms.get(), run.target, hostUid);
+            if (cancelForRecording(run)) return Bundle.EMPTY;
             Bundle capture = captureMetadata(run);
             if (config.scopeCapture) {
                 try {
@@ -358,6 +382,7 @@ public final class SystemLongPressDrag implements RuntimeServer.DragGestures {
                 }
             }
             ScopeCapturePayload.validate(capture, SystemClock.elapsedRealtime());
+            if (cancelForRecording(run)) return Bundle.EMPTY;
             synchronized (this) {
                 if (!held(run, configuration()) || !run.config.identity.equals(config.identity)) return Bundle.EMPTY;
                 Bundle result = state(run); result.putBundle("capture", capture);
@@ -428,7 +453,7 @@ public final class SystemLongPressDrag implements RuntimeServer.DragGestures {
         }
         catch (android.content.pm.PackageManager.NameNotFoundException changed) { return Bundle.EMPTY; }
         catch (ReflectiveOperationException | RuntimeException changed) { return Bundle.EMPTY; }
-        if (run.inputRevoked) return Bundle.EMPTY;
+        if (run.inputRevoked || cancelForRecording(run)) return Bundle.EMPTY;
         if (run.token == null) {
             ensureToken(run);
             log("armed");
@@ -441,6 +466,12 @@ public final class SystemLongPressDrag implements RuntimeServer.DragGestures {
         if (request == null || request.size() != 1 || !(request.get("token") instanceof String token)
                 || run == null || !token.equals(run.token)) return cancelled();
         if (!valid(run, config)) { cancelRun(run, "lease_invalid"); return cancelled(); }
+        // Check the first poll that can create a mask; the final transfer checks again.
+        if (!run.previewChecked && !run.transferred && !run.gesture.released()
+                && SystemClock.elapsedRealtime() >= run.stages.dragAt()) {
+            run.previewChecked = true;
+            if (cancelForRecording(run)) return cancelled();
+        }
         if (run.gesture.released()) {
             long sinceRelease = SystemClock.elapsedRealtime() - run.releasedAt;
             if (!keepForCardLink(run.direction() != null, io.github.yudigaga.taplusbridge.recognition.RouteLink.valid(run.cardLink), sinceRelease)) {
@@ -453,49 +484,55 @@ public final class SystemLongPressDrag implements RuntimeServer.DragGestures {
         return state(run);
     }
 
-    @Override public synchronized Bundle overlayReady(Bundle request, RuntimeSnapshot config) {
-        Run run = current;
-        if (request == null || request.size() != 1 || !(request.get("token") instanceof String token)
-                || run == null || !token.equals(run.token)) return cancelled();
-        if (run.transferred || run.gesture.released()) return cancelled();
-        if (!valid(run, config)) { cancelRun(run, "lease_invalid"); return cancelled(); }
-        if (SystemClock.elapsedRealtime() < run.stages.dragAt()) return state(run);
+    @Override public Bundle overlayReady(Bundle request, RuntimeSnapshot config) {
+        final Run run;
+        final String token;
+        synchronized (this) {
+            run = current;
+            if (request == null || request.size() != 1 || !(request.get("token") instanceof String requested)
+                    || run == null || !requested.equals(run.token)) return cancelled();
+            token = requested;
+            if (run.transferred || run.gesture.released()) return cancelled();
+            if (!valid(run, config)) { cancelRun(run, "lease_invalid"); return cancelled(); }
+            if (SystemClock.elapsedRealtime() < run.stages.dragAt()) return state(run);
+        }
+        final int hostUid;
         try {
             validateAfterPick(run);
-        } catch (ReflectiveOperationException unavailable) {
-            replaceCurrent(null);
-            String reason = "drag_source_changed".equals(unavailable.getMessage())
-                    ? "source_changed" : "source_validation_failed";
-            logTakeoverFailure(reason); return cancelled();
-        } catch (IllegalStateException rejected) {
-            replaceCurrent(null); logTakeoverFailure(ScopeCaptureWindow.diagnosticWindowReason(rejected.getMessage()));
-            return cancelled();
-        } catch (RuntimeException unavailable) {
-            replaceCurrent(null); logTakeoverFailure("source_validation_failed"); return cancelled();
-        }
-        ScopeCaptureWindow.TransferResult transfer;
-        try {
-            int hostUid = context.get().getPackageManager().getApplicationInfo(HostPolicy.HOST_PACKAGE, 0).uid;
-            transfer = windows.transferTouchToMaskDetailed(atms.get(), run.target, hostUid,
-                    DragSettings.MASK_WINDOW_PREFIX + token);
+            hostUid = context.get().getPackageManager().getApplicationInfo(HostPolicy.HOST_PACKAGE, 0).uid;
         } catch (android.content.pm.PackageManager.NameNotFoundException unavailable) {
-            replaceCurrent(null); logTakeoverFailure("host_package_missing"); return cancelled();
+            return cancelledTakeover(run, "host_package_missing");
+        } catch (ReflectiveOperationException unavailable) {
+            return cancelledTakeover(run, "drag_source_changed".equals(unavailable.getMessage())
+                    ? "source_changed" : "source_validation_failed");
+        } catch (IllegalStateException rejected) {
+            return cancelledTakeover(run, ScopeCaptureWindow.diagnosticWindowReason(rejected.getMessage()));
         } catch (RuntimeException unavailable) {
-            replaceCurrent(null); logTakeoverFailure("system_runtime_failure"); return cancelled();
+            return cancelledTakeover(run, "source_validation_failed");
         }
-        if (!transfer.transferred) {
-            replaceCurrent(null); logTakeoverFailure(transfer.reason); return cancelled();
+        synchronized (this) {
+            if (current != run || run.transferred || run.gesture.released()) return cancelled();
+            ScopeCaptureWindow.TransferResult transfer;
+            try {
+                transfer = windows.transferTouchToMaskDetailed(atms.get(), run.target, hostUid,
+                        DragSettings.MASK_WINDOW_PREFIX + token, () -> held(run, configuration())
+                                && !cancelForRecording(run)
+                                && held(run, configuration()));
+            } catch (RuntimeException unavailable) {
+                return cancelledTakeover(run, "system_runtime_failure");
+            }
+            if (!transfer.transferred) return cancelledTakeover(run, transfer.reason);
+            run.transferred = true;
+            publishInput();
+            DragGestureGate.beginPhysical(0, run.gesture.device(), run.gesture.downAt());
+            if (shouldSendDragFeedback(true, run.dragFeedbackSent)) {
+                run.dragFeedbackSent = true;
+                if (LongPressFeedback.vibrate(context.get(), true)) log("ready_haptic_requested");
+                else log("ready_haptic_unavailable");
+            }
+            Bundle result = state(run); result.putBoolean("accepted", true);
+            log("takeover_succeeded"); return result;
         }
-        run.transferred = true;
-        publishInput();
-        DragGestureGate.beginPhysical(0, run.gesture.device(), run.gesture.downAt());
-        if (shouldSendDragFeedback(true, run.dragFeedbackSent)) {
-            run.dragFeedbackSent = true;
-            if (LongPressFeedback.vibrate(context.get(), true)) log("ready_haptic_requested");
-            else log("ready_haptic_unavailable");
-        }
-        Bundle result = state(run); result.putBoolean("accepted", true);
-        log("takeover_succeeded"); return result;
     }
 
     @Override public Bundle update(Bundle request, RuntimeSnapshot config) {
@@ -589,8 +626,10 @@ public final class SystemLongPressDrag implements RuntimeServer.DragGestures {
     }
 
     private Bundle state(Run run) {
+        DragTrace trace = new DragTrace(run.gesture.device(), run.gesture.downAt(), run.began);
         Bundle result = new Bundle(); result.putString("token", run.token); result.putString("source", run.target.source);
         result.putString("identity", run.config.identity); result.putFloat("x", run.gesture.x()); result.putFloat("y", run.gesture.y());
+        trace.writeTo(result);
         var content = assistContent;
         if (content != null && !run.sourceMovedBeforeTransfer) {
             String text = content.read(run.target, run.config, run.began, run.gesture.downAt()).deliveryText();
@@ -655,6 +694,25 @@ public final class SystemLongPressDrag implements RuntimeServer.DragGestures {
         if (current != run) return;
         replaceCurrent(null);
         log(reason);
+    }
+
+    private boolean cancelForRecording(Run run) {
+        RecordingGuard guard = recordingGuard;
+        if (run.transferred || guard == null
+                || !guard.protects(run.target, run.config, run.gesture.device(), run.gesture.downAt())) return false;
+        synchronized (this) {
+            if (run.transferred) return false;
+            cancelRun(run, "recording_protected");
+            return true;
+        }
+    }
+
+    private synchronized Bundle cancelledTakeover(Run run, String reason) {
+        if (current == run && !run.transferred) {
+            replaceCurrent(null);
+            logTakeoverFailure(reason);
+        }
+        return cancelled();
     }
 
     public synchronized void offerCardLink(String url) {

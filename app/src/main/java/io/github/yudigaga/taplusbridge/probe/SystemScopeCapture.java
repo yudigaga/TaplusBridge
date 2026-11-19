@@ -48,11 +48,14 @@ public final class SystemScopeCapture implements RuntimeServer.SourceCapture {
         final RuntimeSnapshot config;
         final ScopeCaptureWindow.Snapshot target;
         final long input, until;
+        final RecordingRisk risk;
         final Runnable ready;
         final Runnable failed;
         boolean acknowledged;
-        LinkWindow(String nonce, RuntimeSnapshot config, ScopeCaptureWindow.Snapshot target, long input, Runnable ready, Runnable failed) {
+        LinkWindow(String nonce, RuntimeSnapshot config, ScopeCaptureWindow.Snapshot target, long input,
+                   RecordingRisk risk, Runnable ready, Runnable failed) {
             this.nonce=nonce;this.config=config;this.target=target;this.input=input;this.ready=ready;this.failed=failed;
+            this.risk=risk;
             until=SystemClock.elapsedRealtime()+8_000;
         }
     }
@@ -60,6 +63,22 @@ public final class SystemScopeCapture implements RuntimeServer.SourceCapture {
     private final XposedModule module;
     private final Handler worker;
     private final Executor imageEncoder;
+    private final SourceRecordingState.Source recording;
+    private static final long RECORDING_OBSERVATION_MAX_AGE = 250;
+    private static final class RecordingRisk {
+        final ScopeCaptureWindow.Snapshot target;
+        final RuntimeSnapshot config;
+        final long input, menu, down, began;
+        final int device;
+        volatile boolean revoked, scopeYielded, protectedRecording, committed;
+        boolean cleanupScheduled;
+        RecordingRisk(ScopeCaptureWindow.Snapshot target, RuntimeSnapshot config, long input, long menu,
+                      int device, long down, long began) {
+            this.target=target;this.config=config;this.input=input;this.menu=menu;
+            this.device=device;this.down=down;this.began=began;
+        }
+    }
+    private volatile RecordingRisk recordingRisk;
     // Owned by the pointer worker; a waiting request retains no screenshot pixels.
     private boolean encodingImage;
     private Runnable pendingEncoding;
@@ -72,9 +91,12 @@ public final class SystemScopeCapture implements RuntimeServer.SourceCapture {
     private final RecognitionMenuRetention menuRetention;
     private volatile boolean menuNavigationGuardReady;
     private record MenuTouch(ScopeCaptureWindow.Snapshot target, int device, long down, long input,
-                             long recognitionAt, float slop) { }
+                             long menuEpoch, long recognitionAt, long requiredDuration, float slop,
+                             RecognitionMenuGesture.Lease lease) { }
+    private final RecognitionMenuGesture menuGesture = new RecognitionMenuGesture();
     private volatile MenuTouch menuTouch;
     private volatile long invalidMenuInput = -1, validatedMenuRelease = -1;
+    private final java.util.concurrent.atomic.AtomicLong menuEpoch = new java.util.concurrent.atomic.AtomicLong();
     private final ScopeLongPress gesture = new ScopeLongPress();
     private final ScopeCaptureStore store = new ScopeCaptureStore();
     private ScopeCaptureWindow.Snapshot origin;
@@ -103,15 +125,33 @@ public final class SystemScopeCapture implements RuntimeServer.SourceCapture {
     private long timeout = 550;
     private volatile float slop = 20;
     private volatile ScopeCaptureWindow.Snapshot pendingTarget;
+    private static final class PendingCapture {
+        final ScopeCaptureWindow.Snapshot target;
+        final RecordingRisk risk;
+        final long input;
+        final String nonce;
+        volatile boolean revoked;
+        PendingCapture(ScopeCaptureWindow.Snapshot target,RecordingRisk risk,long input,String nonce) {
+            this.target=target;this.risk=risk;this.input=input;this.nonce=nonce;
+        }
+    }
+    // Keep spent contexts as tombstones; production requests must never fall back to the legacy test path.
+    private volatile PendingCapture pendingCapture;
     private volatile ScopeLinkProbe linkProbe;
     public ScopeLinkProbe linkProbe() { return linkProbe; }
     public void setLinkProbe(ScopeLinkProbe probe) { linkProbe = probe; }
     public void validateLinkTarget(ScopeCaptureWindow.Snapshot target) throws ReflectiveOperationException {
+        RecordingRisk risk = riskFor(target);
+        requireRecordingAllowed(risk);
         windows.validate(atms.get(), target);
+        requireRecordingAllowed(risk);
     }
     public void validateLinkTargetBehind(ScopeCaptureWindow.Snapshot target, int hostUid) throws ReflectiveOperationException {
+        RecordingRisk risk = riskFor(target);
+        requireRecordingAllowed(risk);
         if (hostUid >= 10000 && hostUid < 100000) windows.validateBehindHost(atms.get(), target, hostUid);
         else windows.validate(atms.get(), target);
+        requireRecordingAllowed(risk);
     }
     @Override public boolean linkReady() { return linkProbe != null; }
 
@@ -131,7 +171,13 @@ public final class SystemScopeCapture implements RuntimeServer.SourceCapture {
         if (!link.tryYieldToHost(target)) return false;
         // Native callbacks may have different pick times; reserve this physical gesture across UP/cancel.
         hostLinkOwner = new HostLinkOwner(source, uid, user, now + 30_000);
-        cancel();
+        RecordingRisk risk = riskFor(target);
+        if (risk == null) cancel();
+        else {
+            // Retire only the scope work; native presentation and drag still observe this same touch.
+            risk.scopeYielded = true;
+            retireRecordingRisk(risk);
+        }
         return true;
     }
 
@@ -156,9 +202,16 @@ public final class SystemScopeCapture implements RuntimeServer.SourceCapture {
     SystemScopeCapture(XposedModule module, Handler worker, Supplier<Context> context,
                        Supplier<Object> atms, Supplier<RuntimeServer> runtime, ScopeCaptureWindow windows,
                        PhysicalTouchState physical, Executor imageEncoder) {
+        this(module, worker, context, atms, runtime, windows, physical, imageEncoder, SourceRecordingState.from(context));
+    }
+
+    SystemScopeCapture(XposedModule module, Handler worker, Supplier<Context> context,
+                       Supplier<Object> atms, Supplier<RuntimeServer> runtime, ScopeCaptureWindow windows,
+                       PhysicalTouchState physical, Executor imageEncoder, SourceRecordingState.Source recording) {
         this.module = module; this.worker = worker; this.context = context; this.atms = atms;
         this.runtime = runtime; this.physical = physical; this.windows = windows; this.imageEncoder = imageEncoder;
-        menuRetention = new RecognitionMenuRetention(inputGeneration::get,this::menuConfiguration,this::menuTouchValidated,
+        this.recording = java.util.Objects.requireNonNull(recording);
+        menuRetention = new RecognitionMenuRetention(menuEpoch::get,this::menuConfiguration,this::menuTouchValidated,
                 target -> {
                     Context system=context.get();
                     if(!unlocked(system))return false;
@@ -169,7 +222,7 @@ public final class SystemScopeCapture implements RuntimeServer.SourceCapture {
                                 && windows.recognitionSourceCurrent(atms.get(),target,host.applicationInfo.uid);
                     }catch(PackageManager.NameNotFoundException unavailable){return false;}
                 });
-        recognitionMenus = new RecognitionMenuController(worker, inputGeneration::get,
+        recognitionMenus = new RecognitionMenuController(worker, menuEpoch::get,
                 () -> {
                     RuntimeServer server = runtime.get();
                     return server == null ? null : server.sourceCaptureConfiguration();
@@ -183,9 +236,88 @@ public final class SystemScopeCapture implements RuntimeServer.SourceCapture {
         RuntimeServer server=runtime.get();return server==null?null:server.sourceCaptureConfiguration();
     }
 
+    private RecordingRisk riskFor(ScopeCaptureWindow.Snapshot target) {
+        RecordingRisk risk=recordingRisk;
+        return risk!=null && risk.target==target ? risk : null;
+    }
+
+    private boolean recordingCurrent(RecordingRisk risk) {
+        return risk==null || recordingRisk==risk && risk.input==inputGeneration.get()
+                && !risk.revoked && !risk.scopeYielded && !risk.protectedRecording;
+    }
+
+    /** Only call at a fresh boundary outside snapshot, retention and WMS monitors. */
+    private boolean recordingAllowed(RecordingRisk risk) {
+        if (!recordingCurrent(risk)) {
+            if(risk!=null && recordingRisk==risk && (risk.revoked || risk.protectedRecording))retireRecordingRisk(risk);
+            return false;
+        }
+        if (risk==null) return true;
+        if (observesRecording(risk)) {
+            risk.protectedRecording=true;
+            retireRecordingRisk(risk);
+            event("recording_protected",risk.committed ? "already_committed" : "before_commit");
+        }
+        return recordingCurrent(risk);
+    }
+
+    private boolean observesRecording(RecordingRisk risk) {
+        SourceRecordingState.Observation observed;
+        try { observed=recording.observe(risk.target.uid); }
+        catch (RuntimeException | LinkageError unavailable) { observed=SourceRecordingState.UNKNOWN; }
+        long now=SystemClock.elapsedRealtime();
+        return observed!=null && observed.uid()==risk.target.uid && observed.observedAt()>=risk.began
+                && observed.observedAt()<=now && now-observed.observedAt()<=RECORDING_OBSERVATION_MAX_AGE;
+    }
+
+    private void requireRecordingAllowed(RecordingRisk risk) {
+        if(!recordingAllowed(risk))throw new IllegalStateException("scope_recording_veto");
+    }
+
+    private void committed(RecordingRisk risk) {
+        if(risk==null)return;
+        risk.committed=true;
+        if(risk.protectedRecording)event("recording_protected","already_committed");
+    }
+
+    private void retireRecordingRisk(RecordingRisk risk) {
+        synchronized(risk){if(risk.cleanupScheduled)return;risk.cleanupScheduled=true;}
+        SystemAssistContent content=assistContent;
+        if(content!=null)content.cancelOwner(risk.target,risk.config,risk.device,risk.down);
+        ScopeLinkProbe link=linkProbe;
+        if(link!=null)link.cancelOwner(risk.target);
+        worker.post(()->{
+            if(recordingRisk!=risk || risk.input!=inputGeneration.get())return;
+            PendingCapture pendingCaptureOwner=pendingCapture;
+            if(pendingCaptureOwner!=null && pendingCaptureOwner.risk==risk){
+                pendingCaptureOwner.revoked=true;store.clear();
+            } else if(pendingCaptureOwner==null)store.clear();
+            if(pendingTarget==risk.target)pendingTarget=null;
+            LinkWindow pending=linkWindow;
+            if(pending!=null && pending.risk==risk)linkWindow=null;
+            pendingEncoding=null;
+            MenuTouch touch=menuTouch;
+            if(touch!=null && touch.target==risk.target){
+                menuRetention.cancel();recognitionMenus.cancel();menuTouch=null;
+            }
+            if(origin==risk.target){
+                generation++;gestureActive=false;gesture.cancel();origin=null;configuration=null;
+                recognitionFeedbackSent=false;
+            }
+        });
+    }
+
+    private void revokeRecordingRisk(RecordingRisk risk) {
+        if(risk!=null){risk.revoked=true;retireRecordingRisk(risk);}
+    }
+
     private String dismissRecognitionMenu(ScopeCaptureWindow.Snapshot target,java.util.function.BooleanSupplier current)
             throws ReflectiveOperationException {
         String outcome="unsupported";
+        MenuTouch touch = menuTouch;
+        if (touch == null || touch.target != target) return "stale";
+        RecordingRisk risk=riskFor(target);
+        if(!recordingAllowed(risk))return "stale";
         try {
             Context system=context.get();
             if(!unlocked(system))return "stale";
@@ -193,11 +325,12 @@ public final class SystemScopeCapture implements RuntimeServer.SourceCapture {
             if(host.applicationInfo==null || !host.applicationInfo.enabled
                     || !HostPolicy.supportedVersion(host.versionName,host.getLongVersionCode()))return outcome;
             outcome=windows.dismissRecognitionMenu(atms.get(),target,host.applicationInfo.uid,
-                    ()->current.getAsBoolean() && unlocked(context.get()),()->{
+                    ()->recordingAllowed(risk) && unlocked(context.get()) && current.getAsBoolean(),()->{
                         RuntimeSnapshot config=menuConfiguration();
-                        return current.getAsBoolean() && config!=null && menuRetention.arm(target,config.identity,
-                                inputGeneration.get(),recognitionMenus.shownElapsed(target),menuNavigationGuardReady);
+                        return recordingAllowed(risk) && current.getAsBoolean() && config!=null && menuRetention.arm(target,config.identity,
+                                touch.menuEpoch,recognitionMenus.shownElapsed(target),menuNavigationGuardReady);
                     });
+            if("sent".equals(outcome))committed(risk);
             return outcome;
         }catch(PackageManager.NameNotFoundException unavailable){return outcome;}
         finally {if(!"sent".equals(outcome))menuRetention.cancel();}
@@ -209,22 +342,65 @@ public final class SystemScopeCapture implements RuntimeServer.SourceCapture {
     }
 
     public void newKeyInput() {
+        revokeRecordingRisk(recordingRisk);
+        menuGesture.invalidate();
         invalidMenuInput=inputGeneration.get();
         menuRetention.cancel();recognitionMenus.cancel();
     }
 
-    /** Copy only touch primitives before returning to the system input dispatcher. */
+    public void menuInputUnknown() {
+        revokeRecordingRisk(recordingRisk);
+        menuGesture.invalidate();
+        invalidMenuInput=inputGeneration.get();
+        menuRetention.cancel();recognitionMenus.cancel();
+    }
+
+    /** Called for eligible touch pointers before the input Hook can take a transfer early return. */
+    public long menuPointerAtHook(boolean realMainInput, boolean touchscreen, int action) {
+        if (!realMainInput || !PhysicalTouchState.isTouchAction(action)
+                || touchscreen && action != MotionEvent.ACTION_DOWN) return menuEpoch.get();
+        long observed = menuEpoch.incrementAndGet();
+        revokeRecordingRisk(recordingRisk);
+        menuGesture.invalidate();
+        menuRetention.cancel();
+        recognitionMenus.cancelStale();
+        return observed;
+    }
+
+    /** Existing touchscreen callers capture their lease before copying touch primitives. */
     public void pointer(MotionEvent event, int display, boolean exclusiveAtEvent) {
-        int action = event.getActionMasked(), count = event.getPointerCount(), device = event.getDeviceId();
+        if (physical != null && physical.isInjected(display, event.getDeviceId(),
+                event.getDownTime(), SystemClock.uptimeMillis())) return;
+        pointer(event, display, exclusiveAtEvent,
+                menuPointerAtHook(display == 0, true, event.getActionMasked()));
+    }
+
+    /** Copy only touch primitives before returning to the system input dispatcher. */
+    public void pointer(MotionEvent event, int display, boolean exclusiveAtEvent, long observedMenuEpoch) {
+        int rawMaskedAction = event.getActionMasked();
+        int action = rawMaskedAction == MotionEvent.ACTION_POINTER_UP
+                && (event.getFlags() & MotionEvent.FLAG_CANCELED) != 0
+                ? MotionEvent.ACTION_CANCEL : rawMaskedAction;
+        int count = event.getPointerCount(), device = event.getDeviceId();
         long down = event.getDownTime(), at = event.getEventTime();
+        long receivedUptime = SystemClock.uptimeMillis();
+        boolean menuCanceled = (event.getFlags() & MotionEvent.FLAG_CANCELED) != 0;
+        RecognitionMenuGesture.Lease observedMenuLease = menuGesture.observe(rawMaskedAction, display, device,
+                event.getSource(), count == 1 ? event.getPointerId(0) : -1, count, down, at, receivedUptime,
+                menuCanceled, rawMaskedAction == MotionEvent.ACTION_UP
+                        ? physical != null && physical.released() : exclusiveAtEvent,
+                event.getRawX(), event.getRawY());
         long observedInput = action == MotionEvent.ACTION_DOWN ? inputGeneration.incrementAndGet() : inputGeneration.get();
         if (action == MotionEvent.ACTION_DOWN) {
+            revokeRecordingRisk(recordingRisk);
             menuRetention.cancel();
             menuTouch = null; invalidMenuInput = -1; validatedMenuRelease = -1;
-            recognitionMenus.cancel();
+            recognitionMenus.cancelStale();
         }
         MenuTouch touch = menuTouch;
-        if (action == MotionEvent.ACTION_CANCEL || count != 1 || display != 0
+        if(action==MotionEvent.ACTION_CANCEL || menuCanceled || display!=0)
+            revokeRecordingRisk(recordingRisk);
+        if (action == MotionEvent.ACTION_CANCEL || menuCanceled || count != 1 || display != 0
                 || touch != null && (action == MotionEvent.ACTION_MOVE || action == MotionEvent.ACTION_UP)
                 && (device != touch.device || down != touch.down || !Float.isFinite(event.getRawX())
                 || !Float.isFinite(event.getRawY())
@@ -237,20 +413,34 @@ public final class SystemScopeCapture implements RuntimeServer.SourceCapture {
             menuRetention.cancel();
             recognitionMenus.cancel();
             ScopeLinkProbe link = linkProbe; if (link != null) link.cancel();
-            worker.post(this::cancel); return;
+            RecordingRisk suppressed=recordingRisk;
+            worker.post(()->{if(recordingRisk==suppressed && observedInput==inputGeneration.get())cancel();}); return;
         }
-        if (action == MotionEvent.ACTION_DOWN) { store.clear(); pendingTarget = null; linkWindow = null; }
+        if (action == MotionEvent.ACTION_DOWN) { clearStore(); pendingTarget = null; linkWindow = null; }
         long eventElapsed = SystemClock.elapsedRealtime() - Math.max(0, SystemClock.uptimeMillis() - at);
         float x = event.getRawX(), y = event.getRawY();
         float x2 = count > 1 ? event.getRawX(1) : Float.NaN, y2 = count > 1 ? event.getRawY(1) : Float.NaN;
         ScopeLinkProbe link = linkProbe;
         if (link != null) link.pointer(action, count, x, y, down, at, slop);
+        RecordingRisk pointerRisk=recordingRisk;
         worker.post(() -> {
-            event(display, device, down, at, eventElapsed, action, count, x, y, x2, y2, exclusiveAtEvent, observedInput);
+            if(observedInput!=inputGeneration.get()){
+                if((action==MotionEvent.ACTION_UP || action==MotionEvent.ACTION_CANCEL)
+                        && pointerRisk!=null && recordingRisk==pointerRisk
+                        && display==0 && device==pointerRisk.device && down==pointerRisk.down
+                        && gestureInputGeneration==observedInput)cancel();
+                return;
+            }
+            event(display, device, down, at, eventElapsed, action, count, x, y, x2, y2, exclusiveAtEvent,
+                    observedInput, observedMenuEpoch, observedMenuLease);
+            if (observedMenuEpoch != menuEpoch.get()) return;
             if (action == MotionEvent.ACTION_UP) {
                 MenuTouch current = menuTouch;
+                // Delivery-time elapsed offsets must not lengthen the original uptime hold.
                 if (current != null && current.input == observedInput && current.down == down && current.device == device
-                        && invalidMenuInput != observedInput && eventElapsed >= current.recognitionAt
+                        && current.menuEpoch == observedMenuEpoch
+                        && current.lease == observedMenuLease && invalidMenuInput != observedInput
+                        && menuGesture.completed(current.lease, current.requiredDuration, current.slop)
                         && at <= SystemClock.uptimeMillis() && SystemClock.uptimeMillis() - at <= 300) {
                     validatedMenuRelease = observedInput;
                     recognitionMenus.released();
@@ -265,17 +455,22 @@ public final class SystemScopeCapture implements RuntimeServer.SourceCapture {
 
     private boolean menuTouchValidated() {
         MenuTouch touch = menuTouch;
+        RecordingRisk risk=touch==null ? null : riskFor(touch.target);
         return physical != null && touch != null && touch.input == inputGeneration.get()
+                && recordingCurrent(risk) && (risk==null || risk.menu==touch.menuEpoch
+                        && risk.device==touch.device && risk.down==touch.down)
                 && SystemClock.elapsedRealtime() >= touch.recognitionAt
-                && invalidMenuInput != touch.input && (physical.soleStream(0, touch.device, touch.down)
-                || validatedMenuRelease == touch.input && physical.released());
+                && invalidMenuInput != touch.input && validatedMenuRelease == touch.input && physical.released()
+                && menuGesture.completed(touch.lease, touch.requiredDuration, touch.slop)
+                && touch.menuEpoch == menuEpoch.get();
     }
 
     private void event(int display, int device, long down, long at, long eventElapsed, int action, int count,
-                       float x, float y, float x2, float y2, boolean exclusiveAtEvent, long observedInput) {
+                       float x, float y, float x2, float y2, boolean exclusiveAtEvent, long observedInput,
+                       long observedMenuEpoch, RecognitionMenuGesture.Lease observedMenuLease) {
         if (action == MotionEvent.ACTION_DOWN) {
             gestureInputGeneration = observedInput;
-            store.clear(); pendingTarget = null;
+            clearStore(); pendingTarget = null;
             downElapsed = eventElapsed - Math.max(0, at - down);
             hostLinkOwner = null;
             sourcePointMoved = false; lastOrigin = null;
@@ -286,8 +481,10 @@ public final class SystemScopeCapture implements RuntimeServer.SourceCapture {
                 && (action == MotionEvent.ACTION_MOVE || action == MotionEvent.ACTION_UP)
                 && Math.hypot(x - originalPoint.x, y - originalPoint.y) > slop) {
             sourcePointMoved = true; lastOrigin = originalPoint;
-            menuRetention.cancel();
-            recognitionMenus.cancel();
+            if (observedMenuEpoch == menuEpoch.get()) {
+                menuRetention.cancel();
+                recognitionMenus.cancel();
+            }
         }
         try {
             if (DragGestureGate.suppressLongPress()) { cancel(); return; }
@@ -296,17 +493,24 @@ public final class SystemScopeCapture implements RuntimeServer.SourceCapture {
             if (action == MotionEvent.ACTION_DOWN) {
                 if (gestureActive || !exclusiveAtEvent) { cancel(); return; }
                 cancel();
-                configuration = server.sourceCaptureConfiguration();
-                if (configuration == null || !configuration.enabled || (!configuration.recognition
-                        && !configuration.scopeCapture && !configuration.scopeLinkProbe)
-                        || !configuration.sourceScope.managed
-                        || Settings.System.getInt(system.getContentResolver(), "content_catcher_network_enabled_content_extension", 0) != 1) return;
-                origin = windows.inspect(atms.get(), display, x, y);
-                lastOrigin = origin;
-                if (!configuration.sourceScope.allows(origin.source)
-                        || HostPolicy.HOST_PACKAGE.equals(origin.source) || HostPolicy.MODULE_PACKAGE.equals(origin.source)) {
-                    cancel(); return;
+                RecordingRisk risk;
+                try(RuntimeServer.PolicyOperation operation=server.beginSourceCaptureOperation()){
+                    configuration=operation.configuration();
+                    if (configuration == null || !configuration.enabled || (!configuration.recognition
+                            && !configuration.scopeCapture && !configuration.scopeLinkProbe)
+                            || !configuration.sourceScope.managed
+                            || Settings.System.getInt(system.getContentResolver(), "content_catcher_network_enabled_content_extension", 0) != 1) return;
+                    origin = windows.inspect(atms.get(), display, x, y);
+                    lastOrigin = origin;
+                    if (!configuration.sourceScope.allows(origin.source)
+                            || HostPolicy.HOST_PACKAGE.equals(origin.source) || HostPolicy.MODULE_PACKAGE.equals(origin.source)) {
+                        cancel(); return;
+                    }
+                    risk=new RecordingRisk(origin,configuration,observedInput,observedMenuEpoch,device,down,downElapsed);
+                    recordingRisk=risk;
+                    if(!operation.isCurrent())risk.revoked=true;
                 }
+                if(!recordingAllowed(risk)){retireRecordingRisk(risk);return;}
                 mode = Settings.System.getInt(system.getContentResolver(), "support_long_press_mode",
                         Settings.Global.getInt(system.getContentResolver(), "support_long_press_mode", 1));
                 timeout = Settings.System.getInt(system.getContentResolver(), "support_long_press_time_out",
@@ -318,33 +522,38 @@ public final class SystemScopeCapture implements RuntimeServer.SourceCapture {
                         : Long.MAX_VALUE;
                 gestureActive = true;
                 recognitionFeedbackSent = false;
-                if (mode == 1 && timeout >= 100 && timeout <= 5_000) {
-                    if (inputGeneration.get() == observedInput)
-                        menuTouch = new MenuTouch(origin,device,down,observedInput,recognitionAt,slop);
-                    recognitionMenus.begin(origin, configuration, downElapsed, downElapsed + timeout, recognitionAt, observedInput);
+                if (mode == 1 && timeout >= 100 && timeout <= 5_000
+                        && inputGeneration.get() == observedInput && menuEpoch.get() == observedMenuEpoch) {
+                    menuTouch = new MenuTouch(origin,device,down,observedInput,observedMenuEpoch,recognitionAt,
+                            recognitionAt - downElapsed,slop,observedMenuLease);
+                    recognitionMenus.begin(origin, configuration, downElapsed, downElapsed + timeout, recognitionAt,
+                            observedMenuEpoch);
                 }
-                if (mode == 1) scheduleRecognitionFeedback(generation, configuration, device, down, recognitionAt);
+                if (mode == 1) scheduleRecognitionFeedback(generation, configuration, device, down, recognitionAt, risk);
                 SystemAssistContent content = assistContent;
-                if (mode == 1 && content != null && configuration.recognition)
-                    content.arm(origin, configuration, down, downElapsed, recognitionAt, device);
+                if (mode == 1 && content != null && configuration.recognition && recordingAllowed(risk))
+                    content.arm(origin, configuration, down, downElapsed, recognitionAt, device, ()->recordingCurrent(risk));
                 ScopeLinkProbe link = linkProbe;
-                if (configuration.scopeLinkProbe && link != null)
+                if (configuration.scopeLinkProbe && link != null && recordingAllowed(risk))
                     link.arm(origin, configuration, down, downElapsed, timeout, mode);
             }
             if (origin == null) return;
+            RecordingRisk risk=riskFor(origin);
+            if(!recordingCurrent(risk))return;
             if (count > 1 && (!Float.isFinite(x2) || !Float.isFinite(y2)
                     || !origin.bounds.contains((int) x2, (int) y2))) { cancel(); return; }
             ScopeLongPress.Trigger trigger = gesture.event(display, device, down, at, action, count,
                     x, y, x2, y2, mode, timeout, slop, SystemClock.uptimeMillis());
             if (trigger != null) {
-                recognitionFeedback(generation, configuration, device, down, recognitionAt, true, eventElapsed);
+                recognitionFeedback(generation, configuration, device, down, recognitionAt, true, eventElapsed, risk);
+                if(!recordingCurrent(risk))return;
                 gestureActive = false;
                 event("gesture", "none");
                 long expected = generation;
                 var picked = origin; var config = configuration; long began = downElapsed, readyAt = recognitionAt;
                 long releasedAt = eventElapsed;
                 // Screenshot-only mode lets ROM capture win; link mode owns the original click first.
-                worker.postDelayed(() -> capture(expected, picked, config, began, readyAt, releasedAt), 300);
+                worker.postDelayed(() -> capture(expected, picked, config, began, readyAt, releasedAt, risk), 300);
             } else if (action == MotionEvent.ACTION_CANCEL || action == MotionEvent.ACTION_UP) cancel();
         } catch (ReflectiveOperationException | RuntimeException unavailable) {
             cancel(); event("rejected", reasonOf(unavailable));
@@ -353,6 +562,12 @@ public final class SystemScopeCapture implements RuntimeServer.SourceCapture {
 
     private void capture(long expected, ScopeCaptureWindow.Snapshot picked, RuntimeSnapshot config, long began,
                          long readyAt, long releasedAt) {
+        capture(expected,picked,config,began,readyAt,releasedAt,riskFor(picked));
+    }
+
+    private void capture(long expected, ScopeCaptureWindow.Snapshot picked, RuntimeSnapshot config, long began,
+                         long readyAt, long releasedAt, RecordingRisk risk) {
+        if(!recordingAllowed(risk))return;
         RuntimeServer server = runtime.get();
         RuntimeSnapshot latest = server == null ? null : server.sourceCaptureConfiguration();
         if (DragGestureGate.suppressLongPress() || expected != generation || gestureInputGeneration != inputGeneration.get()
@@ -364,27 +579,35 @@ public final class SystemScopeCapture implements RuntimeServer.SourceCapture {
         SystemAssistContent content = assistContent;
         if (content != null && content.pending(picked, latest, began, sourceDown)
                 && SystemClock.elapsedRealtime() - releasedAt < 2_500) {
-            worker.postDelayed(() -> capture(expected, picked, config, began, readyAt, releasedAt), 50); return;
+            worker.postDelayed(() -> capture(expected, picked, config, began, readyAt, releasedAt, risk), 50); return;
         }
         SystemAssistContent.Result provided = content == null ? SystemAssistContent.Result.EMPTY : content.read(picked, latest, began, sourceDown);
         if (nativeSince(picked.source, began) && !latest.scopeLinkProbe && provided.deliveryText().isBlank()) return;
         if (!provided.links().isEmpty()) {
-            if (link != null) link.cancel();
-            deliverCapture(expected, picked, config, began, null); return;
+            if (link != null) link.cancelOwner(picked);
+            deliverCapture(expected, picked, config, began, null, risk); return;
         }
         if (latest.scopeLinkProbe && link != null) {
-            prepareLinkWindow(picked, latest, () -> link.confirm(picked, latest, readyAt, releasedAt,
-                    url -> { clearLinkWindow(picked,latest);worker.post(() -> deliverCapture(expected, picked, config, began, url)); }),
-                    ()->{link.cancel();deliverCapture(expected,picked,config,began,null);});
-        } else deliverCapture(expected, picked, config, began, null);
+            prepareLinkWindow(picked, latest, risk, () -> {
+                if(!recordingAllowed(risk))return;
+                link.confirm(picked, latest, readyAt, releasedAt,
+                        url -> { if(!recordingCurrent(risk))return;clearLinkWindow(picked,latest);
+                            worker.post(() -> deliverCapture(expected, picked, config, began, url, risk)); });
+            }, ()->{if(!recordingCurrent(risk))return;link.cancelOwner(picked);
+                deliverCapture(expected,picked,config,began,null,risk);});
+        } else deliverCapture(expected, picked, config, began, null, risk);
     }
 
     public void captureDragLink(ScopeCaptureWindow.Snapshot target, RuntimeSnapshot config, long down,
                                 long readyAt, long releasedAt, java.util.function.Consumer<String> complete) {
         ScopeLinkProbe link=linkProbe;
         if(link==null){complete.accept(null);return;}
-        prepareLinkWindow(target,config,()->link.confirmDrag(target,config,down,readyAt,releasedAt,
-                url->{clearLinkWindow(target,config);complete.accept(url);}),()->{link.cancel();complete.accept(null);});
+        RecordingRisk risk=riskFor(target);
+        prepareLinkWindow(target,config,risk,()->{
+            if(!recordingAllowed(risk))return;
+            link.confirmDrag(target,config,down,readyAt,releasedAt,
+                    url->{if(!recordingCurrent(risk))return;clearLinkWindow(target,config);complete.accept(url);});
+        },()->{if(!recordingCurrent(risk))return;link.cancelOwner(target);complete.accept(null);});
     }
 
     private void clearLinkWindow(ScopeCaptureWindow.Snapshot target,RuntimeSnapshot config) {
@@ -392,17 +615,26 @@ public final class SystemScopeCapture implements RuntimeServer.SourceCapture {
         if(pending!=null && pending.target==target && pending.config.identity.equals(config.identity))linkWindow=null;
     }
 
-    private void prepareLinkWindow(ScopeCaptureWindow.Snapshot target, RuntimeSnapshot config, Runnable ready, Runnable failed) {
+    private void prepareLinkWindow(ScopeCaptureWindow.Snapshot target, RuntimeSnapshot config, RecordingRisk risk,
+                                   Runnable ready, Runnable failed) {
+        if(!recordingAllowed(risk))return;
         try {
             byte[] token=new byte[24];new java.security.SecureRandom().nextBytes(token);
             LinkWindow pending=new LinkWindow(java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(token),
-                    config,target,inputGeneration.get(),ready,failed);
+                    config,target,inputGeneration.get(),risk,ready,failed);
             linkWindow=pending;
             Intent start=new Intent(LINK_PREPARE).setComponent(new ComponentName(HostPolicy.HOST_PACKAGE,
                     "com.miui.contentextension.services.TextContentExtensionService")).putExtra("link_nonce",pending.nonce);
-            if(context.get().startService(start)==null){linkWindow=null;failed.run();return;}
-            worker.postDelayed(()->{if(linkWindow==pending){linkWindow=null;pending.failed.run();}},8_000);
-        } catch(RuntimeException unavailable){linkWindow=null;event("failed","host_window_unavailable");failed.run();}
+            if(!recordingAllowed(risk)){if(linkWindow==pending)linkWindow=null;return;}
+            committed(risk);
+            if(context.get().startService(start)==null){if(linkWindow==pending)linkWindow=null;failed.run();return;}
+            worker.postDelayed(()->{if(linkWindow==pending && pending.input==inputGeneration.get()
+                    && recordingCurrent(pending.risk)){linkWindow=null;pending.failed.run();}},8_000);
+        } catch(RuntimeException unavailable){
+            LinkWindow pending=linkWindow;
+            if(pending!=null && pending.target==target && pending.risk==risk)linkWindow=null;
+            if(recordingCurrent(risk)){event("failed","host_window_unavailable");failed.run();}
+        }
     }
 
     @Override public Bundle linkWindow(Bundle request, RuntimeSnapshot config, boolean ready) {
@@ -410,31 +642,33 @@ public final class SystemScopeCapture implements RuntimeServer.SourceCapture {
         if(pending==null || request==null || request.size()!=1 || !pending.nonce.equals(request.getString("nonce"))
                 || !pending.config.identity.equals(config.identity) || pending.input!=inputGeneration.get()
                 || SystemClock.elapsedRealtime()>=pending.until || !physical.released())return Bundle.EMPTY;
+        if(!recordingAllowed(pending.risk) || linkWindow!=pending || pending.input!=inputGeneration.get())return Bundle.EMPTY;
         Bundle result=new Bundle();result.putBoolean("accepted",true);
         if(ready) synchronized(pending){
             if(!pending.acknowledged){pending.acknowledged=true;worker.post(()->{
-                if(linkWindow==pending && pending.input==inputGeneration.get())pending.ready.run();
+                if(linkWindow==pending && pending.input==inputGeneration.get() && recordingAllowed(pending.risk))pending.ready.run();
             });}
         }
         return result;
     }
 
     private void scheduleRecognitionFeedback(long expected, RuntimeSnapshot config, int device, long down,
-                                             long readyAt) {
+                                             long readyAt, RecordingRisk risk) {
         if (readyAt <= 0 || readyAt == Long.MAX_VALUE) return;
         worker.postDelayed(() -> recognitionFeedback(expected, config, device, down, readyAt, false,
-                SystemClock.elapsedRealtime()), Math.max(0, readyAt - SystemClock.elapsedRealtime()));
+                SystemClock.elapsedRealtime(), risk), Math.max(0, readyAt - SystemClock.elapsedRealtime()));
     }
 
     private void recognitionFeedback(long expected, RuntimeSnapshot config, int device, long down, long readyAt,
-                                     boolean releasedLongPress, long now) {
+                                     boolean releasedLongPress, long now, RecordingRisk risk) {
+        if(!recordingAllowed(risk))return;
         RuntimeServer server = runtime.get();
         RuntimeSnapshot latest = server == null ? null : server.sourceCaptureConfiguration();
         boolean enabled = config != null && (config.recognition || config.scopeCapture || config.scopeLinkProbe)
                 && latest != null && latest.identity.equals(config.identity);
         boolean held = expected == generation && gestureActive && gesture.isActive()
                 && physical.soleStream(0, device, down);
-        if (recognitionFeedbackSent
+        if (!recordingCurrent(risk) || recognitionFeedbackSent
                 || !LongPressFeedback.recognitionReady(enabled, held, releasedLongPress, readyAt, now)) return;
         recognitionFeedbackSent = true;
         try {
@@ -447,13 +681,18 @@ public final class SystemScopeCapture implements RuntimeServer.SourceCapture {
 
     private void deliverCapture(long expected, ScopeCaptureWindow.Snapshot picked, RuntimeSnapshot config,
                                 long began, String url) {
+        deliverCapture(expected,picked,config,began,url,riskFor(picked));
+    }
+
+    private void deliverCapture(long expected, ScopeCaptureWindow.Snapshot picked, RuntimeSnapshot config,
+                                long began, String url, RecordingRisk risk) {
         Bitmap image = null;
         try {
             long input = gestureInputGeneration;
-            RuntimeSnapshot latest = captureConfiguration(expected, picked, config, began, input);
+            RuntimeSnapshot latest = captureConfiguration(expected, picked, config, began, input, risk);
             if (latest == null) return;
             if (latest.scopeCapture && encodingImage) {
-                pendingEncoding = () -> deliverCapture(expected, picked, config, began, url);
+                pendingEncoding = () -> deliverCapture(expected, picked, config, began, url, risk);
                 return;
             }
             Context system = context.get();
@@ -465,9 +704,11 @@ public final class SystemScopeCapture implements RuntimeServer.SourceCapture {
                     || host.applicationInfo == null || !host.applicationInfo.enabled) return;
             if (latest.scopeCapture) {
                 try {
+                    if(!recordingAllowed(risk))return;
+                    committed(risk);
                     image = windows.captureBehindHost(atms.get(), picked, host.applicationInfo.uid);
                     if (image == null || image.isRecycled()) throw new IllegalStateException("scope_image_missing");
-                    encodeImage(image, expected, picked, config, began, input, host.applicationInfo.uid, text, url);
+                    encodeImage(image, expected, picked, config, began, input, host.applicationInfo.uid, text, url, risk);
                     image = null;
                     return;
                 } catch (ReflectiveOperationException | RuntimeException unavailable) {
@@ -475,23 +716,25 @@ public final class SystemScopeCapture implements RuntimeServer.SourceCapture {
                     event("failed", reasonOf(unavailable));
                 }
             }
-            submitCapture(expected, picked, config, began, input, host.applicationInfo.uid, text, url, null);
+            submitCapture(expected, picked, config, began, input, host.applicationInfo.uid, text, url, null, risk);
         } catch (ReflectiveOperationException | PackageManager.NameNotFoundException | RuntimeException failure) {
-            store.clear(); event("failed", reasonOf(failure));
+            clearStore(); event("failed", reasonOf(failure));
         } finally { if (image != null && !image.isRecycled()) image.recycle(); }
     }
 
     private RuntimeSnapshot captureConfiguration(long expected, ScopeCaptureWindow.Snapshot picked,
-                                                 RuntimeSnapshot config, long began, long input) {
+                                                 RuntimeSnapshot config, long began, long input, RecordingRisk risk) {
+        if(!recordingAllowed(risk))return null;
         RuntimeServer server = runtime.get();
         RuntimeSnapshot latest = server == null ? null : server.sourceCaptureConfiguration();
         return config != null && expected == generation && input == gestureInputGeneration && input == inputGeneration.get()
                 && !DragGestureGate.suppressLongPress() && latest != null && latest.identity.equals(config.identity)
-                && unlocked(context.get()) && physical.released() && !nativeUrlSince(picked.source, began) ? latest : null;
+                && recordingCurrent(risk) && unlocked(context.get()) && physical.released()
+                && !nativeUrlSince(picked.source, began) ? latest : null;
     }
 
     private void encodeImage(Bitmap image, long expected, ScopeCaptureWindow.Snapshot picked, RuntimeSnapshot config,
-                             long began, long input, int hostUid, String text, String url) {
+                             long began, long input, int hostUid, String text, String url, RecordingRisk risk) {
         encodingImage = true;
         try {
             imageEncoder.execute(() -> {
@@ -509,12 +752,12 @@ public final class SystemScopeCapture implements RuntimeServer.SourceCapture {
                 worker.post(() -> {
                     encodingImage = false;
                     try {
-                        if (captureConfiguration(expected, picked, config, began, input) == null) return;
+                        if (captureConfiguration(expected, picked, config, began, input, risk) == null) return;
                         if (error != null) {
                             event("failed", reasonOf(error));
                             if (!config.scopeLinkProbe) return;
                         }
-                        submitCapture(expected, picked, config, began, input, hostUid, text, url, encoded);
+                        submitCapture(expected, picked, config, began, input, hostUid, text, url, encoded, risk);
                     } finally {
                         Runnable pending = pendingEncoding; pendingEncoding = null;
                         if (pending != null) pending.run();
@@ -525,9 +768,9 @@ public final class SystemScopeCapture implements RuntimeServer.SourceCapture {
     }
 
     private void submitCapture(long expected, ScopeCaptureWindow.Snapshot picked, RuntimeSnapshot config,
-                               long began, long input, int hostUid, String text, String url, byte[] png) {
+                               long began, long input, int hostUid, String text, String url, byte[] png, RecordingRisk risk) {
         try {
-            RuntimeSnapshot latest = captureConfiguration(expected, picked, config, began, input);
+            RuntimeSnapshot latest = captureConfiguration(expected, picked, config, began, input, risk);
             if (latest == null || (nativeSince(picked.source, began) && !latest.scopeLinkProbe && text.isBlank())) return;
             Context system = context.get();
             var host = system.getPackageManager().getPackageInfo(HostPolicy.HOST_PACKAGE, PackageManager.MATCH_DISABLED_COMPONENTS);
@@ -541,7 +784,7 @@ public final class SystemScopeCapture implements RuntimeServer.SourceCapture {
                 }
             }
             if (png == null && url == null && text.isBlank() && !latest.scopeLinkProbe) return;
-            if (captureConfiguration(expected, picked, config, began, input) == null) return;
+            if (captureConfiguration(expected, picked, config, began, input, risk) == null) return;
             Point size = new Point(); Display display = system.getSystemService(DisplayManager.class).getDisplay(0);
             if (display == null) return; display.getRealSize(size);
             Bundle data = new Bundle(); data.putString("source", picked.source); data.putString("activity", picked.activity);
@@ -558,31 +801,167 @@ public final class SystemScopeCapture implements RuntimeServer.SourceCapture {
                     : !text.isBlank() ? store.issueContent(host.applicationInfo.uid, latest, data, text, url)
                     : url != null ? store.issueText(host.applicationInfo.uid, latest, data, url)
                     : store.issueResume(host.applicationInfo.uid, latest, data);
+            pendingCapture=new PendingCapture(picked,risk,input,nonce);
             pendingTarget = picked;
             pendingInputGeneration = input;
             Intent start = new Intent(ACTION).setComponent(new ComponentName(HostPolicy.HOST_PACKAGE,
                     "com.miui.contentextension.services.TextContentExtensionService")).putExtra("scope_nonce", nonce);
-            if (system.startService(start) == null) { store.clear(); throw new IllegalStateException("scope_host_unavailable"); }
+            if(!recordingAllowed(risk))return;
+            committed(risk);
+            if (system.startService(start) == null) { clearStore(); throw new IllegalStateException("scope_host_unavailable"); }
             event("submitted", "none");
         } catch (ReflectiveOperationException | PackageManager.NameNotFoundException | RuntimeException failure) {
-            store.clear(); event("failed", reasonOf(failure));
+            clearStore(); event("failed", reasonOf(failure));
         }
     }
 
     @Override public Bundle take(int owner, Bundle request, RuntimeSnapshot config) {
+        PendingCapture captured=pendingCapture;
+        return captured==null ? takeLegacy(owner,request,config) : take(owner,request,config,captured);
+    }
+
+    @Override public Bundle scopeRecordingRisk(Bundle request, RuntimeSnapshot config,
+                                               RuntimeServer.PolicyOperation operation) {
+        if (request == null || request.size() != 2 || config == null || operation == null
+                || !(request.get("source") instanceof String source)
+                || !(request.get("activity") instanceof String activity))
+            return hostRiskReply(false, "request_invalid");
+        RecordingRisk risk = recordingRisk;
+        if (risk == null) return hostRiskReply(false, "no_owner");
+        if (!hostRiskMatches(risk, source, activity, config))
+            return hostRiskReply(false, "owner_mismatch");
+        if (!operation.belongsTo(runtime.get()) || operation.configuration() != config || !operation.isCurrent())
+            return hostRiskReply(false, "policy_stale");
         try {
-            ScopeCaptureWindow.Snapshot target = pendingTarget;
+            boolean observed = false;
+            if (!risk.protectedRecording) {
+                windows.validate(atms.get(), risk.target);
+                observed = observesRecording(risk);
+            }
+            if (!operation.revalidate()) return hostRiskReply(false, "policy_stale");
+            if (!hostRiskMatches(risk, source, activity, config))
+                return hostRiskReply(false, "owner_stale");
+            windows.validate(atms.get(), risk.target);
+            if (!operation.isCurrent()) return hostRiskReply(false, "policy_stale");
+            if (!hostRiskMatches(risk, source, activity, config))
+                return hostRiskReply(false, "owner_stale");
+            if (observed) latchLiveRecordingRisk(risk);
+            if (!risk.protectedRecording) return hostRiskReply(false, "recording_unknown");
+            return hostRiskReply(true, "protected");
+        } catch (ReflectiveOperationException | RuntimeException unavailable) {
+            return hostRiskReply(false, "wms_unavailable");
+        }
+    }
+
+    private boolean hostRiskMatches(RecordingRisk risk, String source, String activity, RuntimeSnapshot config) {
+        return risk != null && source.equals(risk.target.source) && activity.equals(risk.target.activity)
+                && liveRecordingOwner(risk, config);
+    }
+
+    /** The drag observer can share the latch only for the very same WMS target and DOWN. */
+    public boolean protectsDrag(ScopeCaptureWindow.Snapshot target, RuntimeSnapshot config, int device, long down) {
+        RecordingRisk risk = recordingRisk;
+        if (risk == null || risk.device != device || risk.down != down || !risk.target.sameTarget(target)
+                || !liveRecordingOwner(risk, config)) return false;
+        if (!risk.protectedRecording && observesRecording(risk) && liveRecordingOwner(risk, config))
+            latchLiveRecordingRisk(risk);
+        return risk.protectedRecording && liveRecordingOwner(risk, config);
+    }
+
+    private boolean liveRecordingOwner(RecordingRisk risk, RuntimeSnapshot config) {
+        return config.identity.equals(risk.config.identity)
+                && risk.target.user == 0 && risk.target.display == 0
+                && risk.target.uid >= 10000 && risk.target.uid < 100000
+                && physical != null && physical.soleStream(risk.target.display, risk.device, risk.down)
+                && recordingRisk == risk && risk.input == inputGeneration.get()
+                && risk.menu == menuEpoch.get() && !risk.revoked;
+    }
+
+    private Bundle hostRiskReply(boolean protectedInteraction, String reason) {
+        if (module != null) worker.post(() -> {
+            try { event("host_recording_risk", reason); }
+            catch (RuntimeException ignored) { }
+        });
+        if (!protectedInteraction) return Bundle.EMPTY;
+        Bundle result = new Bundle();
+        result.putBoolean("protected", true);
+        return result;
+    }
+
+    private void latchLiveRecordingRisk(RecordingRisk risk) {
+        synchronized (risk) {
+            if (risk.protectedRecording) return;
+            risk.protectedRecording = true;
+        }
+        worker.post(() -> {
+            if (recordingRisk != risk || risk.input != inputGeneration.get() || risk.revoked) return;
+            event("recording_protected", risk.committed ? "already_committed" : "before_commit");
+            retireRecordingRisk(risk);
+        });
+    }
+
+    private Bundle take(int owner,Bundle request,RuntimeSnapshot config,PendingCapture captured) {
+        try {
+            if(!pendingCurrent(captured) || request==null || !captured.nonce.equals(request.getString("nonce"))
+                    || DragGestureGate.suppressLongPress() || !unlocked(context.get()) || !physical.released()
+                    || !recordingAllowed(captured.risk))return Bundle.EMPTY;
+            windows.validateBehindHost(atms.get(),captured.target,owner);
+            if(!recordingAllowed(captured.risk) || !pendingCurrent(captured))return Bundle.EMPTY;
+            Bundle result=store.take(owner,request,config);
+            if(result.containsKey("fd") || "text".equals(result.getString("kind"))
+                    || "content".equals(result.getString("kind")) || "resume".equals(result.getString("kind")))
+                clearPendingCapture(captured,false);
+            return result;
+        }catch(ReflectiveOperationException | RuntimeException changed){
+            captured.revoked=true;
+            if(captured.risk!=null)captured.risk.revoked=true;
+            clearPendingCapture(captured,true);
+            return Bundle.EMPTY;
+        }
+    }
+
+    private boolean pendingCurrent(PendingCapture captured) {
+        return captured!=null && pendingCapture==captured && !captured.revoked
+                && captured.input==inputGeneration.get() && recordingCurrent(captured.risk);
+    }
+
+    private Bundle takeLegacy(int owner, Bundle request, RuntimeSnapshot config) {
+        if(pendingCapture!=null)return Bundle.EMPTY;
+        ScopeCaptureWindow.Snapshot target = pendingTarget;
+        RecordingRisk risk=riskFor(target);
+        try {
             if (DragGestureGate.suppressLongPress() || target == null || pendingInputGeneration != inputGeneration.get()
                     || !unlocked(context.get()) || !physical.released()) return Bundle.EMPTY;
+            if(!recordingAllowed(risk))return Bundle.EMPTY;
             windows.validateBehindHost(atms.get(), target, owner);
+            if(!recordingAllowed(risk) || pendingCapture!=null || pendingTarget!=target
+                    || pendingInputGeneration!=inputGeneration.get())return Bundle.EMPTY;
             Bundle result = store.take(owner, request, config);
             if (result.containsKey("fd") || "text".equals(result.getString("kind"))
                     || "content".equals(result.getString("kind"))
-                    || "resume".equals(result.getString("kind"))) pendingTarget = null;
+                    || "resume".equals(result.getString("kind"))) {
+                if(pendingCapture==null && pendingTarget==target)pendingTarget=null;
+            }
             return result;
         } catch (ReflectiveOperationException | RuntimeException changed) {
-            store.clear(); pendingTarget = null; return Bundle.EMPTY;
+            if(pendingCapture==null){store.clear();pendingTarget=null;}
+            return Bundle.EMPTY;
         }
+    }
+
+    private void clearPendingCapture(PendingCapture captured,boolean clearStore) {
+        captured.revoked=true;
+        worker.post(()->{
+            if(pendingCapture!=captured)return;
+            if(clearStore)store.clear();
+            if(pendingTarget==captured.target)pendingTarget=null;
+        });
+    }
+
+    private void clearStore() {
+        PendingCapture captured=pendingCapture;
+        if(captured!=null)captured.revoked=true;
+        store.clear();
     }
     @Override public Bundle recognitionVisible(Bundle request, RuntimeSnapshot config) {
         Bundle result = new Bundle();
@@ -594,12 +973,29 @@ public final class SystemScopeCapture implements RuntimeServer.SourceCapture {
         return result;
     }
 
+    @Override public void invalidateRecognitionRetention() {
+        menuRetention.cancel();
+        RecordingRisk risk=recordingRisk;
+        if(risk!=null)risk.revoked=true;
+    }
+
     @Override public Bundle retainRecognition(Bundle request,RuntimeSnapshot config) {
+        return retainRecognition(request,config,null);
+    }
+
+    @Override public Bundle retainRecognition(Bundle request,RuntimeSnapshot config,RuntimeServer.PolicyOperation operation) {
         Bundle result=new Bundle();
         if(request==null || request.size()!=3 || !(request.get("source") instanceof String source)
                 || !(request.get("activity") instanceof String activity)
                 || !(request.get("shown_elapsed") instanceof Long shown))return result;
-        boolean keep=menuNavigationGuardReady && menuRetention.claim(source,activity,shown);
+        MenuTouch touch=menuTouch;
+        RecordingRisk risk=touch==null ? null : riskFor(touch.target);
+        boolean keep=recordingAllowed(risk) && menuNavigationGuardReady && (operation==null ? menuRetention.claim(source,activity,shown)
+                : operation.belongsTo(runtime.get()) && config==operation.configuration()
+                        && menuRetention.claim(source,activity,shown,config,
+                        ()->recordingCurrent(risk) && operation.isCurrent(),
+                        ()->operation.revalidate() && recordingAllowed(risk)));
+        keep=keep && recordingAllowed(risk);
         result.putBoolean("keep",keep);
         if(module!=null)module.log(4,"TaplusBridge","recognition menu stage=echo outcome="+(keep?"kept":"passed"));
         return result;
@@ -628,11 +1024,14 @@ public final class SystemScopeCapture implements RuntimeServer.SourceCapture {
                 && source.equals(signal.source) && signal.at >= began;
     }
     private void cancel() {
+        RecordingRisk risk=recordingRisk;
+        revokeRecordingRisk(risk);
         SystemAssistContent content = assistContent;
         if (content != null && origin != null) content.cancelPending(origin, configuration, downElapsed, sourceDown);
         generation++; gestureActive = false; origin = null; configuration = null; gesture.cancel(); pendingEncoding = null;
         recognitionFeedbackSent = false;
-        ScopeLinkProbe link = linkProbe; if (link != null) link.cancel();
+        ScopeLinkProbe link = linkProbe;
+        if (link != null) {if(risk==null)link.cancel();else link.cancelOwner(risk.target);}
     }
     private static boolean unlocked(Context context) {
         if (context == null) return false;

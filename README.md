@@ -12,9 +12,9 @@
 
 ---
 
-当前正式版：**0.15.51 / 83** · [下载 APK](https://github.com/yudigaga/TaplusBridge/releases/latest) · [更新说明](docs/release-notes-0.15.51-release.md)
+当前正式版：**0.15.53 / 85** · [下载 APK](https://github.com/yudigaga/TaplusBridge/releases/latest) · [更新说明](docs/release-notes-0.15.53-release.md)
 
-0.15.51 修正来源新弹窗的关闭时机：仅在模块长按识别或拖动阶段到达后尝试关闭，系统原生长按阶段保留；提前松手不会在之后补发关闭。见[阶段边界说明](docs/2026-11-14-popup-stage-boundary.md)。
+0.15.53 在收到同一次手势的有效抬手后，才尝试关闭符合条件的来源菜单。系统确认来源应用正在录音时，会保护宿主首次识别呈现和长按拖动交接。覆盖范围见[更新说明](docs/release-notes-0.15.53-release.md)。
 
 基于 libxposed API 102 的传送门增强模块。把识别到的链接交给规则指定的应用，提供长按识别、四方向拖动、翻译和 Google Lens 识图，支持通过 Root 或 Shizuku 解冻目标应用。
 
@@ -44,7 +44,7 @@
 
 - [使用指南](docs/usage.md)：设置保存、来源名单、三段计时、补点、浏览器、选字工具条、翻译与 Lens。
 - [文档索引](docs/README.md)：当前指南、本版技术记录及历史版本记录。
-- [0.15.51 构建与发布验证](docs/2026-11-14-release-0.15.51.md)：签名、R8、对齐和测试证据。
+- [0.15.53 构建与发布验证](docs/2026-11-19-release-0.15.53.md)：签名、R8、对齐和测试证据。
 
 隐藏桌面图标后，可从 **LSPosed → TaplusBridge → 模块设置**重新进入，在「概览 → 运行与授权」恢复图标。隐藏图标不关闭模块。
 

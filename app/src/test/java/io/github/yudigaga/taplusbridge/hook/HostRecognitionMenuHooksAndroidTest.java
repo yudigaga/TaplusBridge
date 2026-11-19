@@ -10,9 +10,9 @@ import android.os.Looper;
 import android.os.SystemClock;
 import android.view.View;
 import android.view.WindowManager;
+import io.github.yudigaga.taplusbridge.runtime.IRuntimeBridge;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
-import java.lang.reflect.Proxy;
 import java.time.Duration;
 import java.util.List;
 import java.util.HashMap;
@@ -56,18 +56,23 @@ public final class HostRecognitionMenuHooksAndroidTest {
         installHost("5.1.5", 50015);
         notified = new CountDownLatch(1);
         reply.set(accepted(true));
-        Class<?> bridge = Class.forName("io.github.yudigaga.taplusbridge.runtime.IRuntimeBridge");
-        Object remote = Proxy.newProxyInstance(bridge.getClassLoader(), new Class<?>[]{bridge}, (target, method, args) -> {
-            if (!"call".equals(method.getName())) return null;
-            assertEquals("recognition_visible", args[0]);
-            calledOnMain.set(Looper.myLooper() == Looper.getMainLooper());
-            Bundle result = reply.get();
-            CountDownLatch gate = requests.isEmpty() ? firstReply : null;
-            requests.add(new Bundle((Bundle) args[1]));
-            notified.countDown();
-            if (gate != null) assertTrue("fixture must release the first Binder reply", gate.await(2, TimeUnit.SECONDS));
-            return result;
-        });
+        Object remote = new IRuntimeBridge.Stub() {
+            @Override public Bundle call(String method, Bundle request) throws android.os.RemoteException {
+                assertEquals("recognition_visible", method);
+                calledOnMain.set(Looper.myLooper() == Looper.getMainLooper());
+                Bundle result = reply.get();
+                CountDownLatch gate = requests.isEmpty() ? firstReply : null;
+                requests.add(new Bundle(request));
+                notified.countDown();
+                if (gate != null) {
+                    try { assertTrue("fixture must release the first Binder reply", gate.await(2, TimeUnit.SECONDS)); }
+                    catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt(); throw new android.os.RemoteException("fixture interrupted");
+                    }
+                }
+                return result;
+            }
+        };
         installBridge(remote);
     }
 

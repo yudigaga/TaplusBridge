@@ -16,6 +16,7 @@ import io.github.libxposed.api.XposedModule;
 import io.github.yudigaga.taplusbridge.bridge.BridgeContract;
 import io.github.yudigaga.taplusbridge.runtime.BridgeTransport;
 import io.github.yudigaga.taplusbridge.runtime.RuntimeClient;
+import io.github.yudigaga.taplusbridge.drag.DragTrace;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.lang.ref.WeakReference;
@@ -41,6 +42,7 @@ public final class HostDragHooks {
     });
     private final AtomicLong generation = new AtomicLong();
     private volatile Pending pending;
+    private final ThreadLocal<Object> cancellingNative = new ThreadLocal<>();
     private final HostLongPressDrag longPress;
     private static volatile HostDragHooks installed;
     private static final ThreadLocal<NativeDelivery> delivering = new ThreadLocal<>();
@@ -55,6 +57,14 @@ public final class HostDragHooks {
         long recognitionEpoch = -1;
         String recognizedText = "";
         boolean recommendationWaitLogged;
+        String readinessWaitReason = "";
+        String readyState = "";
+        DragTrace trace = DragTrace.unavailable();
+        long performDueAt = -1, queueLateMillis = -1;
+        int policyReads;
+        long policyTotalMillis;
+        String lastPolicyIdentity = "", lastPolicyStatus = "";
+        boolean stepPolicyLogged, snapshotPolicyLogged;
         Pending(long generation, Object result, String token, String action, boolean recognition,
                 boolean image, boolean preserveNative, long deadline) {
             this.generation = generation; this.result = result; this.token = token; this.action = action;
@@ -100,7 +110,8 @@ public final class HostDragHooks {
         switchMode = method(card, "doSwitchRecognition", boolean.class);
         longPress = new HostLongPressDrag(module, loader, (context, target, token, nativeResult) -> {
             long epoch = generation.incrementAndGet(); pending = null;
-            worker.execute(() -> take(context, target, token, epoch, nativeResult));
+            DragTrace trace = HostLongPressDrag.deliveringTrace();
+            worker.execute(() -> take(context, target, token, epoch, nativeResult, trace));
         });
     }
 
@@ -189,6 +200,8 @@ public final class HostDragHooks {
             module.hook(method(service, name)).setId("taplusbridge:drag-" + name)
                     .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).intercept(chain -> {
                         pending = null;
+                        if ("onDestroy".equals(name) || cancellingNative.get() != chain.getThisObject())
+                            generation.incrementAndGet();
                         if ("onDestroy".equals(name)) longPress.close(chain.getThisObject());
                         return chain.proceed();
                     });
@@ -201,6 +214,10 @@ public final class HostDragHooks {
     }
 
     private void take(Context context, Object service, String token, long epoch, Object nativeResult) {
+        take(context, service, token, epoch, nativeResult, DragTrace.unavailable());
+    }
+
+    private void take(Context context, Object service, String token, long epoch, Object nativeResult, DragTrace trace) {
         Bitmap image = null;
         try {
             Bundle request = new Bundle(); request.putString("token", token);
@@ -248,10 +265,11 @@ public final class HostDragHooks {
                         // The authorized result also owns metadata and extra jobs needed for hidden card links.
                         target = acceptedNative;
                         if (!reuse && ready != null) ready.recycle();
-                    } else cancel.invoke(service);
+                    } else cancelNative(service);
                     Object selected = target;
                     Pending next = new Pending(epoch, selected, token, action, recognitionMode,
                             ready != null, preserveNative, SystemClock.elapsedRealtime() + 20_000);
+                    next.trace = trace;
                     pending = next;
                     if (reuse) {
                         if (ready != null) ready.recycle();
@@ -270,7 +288,7 @@ public final class HostDragHooks {
                                 deliver.invoke(callback.get(service), selected);
                             });
                             module.log(4, "TaplusBridge", "drag delivery stage=native_submitted action=" + next.action);
-                            main.post(() -> perform(context, service, next));
+                            postPerform(context, service, next, 0);
                         } catch (ReflectiveOperationException | RuntimeException failure) { fail(context, next, failure); }
                     });
                 } catch (ReflectiveOperationException | RuntimeException failure) {
@@ -286,6 +304,10 @@ public final class HostDragHooks {
 
     private void perform(Context context, Object service, Pending next) {
         if (pending != next || generation.get() != next.generation) return;
+        if (next.performDueAt >= 0) {
+            next.queueLateMillis = Math.max(0, SystemClock.uptimeMillis() - next.performDueAt);
+            next.performDueAt = -1;
+        }
         try {
             if (catcherResult.get(null) != next.result) { pending = null; return; }
             if (SystemClock.elapsedRealtime() > next.deadline) {
@@ -299,11 +321,12 @@ public final class HostDragHooks {
                 if (next.recognition) {
                     switchMode.invoke(card, true);
                     if (next.image && !Boolean.TRUE.equals(hasRefreshed.invoke(card))) refreshImageRecognition.invoke(card);
-                    RecognitionPolicy.State policy = RecognitionPolicy.current(context);
+                    RecognitionPolicy.State policy = readPolicy(context, next, "policy_step");
                     if (policy.disabled(Channel.SEGMENT)) {
                         boolean ocrComplete = recognitionHooks != null
                                 && recognitionHooks.ocrComplete(service, next.result, next.recognitionEpoch);
                         if (shouldCompleteWithoutSegments(next.image, false, !policy.disabled(Channel.OCR), ocrComplete)) {
+                            nativeReady(next, " segment_enabled=false ocr_complete=" + ocrComplete);
                             RecognitionHooks.DragSnapshot captured = dragSnapshot(service, next);
                             if (recognitionHooks != null && captured == null && next.recognitionEpoch >= 0) {
                                 pending = null; return;
@@ -315,7 +338,7 @@ public final class HostDragHooks {
                                 next.recognizedText = recognitionHooks.ocrText(service, next.result, next.recognitionEpoch);
                             completeRecognition(context, service, next, next.recognizedText); return;
                         }
-                        main.postDelayed(() -> perform(context, service, next), 100); return;
+                        awaitNativeReady(context, service, next, "ocr_pending"); return;
                     }
                     Object textCard = getItem.invoke(adapter.get(card), 0);
                     int count = (Integer) segmentCount.invoke(textCard);
@@ -324,6 +347,7 @@ public final class HostDragHooks {
                         selectAll(textCard);
                         String words = (String) naturalWords.invoke(segments.get(textCard));
                         next.recognizedText = words == null ? "" : words;
+                        nativeReady(next, " segment_enabled=true");
                         RecognitionHooks.DragSnapshot captured = dragSnapshot(service, next);
                         if (recognitionHooks != null && captured == null && next.recognitionEpoch >= 0) {
                             pending = null; return;
@@ -331,24 +355,22 @@ public final class HostDragHooks {
                         if (recognitionHooks != null && (captured == null || captured.waiting())) {
                             awaitRecommendation(context, service, next, captured); return;
                         }
-                        module.log(4, "TaplusBridge", "drag delivery stage=recognition_ready action=" + next.action
-                                + " chars=" + (words == null ? 0 : words.length()) + " links="
-                                + (captured == null ? 0 : captured.links().size()) + " elapsed_ms="
-                                + Math.max(0, SystemClock.elapsedRealtime() - next.beganAt));
+                        stage(next, "recognition_ready", " boundary=host chars=" + (words == null ? 0 : words.length())
+                                + " links=" + (captured == null ? 0 : captured.links().size()));
                         completeRecognition(context, service, next, next.recognizedText); return;
                     }
-                    main.postDelayed(() -> perform(context, service, next), 100); return;
+                    awaitNativeReady(context, service, next, "segments_pending"); return;
                 }
                 if (expanded.get() != root) {
                     expanded = new WeakReference<>(root);
                     Object compact = splash.get(service);
                     if (compact != null) hideSplash.invoke(compact, false);
                     showMain.invoke(service, "translate".equals(next.action) || ("portal".equals(next.action) && !next.image));
-                    main.postDelayed(() -> perform(context, service, next), 100); return;
+                    postPerform(context, service, next, 100); return;
                 }
                 if ("portal".equals(next.action)) {
                     if (view.isShown()) pending = null;
-                    else main.postDelayed(() -> perform(context, service, next), 100);
+                    else postPerform(context, service, next, 100);
                     return;
                 }
                 boolean text = "translate".equals(next.action);
@@ -363,18 +385,32 @@ public final class HostDragHooks {
                     pending = null; action.performClick(); return;
                 }
             }
-            main.postDelayed(() -> perform(context, service, next), 100);
+            next.readyState = "";
+            postPerform(context, service, next, 100);
         } catch (ReflectiveOperationException | RuntimeException failure) { fail(context, next, failure); }
     }
 
     private void awaitRecommendation(Context context, Object service, Pending next, RecognitionHooks.DragSnapshot captured) {
         if (!next.recommendationWaitLogged) {
             next.recommendationWaitLogged = true;
-            if (module != null) module.log(4, "TaplusBridge", "drag delivery stage=recognition_wait action=" + next.action
-                    + " reason=" + (captured == null ? "snapshot_pending" : "recommendation_pending")
-                    + " elapsed_ms=" + Math.max(0, SystemClock.elapsedRealtime() - next.beganAt));
+            stage(next, "recognition_wait", " reason=" + (captured == null ? "snapshot_pending" : "recommendation_pending"));
         }
-        main.postDelayed(() -> perform(context, service, next), 100);
+        postPerform(context, service, next, 100);
+    }
+
+    private void awaitNativeReady(Context context, Object service, Pending next, String reason) {
+        next.readyState = "";
+        if (!reason.equals(next.readinessWaitReason)) {
+            next.readinessWaitReason = reason; stage(next, "recognition_wait", " reason=" + reason);
+        }
+        postPerform(context, service, next, 100);
+    }
+
+    private void nativeReady(Pending next, String state) {
+        next.readinessWaitReason = "";
+        if (!state.equals(next.readyState)) {
+            next.readyState = state; stage(next, "ocr_segment_ready", state);
+        }
     }
 
     private void selectAll(Object textCard) throws ReflectiveOperationException {
@@ -390,21 +426,32 @@ public final class HostDragHooks {
     private void completeRecognition(Context context, Object service, Pending next, String text) {
         if (pending != next || generation.get() != next.generation) return;
         final String acceptedText;
-        try { acceptedText = RecognitionPolicy.recognizedText(next.result, next.image, text, RecognitionPolicy.read(context)); }
+        try { acceptedText = RecognitionPolicy.recognizedText(next.result, next.image, text,
+                readPolicy(context, next, "policy_commit").channels()); }
         catch (ReflectiveOperationException | RuntimeException unavailable) { fail(context, next, unavailable); return; }
         RecognitionHooks.DragSnapshot captured = dragSnapshot(service, next);
         if (recognitionHooks != null && captured == null && next.recognitionEpoch >= 0) {
             pending = null; return;
         }
         List<String> links = captured == null ? List.of() : captured.links();
+        stage(next, "snapshot_ready", " links=" + links.size() + " recognition_epoch=" + next.recognitionEpoch);
         longPress.offerRecognizedLinks(service, next.result, links);
         pending = null;
+        long completionQueuedAt = SystemClock.elapsedRealtime();
         worker.execute(() -> {
             if (generation.get() != next.generation) return;
             try {
+                long workerStarted = SystemClock.elapsedRealtime();
+                stage(next, "drag_complete_started", " worker_queue_ms=" + Math.max(0, workerStarted - completionQueuedAt));
                 Bundle request = new Bundle(); request.putString("token", next.token); request.putString("text", acceptedText);
                 request.putStringArrayList("links", new ArrayList<>(links));
-                Bundle completed = BridgeTransport.call(context, "drag_complete", request);
+                Bundle completed;
+                long ipcBegan = SystemClock.elapsedRealtime();
+                try { completed = BridgeTransport.call(context, "drag_complete", request); }
+                finally {
+                    long ipcMillis = Math.max(0, SystemClock.elapsedRealtime() - ipcBegan);
+                    stage(next, "drag_complete", " links=" + links.size() + " ipc_ms=" + ipcMillis);
+                }
                 if (completed == null || completed.getString("token") == null) throw new IllegalStateException("drag_expired");
                 module.log(4, "TaplusBridge", "drag delivery stage=recognition_complete action=" + next.action
                         + " links=" + links.size() + " elapsed_ms=" + Math.max(0, SystemClock.elapsedRealtime() - next.beganAt));
@@ -416,16 +463,27 @@ public final class HostDragHooks {
                             module.log(4, "TaplusBridge", "drag delivery stage=choice_launch outcome=abandoned reason=native_panel_changed action=" + next.action);
                             return;
                         }
-                        if (!next.preserveNative) cancel.invoke(service);
+                        if (!next.preserveNative) cancelNative(service);
                         worker.execute(() -> {
                             if (generation.get() != next.generation) return;
                             try {
                                 if (catcherResult.get(null) != next.result) return;
-                                Bundle opened = RuntimeClient.call(context, "drag_choose", choice);
-                                if (opened == null || !opened.getBoolean("accepted")) {
-                                    module.log(5, "TaplusBridge", "drag delivery stage=choice_launch outcome=declined action=" + next.action);
+                                long choiceBegan = SystemClock.elapsedRealtime();
+                                RuntimeClient.CallResult call = RuntimeClient.callDetailed(context, "drag_choose", choice);
+                                Bundle opened = call.response();
+                                if (call.state() != RuntimeClient.CallState.REPLIED) {
+                                    stage(next, "choice_launch", " outcome=" + (call.state() == RuntimeClient.CallState.NOT_CONNECTED
+                                            ? "not_connected" : "outcome_unknown") + " ipc_ms="
+                                            + Math.max(0, SystemClock.elapsedRealtime() - choiceBegan));
+                                    // An unknown reply may follow a successful launch. Do not replay or tell the user to repeat it.
+                                    if (call.state() == RuntimeClient.CallState.NOT_CONNECTED)
+                                        fail(context, null, new IllegalStateException("drag_not_connected"));
+                                    else main.post(() -> Toast.makeText(context, "操作结果未确认，请先检查目标应用", Toast.LENGTH_LONG).show());
+                                } else if (!opened.getBoolean("accepted")) {
+                                    stage(next, "choice_launch", " outcome=declined");
                                     fail(context, null, new IllegalStateException("drag_choice"));
-                                } else module.log(4, "TaplusBridge", "drag delivery stage=choice_launch outcome=accepted action=" + next.action);
+                                } else stage(next, "chooser_started", " outcome=accepted ipc_ms="
+                                        + Math.max(0, SystemClock.elapsedRealtime() - choiceBegan));
                             } catch (IllegalAccessException unavailable) { fail(context, null, unavailable); }
                         });
                     } catch (ReflectiveOperationException | RuntimeException unavailable) { fail(context, null, unavailable); }
@@ -438,9 +496,44 @@ public final class HostDragHooks {
 
     private RecognitionHooks.DragSnapshot dragSnapshot(Object service, Pending next) {
         if (recognitionHooks == null) return null;
-        RecognitionHooks.DragSnapshot snapshot = recognitionHooks.dragSnapshot(service, next.result, next.recognitionEpoch);
+        RecognitionHooks.DragSnapshot snapshot = recognitionHooks.dragSnapshot(service, next.result, next.recognitionEpoch,
+                policy -> observePolicy(next, "policy_snapshot", policy));
         if (snapshot != null && next.recognitionEpoch < 0) next.recognitionEpoch = snapshot.epoch();
         return snapshot;
+    }
+
+    private RecognitionPolicy.State readPolicy(Context context, Pending next, String phase) {
+        RecognitionPolicy.State state = RecognitionPolicy.current(context); observePolicy(next, phase, state); return state;
+    }
+
+    private void observePolicy(Pending next, String phase, RecognitionPolicy.State state) {
+        next.policyReads++;
+        next.policyTotalMillis += state.readMillis();
+        boolean changed = !next.lastPolicyIdentity.equals(state.identity()) || !next.lastPolicyStatus.equals(state.status());
+        boolean first = "policy_step".equals(phase) ? !next.stepPolicyLogged : !next.snapshotPolicyLogged;
+        if ("policy_step".equals(phase)) next.stepPolicyLogged = true;
+        else if ("policy_snapshot".equals(phase)) next.snapshotPolicyLogged = true;
+        next.lastPolicyIdentity = state.identity(); next.lastPolicyStatus = state.status();
+        if (first || changed || "policy_commit".equals(phase)) stage(next, phase, state.diagnosticFields());
+    }
+
+    private void stage(Pending next, String phase, String details) {
+        if (module != null) module.log(4, "TaplusBridge", "drag delivery stage=" + phase + " action=" + next.action
+                + " delivery_id=" + next.generation + next.trace.fields(SystemClock.elapsedRealtime())
+                + " elapsed_ms=" + Math.max(0, SystemClock.elapsedRealtime() - next.beganAt)
+                + " main_queue_late_ms=" + next.queueLateMillis + " policy_reads=" + next.policyReads
+                + " policy_ipc_total_ms=" + next.policyTotalMillis + details);
+    }
+
+    private void postPerform(Context context, Object service, Pending next, long delay) {
+        next.performDueAt = SystemClock.uptimeMillis() + delay;
+        main.postDelayed(() -> perform(context, service, next), delay);
+    }
+
+    private void cancelNative(Object service) throws ReflectiveOperationException {
+        Object previous = cancellingNative.get(); cancellingNative.set(service);
+        try { cancel.invoke(service); }
+        finally { if (previous == null) cancellingNative.remove(); else cancellingNative.set(previous); }
     }
 
     private void fail(Context context, Pending next, Throwable failure) {

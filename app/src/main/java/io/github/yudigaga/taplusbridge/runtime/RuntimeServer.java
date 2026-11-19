@@ -32,14 +32,22 @@ public final class RuntimeServer {
     private final LinkedHashMap<String,Long> dragLaunches=new LinkedHashMap<>();
     private final SecureRandom random=new SecureRandom();
     private final Object snapshotLock=new Object();
-    private volatile String snapshotRaw;
     private volatile RuntimeSnapshot snapshot;
+    private long policyEpoch;
     private Lease capture;
     public interface SourceCapture {
         Bundle take(int owner, Bundle request, RuntimeSnapshot config);
         void nativeResult(Bundle request);
         default Bundle recognitionVisible(Bundle request, RuntimeSnapshot config) { return Bundle.EMPTY; }
         default Bundle retainRecognition(Bundle request, RuntimeSnapshot config) { return Bundle.EMPTY; }
+        default Bundle scopeRecordingRisk(Bundle request, RuntimeSnapshot config, PolicyOperation operation) {
+            return Bundle.EMPTY;
+        }
+        default Bundle retainRecognition(Bundle request, RuntimeSnapshot config, PolicyOperation operation) {
+            return retainRecognition(request, config);
+        }
+        /** Synchronous cancellation only; must not reenter runtime/configuration or take the WMS lock. */
+        default void invalidateRecognitionRetention() { }
         default boolean linkReady() { return false; }
         default boolean ownsLinkPick(Bundle request) { return false; }
         default Bundle linkWindow(Bundle request, RuntimeSnapshot config, boolean ready) { return Bundle.EMPTY; }
@@ -75,6 +83,53 @@ public final class RuntimeServer {
         RuntimeSnapshot config = current();
         return config != null && config.build == BuildConfig.VERSION_CODE && config.user == 0 && config.enabled
                 && config.recognition && config.sourceScope.managed ? config : null;
+    }
+    /** One local, synchronous policy read; external authority still needs fresh boundary checks. */
+    public final class PolicyOperation implements AutoCloseable {
+        private final Thread owner=Thread.currentThread();
+        private final RuntimeSnapshot configuration;
+        private final long epoch;
+        private boolean closed,revoked;
+        private PolicyOperation(RuntimeSnapshot configuration,long epoch) {
+            this.configuration=configuration;this.epoch=epoch;
+        }
+        public RuntimeSnapshot configuration() {
+            synchronized(snapshotLock){return currentInMemory()?configuration:null;}
+        }
+        public boolean isCurrent() {
+            synchronized(snapshotLock){return currentInMemory();}
+        }
+        public boolean belongsTo(RuntimeServer expected) {
+            synchronized(snapshotLock){return expected==RuntimeServer.this && currentInMemory();}
+        }
+        private boolean currentInMemory() {
+            return Thread.currentThread()==owner && !closed && !revoked && configuration!=null
+                    && snapshot==configuration && policyEpoch==epoch;
+        }
+        public boolean revalidate() {
+            synchronized(snapshotLock) {
+                if(Thread.currentThread()!=owner || closed || revoked)return false;
+                if(!currentInMemory()){revoked=true;return false;}
+                RuntimeSnapshot latest=current();
+                if(latest!=configuration || !currentInMemory())revoked=true;
+                return !revoked;
+            }
+        }
+        @Override public void close() {
+            synchronized(snapshotLock){closed=true;}
+        }
+    }
+    public PolicyOperation beginPolicyOperation() {
+        synchronized(snapshotLock) {
+            RuntimeSnapshot config=current();
+            return new PolicyOperation(config,policyEpoch);
+        }
+    }
+    /** Source DOWN owns this operation only through its synchronous target inspection. */
+    public PolicyOperation beginSourceCaptureOperation() {
+        synchronized(snapshotLock) {
+            return new PolicyOperation(sourceCaptureConfiguration(),policyEpoch);
+        }
     }
     private record Lease(String nonce,String source,int sourceUid,int owner,long issued,boolean taken,String identity,boolean probe){}
     public RuntimeServer(Context context,Handler worker,Supplier<SharedPreferences> preferences,
@@ -116,37 +171,40 @@ public final class RuntimeServer {
     };
     public IRuntimeBridge binder(){return binder;}
     private RuntimeSnapshot current(){
-        long started=SystemClock.elapsedRealtimeNanos();
-        try{
-            var own=context.getPackageManager().getApplicationInfo(BridgeContract.APP_PACKAGE,
-                    PackageManager.MATCH_DISABLED_COMPONENTS|PackageManager.MATCH_UNINSTALLED_PACKAGES);
-            if((own.flags&android.content.pm.ApplicationInfo.FLAG_INSTALLED)==0 || own.uid/100000!=0){
-                perf("snapshot_read",started,"module_missing");return null;
-            }
-            String raw=preferences.get().getString(RuntimeSnapshot.KEY,null);
-            RuntimeSnapshot cached=snapshot;
-            if(cached!=null && raw!=null && raw.equals(snapshotRaw)){
-                return cached;
-            }
-            String outcome;
-            RuntimeSnapshot result;
-            synchronized(snapshotLock){
-                raw=preferences.get().getString(RuntimeSnapshot.KEY,null);
-                cached=snapshot;
-                if(cached!=null && raw!=null && raw.equals(snapshotRaw)){
-                    result=cached;outcome="cache_hit";
-                }else{
-                    result=RuntimeSnapshot.parse(raw);
-                    snapshotRaw=raw;snapshot=result;outcome="parsed";
-                    event("runtime config stage=loaded build="+result.build
-                            +" supplemental_tap="+(result.scopeLinkProbe?"on":"off"));
+        synchronized(snapshotLock){
+            long started=SystemClock.elapsedRealtimeNanos();
+            try{
+                var own=context.getPackageManager().getApplicationInfo(BridgeContract.APP_PACKAGE,
+                        PackageManager.MATCH_DISABLED_COMPONENTS|PackageManager.MATCH_UNINSTALLED_PACKAGES);
+                if((own.flags&android.content.pm.ApplicationInfo.FLAG_INSTALLED)==0 || own.uid/100000!=0){
+                    revokePolicyOperations();
+                    perf("snapshot_read",started,"module_missing");return null;
                 }
+                String raw=preferences.get().getString(RuntimeSnapshot.KEY,null);
+                RuntimeSnapshot cached=snapshot;
+                if(cached!=null && raw!=null && raw.equals(cached.encode())){
+                    return cached;
+                }
+                RuntimeSnapshot result=RuntimeSnapshot.parse(raw);
+                if(cached!=null && !cached.identity.equals(result.identity))revokePolicyOperations();
+                snapshot=result;
+                event("runtime config stage=loaded build="+result.build
+                        +" supplemental_tap="+(result.scopeLinkProbe?"on":"off"));
+                perf("snapshot_read",started,"parsed");
+                return result;
+            }catch(PackageManager.NameNotFoundException|RuntimeException missing){
+                revokePolicyOperations();
+                perf("snapshot_read",started,"unavailable");return null;
             }
-            if(!"cache_hit".equals(outcome))perf("snapshot_read",started,outcome);
-            return result;
-        }catch(PackageManager.NameNotFoundException|RuntimeException missing){
-            perf("snapshot_read",started,"unavailable");return null;
         }
+    }
+    private void revokePolicyOperations(){
+        policyEpoch++;
+        invalidateRecognitionRetention();
+    }
+    private void invalidateRecognitionRetention(){
+        SourceCapture capture=sourceCapture;
+        if(capture!=null)capture.invalidateRecognitionRetention();
     }
     private boolean host(int uid){
         try {
@@ -171,8 +229,8 @@ public final class RuntimeServer {
         }
         if((dragLaunch || dragConsume) && isHost)return declined("unauthorized");
         long identity=Binder.clearCallingIdentity();
-        try {
-            RuntimeSnapshot config=current();
+        try (PolicyOperation operation=beginPolicyOperation()) {
+            RuntimeSnapshot config=operation.configuration();
             if ("scope_link_window_check".equals(method) || "scope_link_window_ready".equals(method)) {
                 SourceCapture capture = sourceCapture;
                 return config == null || config.build != BuildConfig.VERSION_CODE || !config.enabled
@@ -206,6 +264,18 @@ public final class RuntimeServer {
                 if (result.getBoolean("owned")) result.putString("identity", config.identity);
                 return result;
             }
+            if ("scope_recording_risk".equals(method)) {
+                SourceCapture capture = sourceCapture;
+                if (!isHost || config == null || config.build != BuildConfig.VERSION_CODE || !config.enabled
+                        || !config.recognition || !config.sourceScope.managed || capture == null
+                        || input == null || input.size() != 2
+                        || !(input.get("source") instanceof String source) || !HostPolicy.validTarget(source)
+                        || !config.sourceScope.allows(source)
+                        || !(input.get("activity") instanceof String activity) || activity.length() > 512
+                        || !activity.matches("[A-Za-z_$][A-Za-z0-9_$]*(?:\\.[A-Za-z_$][A-Za-z0-9_$]*)*"))
+                    return Bundle.EMPTY;
+                return capture.scopeRecordingRisk(new Bundle(input), config, operation);
+            }
             if ("recognition_visible".equals(method)) {
                 if (config == null || config.build != BuildConfig.VERSION_CODE || !config.enabled || !config.recognition
                         || config.user != 0 || !config.sourceScope.managed || sourceCapture == null
@@ -226,7 +296,7 @@ public final class RuntimeServer {
                         || !(input.get("shown_elapsed") instanceof Long shown) || shown < 0
                         || shown > SystemClock.elapsedRealtime() || SystemClock.elapsedRealtime()-shown > 30_000)
                     return Bundle.EMPTY;
-                return sourceCapture.retainRecognition(new Bundle(input),config);
+                return sourceCapture.retainRecognition(new Bundle(input),config,operation);
             }
             if ("scope_capture_native".equals(method)) {
                 SourceCapture capture = sourceCapture; if (capture != null) capture.nativeResult(input);

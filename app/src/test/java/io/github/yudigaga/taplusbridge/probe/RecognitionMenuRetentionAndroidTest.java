@@ -253,6 +253,40 @@ public final class RecognitionMenuRetentionAndroidTest {
         assertFalse("A failed post-consume check must never restore the permission", claim());
     }
 
+    @Test public void menuEpochChangingDuringThePostConsumeConfigurationReadCannotRetain() throws Exception {
+        assertTrue(arm());
+        AtomicInteger reads = new AtomicInteger();
+        duringConfigurationRead = () -> {
+            if (reads.incrementAndGet() == 3) input.incrementAndGet();
+        };
+        assertFalse("The last configuration read must finish before the terminal menu epoch check", claim());
+        duringConfigurationRead = () -> {};
+        assertFalse(claim());
+    }
+
+    @Test public void cancellationDuringThePostConsumeConfigurationReadCannotRetain() throws Exception {
+        assertTrue(arm());
+        AtomicInteger reads = new AtomicInteger();
+        duringConfigurationRead = () -> {
+            if (reads.incrementAndGet() != 3) return;
+            try { cancel(); }
+            catch (Exception error) { throw new AssertionError(error); }
+        };
+        assertFalse("Cancellation must be checked after the last configuration read", claim());
+        duringConfigurationRead = () -> {};
+        assertFalse(claim());
+    }
+
+    @Test public void menuEpochChangingDuringTheFinalArmConfigurationReadCannotPublishALease() throws Exception {
+        AtomicInteger reads = new AtomicInteger();
+        duringConfigurationRead = () -> {
+            if (reads.incrementAndGet() == 3) input.incrementAndGet();
+        };
+        assertFalse("A concurrent menu conflict must invalidate an arm before publication completes", arm());
+        duringConfigurationRead = () -> {};
+        assertFalse(claim());
+    }
+
     @Test public void navigationCancellationDuringTheForegroundCheckWinsOverClaim() throws Exception {
         assertTrue(arm());
         duringSourceCheck = ignored -> {

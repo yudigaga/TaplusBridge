@@ -286,6 +286,17 @@ public final class ScopeLinkProbe {
         if (run != null) finish(run, null, "cancelled");
     }
 
+    /** Retire the precise scope Snapshot even if its Run already finished or was never armed. */
+    void cancelOwner(ScopeCaptureWindow.Snapshot snapshot) {
+        if (snapshot == null) return;
+        synchronized (lock) {
+            if (active != null && active.snapshot == snapshot) finish(active, null, "cancelled");
+            if (tail != null && tail.snapshot == snapshot) tail = null;
+            if (!retired.contains(snapshot)) retired.add(snapshot);
+            if (retired.size() > 8) retired.remove(0);
+        }
+    }
+
     /** A host probe owns window passthrough and delivery; this candidate must not also click or consume. */
     public boolean tryYieldToHost(ScopeCaptureWindow.Snapshot snapshot) {
         synchronized (lock) {
